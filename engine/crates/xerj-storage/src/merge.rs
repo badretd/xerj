@@ -75,6 +75,16 @@ pub struct SizeTieredMergePolicy {
     /// already exceed it (otherwise no merge in that tier could ever run).
     /// 0 disables the bound (previous behaviour).
     pub max_batch_input_bytes: u64,
+    /// Upper bound on the input bytes of a batch that is over
+    /// `max_batch_input_bytes` only because the tier's `min_merge_count`
+    /// smallest segments already exceed it (the floor above). Such a batch is
+    /// emitted only while its input stays at or under this bound; otherwise
+    /// the tier is left as it is, because its segments are already as large as
+    /// the memory budget can merge. Segment sizes grow by `min_merge_count`x
+    /// per tier, so without this bound the floor lets the working set of one
+    /// batch grow with the corpus. 0 keeps the floor unbounded (previous
+    /// behaviour).
+    pub max_floor_batch_input_bytes: u64,
 }
 
 impl Default for SizeTieredMergePolicy {
@@ -85,6 +95,7 @@ impl Default for SizeTieredMergePolicy {
             tier_floor_bytes: 5 * 1024 * 1024, // 5 MiB
             max_merged_segment_bytes: 5 * 1024 * 1024 * 1024, // 5 GiB
             max_batch_input_bytes: 512 * 1024 * 1024, // 512 MiB
+            max_floor_batch_input_bytes: 0,
         }
     }
 }
@@ -160,6 +171,16 @@ impl MergePolicy for SizeTieredMergePolicy {
                     i += 1;
                 }
                 if batch.len() >= self.min_merge_count {
+                    // A floor batch over its own bound ends the tier: the
+                    // segments are sorted ascending, so every later batch of
+                    // this tier is at least as large.
+                    if self.max_batch_input_bytes > 0
+                        && self.max_floor_batch_input_bytes > 0
+                        && batch_bytes > self.max_batch_input_bytes
+                        && batch_bytes > self.max_floor_batch_input_bytes
+                    {
+                        break;
+                    }
                     merges.push(batch);
                 }
                 start = i;
@@ -720,5 +741,50 @@ mod tests {
                 batch
             );
         }
+    }
+
+    #[test]
+    fn a_floor_batch_over_its_bound_is_not_merged() {
+        // The floor above lets `min_merge_count` segments overrun the cap.
+        // Segment sizes grow min_merge_count-fold per tier, so on a growing
+        // index the floor batch of the top tier grows with the corpus: on
+        // 1,000,000 passages at a 6 GiB budget (96 MiB cap) the floor merged
+        // 4 x ~100 MiB, then started 4 x ~400 MiB and the process held 36 GB.
+        // `max_floor_batch_input_bytes` bounds that batch; a tier whose floor
+        // batch is above it is left alone.
+        let segments: Vec<SegmentMeta> = (0..8)
+            .map(|i| sized_segment(&format!("seg-{i}"), 6 * MI))
+            .collect();
+        let bounded = |floor: u64| SizeTieredMergePolicy {
+            max_batch_input_bytes: 10 * MI,
+            max_floor_batch_input_bytes: floor,
+            ..Default::default()
+        };
+
+        // Floor batches carry 4 x 6 = 24 MiB.
+        assert!(
+            bounded(20 * MI).select_merges(&segments).is_empty(),
+            "a 24 MiB floor batch must not run under a 20 MiB floor bound"
+        );
+        let allowed = bounded(30 * MI).select_merges(&segments);
+        assert_eq!(allowed.len(), 2, "24 MiB floor batches fit a 30 MiB bound");
+        assert!(allowed.iter().all(|batch| batch.len() == 4));
+        // 0 keeps the unbounded floor.
+        assert_eq!(bounded(0).select_merges(&segments).len(), 2);
+
+        // Batches under the cap are not affected by the floor bound
+        // (4 x 2.5 MiB = 10 MiB, exactly the cap).
+        let small: Vec<SegmentMeta> = (0..8)
+            .map(|i| sized_segment(&format!("small-{i}"), 5 * MI / 2))
+            .collect();
+        assert_eq!(bounded(MI).select_merges(&small).len(), 2);
+
+        // Mixed tier: the small segments still merge, the floor batch of the
+        // large ones (in their own tier) does not.
+        let mut mixed = small.clone();
+        mixed.extend((0..4).map(|i| sized_segment(&format!("big-{i}"), 40 * MI)));
+        let merges = bounded(30 * MI).select_merges(&mixed);
+        assert_eq!(merges.len(), 2);
+        assert!(merges.iter().flatten().all(|id| id.starts_with("small-")));
     }
 }

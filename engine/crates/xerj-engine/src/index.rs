@@ -15360,6 +15360,10 @@ impl Index {
             tier_floor_bytes: mc.tier_floor_mb * 1024 * 1024,
             max_merged_segment_bytes: mc.max_segment_mb * 1024 * 1024,
             max_batch_input_bytes: Self::merge_batch_cap_bytes(),
+            max_floor_batch_input_bytes: crate::merge_budget::merge_floor_batch_input_cap_bytes(
+                Self::merge_process_budget_bytes(),
+                Self::merge_batch_cap_bytes(),
+            ),
         };
 
         let segments_snapshot_init = {

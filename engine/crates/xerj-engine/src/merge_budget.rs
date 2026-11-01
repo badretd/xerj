@@ -23,6 +23,32 @@ pub const MIN_BATCH_CAP_BYTES: u64 = 32 * 1024 * 1024;
 /// 20k-doc index). 8× is the figure a batch must fit under.
 pub const MERGE_WORKING_SET_NUMERATOR: u64 = 8;
 
+/// Planning multiplier for the working set of a batch whose stored JSON
+/// compresses far better than prose: `semantic_text` stores packed-f32
+/// lexical vectors (3 KB of hex per vector, ~5-6x zstd). One batch decodes
+/// the inputs' stored JSON, copies it into the merged buffer, parses it into
+/// a `Value` tree and builds the column JSON from that, so the heap is
+/// several times the DECODED bytes. Measured on 1,000,000 Wikipedia passages
+/// with `semantic_text` at a 6 GiB budget: 4 x ~100 MiB inputs held +6 GB
+/// (~15x), 4 x ~400 MiB held +30 GB (~19x) before the run was stopped.
+pub const MERGE_WORKING_SET_WORST_NUMERATOR: u64 = 20;
+
+/// Upper bound on a batch that the size-tiered floor lets run over the
+/// batch cap (its tier's `min_merge_count` smallest segments are already
+/// over the cap; see `SizeTieredMergePolicy::max_floor_batch_input_bytes`).
+///
+/// Half of `budget_bytes` at the worst measured working set
+/// ([`MERGE_WORKING_SET_WORST_NUMERATOR`]), i.e. `budget / 40`, never below
+/// `cap`. A 6 GiB budget is ~154 MiB, 16 GiB ~410 MiB, 64 GiB ~1.6 GiB.
+/// `budget_bytes == 0` (unknown budget, no governor) and `cap == 0` (the
+/// batch bound switched off) return 0: the floor stays unbounded, as before.
+pub fn merge_floor_batch_input_cap_bytes(budget_bytes: u64, cap: u64) -> u64 {
+    if budget_bytes == 0 || cap == 0 {
+        return 0;
+    }
+    (budget_bytes / 2 / MERGE_WORKING_SET_WORST_NUMERATOR).max(cap)
+}
+
 /// Upper bound on the input bytes of one merge batch.
 ///
 /// `budget_bytes == 0` means the budget is unknown (no governor). That
@@ -799,6 +825,33 @@ mod tests {
         // No governor: the pre-change fallback.
         assert_eq!(merge_batch_input_cap_bytes(0), HISTORICAL_BATCH_CAP_BYTES);
         assert_eq!(merge_parallelism_under_budget(1, 0), 1);
+    }
+
+    #[test]
+    fn the_floor_batch_bound_is_half_the_budget_at_the_worst_working_set() {
+        // 6 GiB (the 1 M run's budget): ~154 MiB, so 4 x ~100 MiB segments
+        // (the next tier of that run, +30 GB) no longer merge in the background.
+        let six = merge_floor_batch_input_cap_bytes(6 * GIB, 96 * MIB);
+        assert_eq!(six, 6 * GIB / 40);
+        assert!(six > 150 * MIB && six < 4 * 100 * MIB);
+        assert_eq!(
+            merge_floor_batch_input_cap_bytes(16 * GIB, 256 * MIB),
+            16 * GIB / 40
+        );
+        // Never below the cap itself.
+        assert_eq!(merge_floor_batch_input_cap_bytes(GIB, 32 * MIB), 32 * MIB);
+        // Unknown budget or a switched-off cap: unbounded, as before.
+        assert_eq!(merge_floor_batch_input_cap_bytes(0, 512 * MIB), 0);
+        assert_eq!(merge_floor_batch_input_cap_bytes(6 * GIB, 0), 0);
+        // The bound keeps the floor batch's estimated working set inside half
+        // of the budget.
+        for budget in [4 * GIB, 6 * GIB, 8 * GIB, 16 * GIB, 64 * GIB] {
+            let cap = merge_batch_input_cap_bytes(budget);
+            let floor = merge_floor_batch_input_cap_bytes(budget, cap);
+            if floor > cap {
+                assert!(floor * MERGE_WORKING_SET_WORST_NUMERATOR <= budget / 2);
+            }
+        }
     }
 
     #[test]
