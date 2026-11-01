@@ -10,7 +10,7 @@ Each test writes OUT/tN.json with its checks; the exit code is 0 only when all t
 """
 import argparse, hashlib, json, os, random, re, sys, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from e2e_lib import Client, Report, Server, ask, bulk_body, load_worlds, now, ns_of, outcome
+from e2e_lib import Client, Report, Server, ask, bulk_body, fp, load_worlds, now, ns_of, outcome
 
 ap = argparse.ArgumentParser()
 for k in ("bin", "model", "worlds", "sample", "out"):
@@ -53,7 +53,7 @@ def citations_ok(c, ns, o, w, rep, tag):
     good = [e["fact_id"] for e in ev] == o.get("final_evidence_ids")
     docs = {(d["doc_id"], d["version"]): d["text"] for d in w["base_documents"]}
     for e in ev:
-        s, f = c.call("GET", f"/_facts/{ns}/{e['fact_id']}")
+        s, f = c.call("GET", f"/_facts/{ns}/{fp(e['fact_id'])}")
         src = e["source"]
         text = docs.get((src["doc_id"], src["version"]))
         loc = src.get("locator") or {}
@@ -84,7 +84,7 @@ def t1(c):
     st, x = c.call("GET", f"/_facts/{ns}")
     n_facts, n_docs = len(w["base_facts"]), len(w["base_documents"])
     r.check("status counts equal what was written", st == 200 and x["records"] == n_facts and x["documents"] == n_docs and x["visible_at_head"] == n_facts and x["published_rev"] == b["committed"]["to_rev"], x)
-    bad = [f["fact_id"] for f in w["base_facts"] if not (lambda g: g[0] == 200 and g[1].get("visible") is True)(c.call("GET", f"/_facts/{ns}/{f['fact_id']}"))]
+    bad = [f["fact_id"] for f in w["base_facts"] if not (lambda g: g[0] == 200 and g[1].get("visible") is True)(c.call("GET", f"/_facts/{ns}/{fp(f['fact_id'])}"))]
     r.check("every fact readable by id and visible", not bad, bad)
     bad = []
     for f in w["base_facts"]:
@@ -129,7 +129,7 @@ def t2(c):
             r.check(f"{tag}: UNKNOWN with a reason, no value", fs == "UNKNOWN" and fa is None and rc == "RAW_UNKNOWN" and not o["evidence"], [fs, fa, rc])
         elif p == "repaired":
             rp = o.get("repair") or {}
-            good = fs == "ANSWER" and norm(fa) == norm(s["gold_answer"]) and rc == "D2R_REPAIRED" and rp.get("code") == "D2R_REPAIRED" and rp.get("original_answer") not in (None, fa) \
+            good = fs == "ANSWER" and norm(fa) == norm(s["gold_answer"]) and rc == "D2R_REPAIRED" and rp.get("code") == "D2R_REPAIRED" and rp.get("original_answer") is not None \
                 and rp.get("repaired_answer") == fa and rp.get("original_program") and rp.get("repaired_program") and rp.get("repaired_evidence_ids") == o["final_evidence_ids"] and o["status"] == "ANSWER"
             r.check(f"{tag}: repaired, logged, cites the repaired program", good, {k: o.get(k) for k in ("final_status", "final_answer", "reason_code", "repair")})
             citations_ok(c, ns, o, w, r, tag)
@@ -246,7 +246,7 @@ def t3():
             for b in tried[n]:
                 if b["facts"][0]["fact_id"] in done:
                     continue
-                g = [c.call("GET", f"/_facts/{n}/{f['fact_id']}")[0] == 200 for f in b["facts"]]
+                g = [c.call("GET", f"/_facts/{n}/{fp(f['fact_id'])}")[0] == 200 for f in b["facts"]]
                 halves += len(set(g)) > 1
             r.check(f"round {rnd} {n}: an unacknowledged batch is all or nothing", halves == 0, halves)
         acks = sum(len(v) for v in acked.values())
@@ -308,9 +308,9 @@ def t4(c):
         r.check(f"{tag}: cites the correction", st == 200 and o.get("final_evidence_ids") == [f"{fid}#v2"], o.get("final_evidence_ids"))
         st, o = ask(c, ns, q(w), iid(w), revision=rev0)
         r.check(f"{tag}: the old revision still gives the old answer", st == 200 and o.get("final_answer") == old, [o.get("final_status"), o.get("final_answer")])
-        st, g = c.call("GET", f"/_facts/{ns}/{fid}")
+        st, g = c.call("GET", f"/_facts/{ns}/{fp(fid)}")
         r.check(f"{tag}: the old fact is readable, not visible", st == 200 and g.get("visible") is False, g)
-        st, b = c.call("DELETE", f"/_facts/{ns}/{fid}%23v2")
+        st, b = c.call("DELETE", f"/_facts/{ns}/{fp(fid + '#v2')}")
         r.check(f"{tag}: delete committed", st == 200, str(b)[:300])
         st, o = ask(c, ns, q(w), iid(w))
         r.check(f"{tag}: after the delete no value is served and it says why", st == 200 and o.get("final_status") != "ANSWER" and o.get("final_answer") is None and o.get("reason_code"), [o.get("final_status"), o.get("final_answer"), o.get("reason_code")])
@@ -455,7 +455,7 @@ def t5():
     for n, bs in writes.items():
         for b in bs:
             for f in b["facts"]:
-                st, g = cl.call("GET", f"/_facts/{n}/{f['fact_id']}?wait_for_ms=120000")
+                st, g = cl.call("GET", f"/_facts/{n}/{fp(f['fact_id'])}?wait_for_ms=120000")
                 if st != 200:
                     lost.append([f["fact_id"], st])
     r.check("after a restart every acknowledged write of the run is there", not lost, lost[:5])

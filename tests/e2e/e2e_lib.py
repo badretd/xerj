@@ -1,8 +1,13 @@
 """Shared helpers of the facts end-to-end tests: a real xerj server process and a small HTTP client. Standard library only."""
-import hashlib, http.client, json, os, signal, subprocess, sys, time
+import hashlib, http.client, json, os, signal, subprocess, sys, time, urllib.parse
 
 VERIFY = "decline_v2"
 OUTCOME_KEYS = ("status", "answer", "final_status", "final_answer", "final_evidence_ids", "reason_code", "program", "evidence_ids")
+
+
+def fp(fact_id):
+    """a fact id as one path segment: bench ids hold slashes"""
+    return urllib.parse.quote(fact_id, safe="")
 
 
 def now():
