@@ -190,6 +190,19 @@ struct MockState {
     /// persist nothing. Status 400 is not a `server_error`, so it used to be
     /// a warning on an exit-0 run.
     reject_catalog_items: bool,
+    /// Opt-in: hold every DATA bulk this long before answering it — the
+    /// shape of a node that ingests slower than autoindex extracts, which is
+    /// where a single large file spends almost all of its time. Catalog,
+    /// graph and every other request answer at once.
+    data_bulk_delay_ms: u64,
+    /// Opt-in: serve each connection on its own thread, so concurrent
+    /// requests are answered concurrently (the default serves one at a
+    /// time, which hides how many bulks a client keeps on the wire).
+    concurrent: bool,
+    /// Data bulks being held by `data_bulk_delay_ms` right now, and the most
+    /// at once (counted only for data bulks).
+    data_bulks_in_flight: usize,
+    peak_data_bulks_in_flight: usize,
 }
 
 struct MockEndpoint {
@@ -220,7 +233,16 @@ impl MockEndpoint {
                     // BSD/macOS: accepted sockets inherit the listener's
                     // O_NONBLOCK; the handler does blocking reads.
                     stream.set_nonblocking(false).unwrap();
-                    handle(stream, &server_state)
+                    let concurrent = server_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .concurrent;
+                    if concurrent {
+                        let state = Arc::clone(&server_state);
+                        thread::spawn(move || handle(stream, &state));
+                    } else {
+                        handle(stream, &server_state)
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if server_state
@@ -780,6 +802,22 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
     if is_graph {
         return json!({"errors": false, "items": []});
     }
+    if is_data {
+        // Read under the lock, slept without it: the state is shared with the
+        // test thread, which must stay free to inspect it meanwhile.
+        let delay_ms = {
+            let mut locked = state.lock().unwrap();
+            locked.data_bulks_in_flight += 1;
+            locked.peak_data_bulks_in_flight = locked
+                .peak_data_bulks_in_flight
+                .max(locked.data_bulks_in_flight);
+            locked.data_bulk_delay_ms
+        };
+        if delay_ms > 0 {
+            thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        state.lock().unwrap().data_bulks_in_flight -= 1;
+    }
     {
         // Checked before anything is applied and by LINES, as
         // `xerj-engine/src/bulk.rs` does.
@@ -1158,6 +1196,229 @@ fn the_legacy_terminal_line_and_run_document_report_code_coverage() {
             .is_some_and(|defs| defs.contains("struct AlphaConfig")),
         "{ast}"
     );
+}
+
+/// A corpus that is ONE large streaming file must move the index bar while
+/// that file is still in flight. Bytes used to be credited only when a file
+/// finished — mailboxes excepted — so a run over a single 10 GB JSONL printed
+/// `pct=0.0 items=0/1 … eta_s=unknown` on every tick for hours while the node
+/// ingested ~1,100 docs/s: the signature of a hang, to a person and to an
+/// agent reading stderr. The endpoint holds every data bulk for a moment, so
+/// the file spends most of its time being sent, exactly as on a real node.
+#[test]
+fn a_single_large_jsonl_moves_the_index_bar_before_it_finishes() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let text = "lorem ipsum dolor sit amet consectetur ".repeat(12);
+    let jsonl: String = (0..6_000)
+        .map(|i| format!("{{\"id\":\"p{i}\",\"title\":\"passage {i}\",\"text\":\"{text}\"}}\n"))
+        .collect();
+    fs::write(corpus.path().join("passages.jsonl"), &jsonl).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    endpoint.state.lock().unwrap().data_bulk_delay_ms = 250;
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    // ~3.2 MB of source stages to several 1 MiB bulks, each held 250 ms.
+    config.bulk_mb = 1;
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+    config.progress_interval = Some(std::time::Duration::from_millis(50));
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, _) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    assert_eq!(code, 0);
+    let data_bulks = endpoint.state.lock().unwrap().data_bulk_number;
+    assert!(
+        data_bulks >= 3,
+        "the fixture must send the file in several bulks: {data_bulks}"
+    );
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    // Every index-phase tick taken while the one file was still in flight.
+    let in_flight: Vec<f64> = stream
+        .lines()
+        .filter(|line| {
+            line.starts_with("xerj-progress phase=index ") && line.contains(" items=0/1 ")
+        })
+        .filter_map(crate::progress::record_pct)
+        .collect();
+    assert!(
+        in_flight.len() >= 5,
+        "the ticker must have sampled the file in flight: {stream}"
+    );
+    assert!(
+        in_flight.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the bar never moves backwards: {in_flight:?}"
+    );
+    assert!(
+        in_flight.iter().any(|pct| *pct > 0.0 && *pct < 100.0),
+        "the bar must move while the only file is still being indexed, not sit at 0.0 \
+         until it finishes: {in_flight:?}"
+    );
+}
+
+/// One large file must not mean one bulk on the wire. Phase B used to send
+/// each bulk inline from the worker that staged it: a corpus that is ONE
+/// JSONL got one worker, so exactly one data bulk was ever in flight and the
+/// node indexed one request at a time for the whole run (the 10 GB Wikipedia
+/// JSONL spent its whole index phase like that). With `--workers 4` the
+/// sender threads keep up to four of that file's bulks in flight, every
+/// record still lands, and the run exits 0.
+#[test]
+fn a_single_large_jsonl_keeps_several_bulks_in_flight() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let text = "lorem ipsum dolor sit amet consectetur ".repeat(12);
+    let jsonl: String = (0..6_000)
+        .map(|i| format!("{{\"id\":\"p{i}\",\"title\":\"passage {i}\",\"text\":\"{text}\"}}\n"))
+        .collect();
+    fs::write(corpus.path().join("passages.jsonl"), &jsonl).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    {
+        let mut locked = endpoint.state.lock().unwrap();
+        locked.concurrent = true;
+        locked.data_bulk_delay_ms = 300;
+    }
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    // ~3.2 MB of source stages to several 1 MiB bulks, each held 300 ms.
+    config.bulk_mb = 1;
+    config.workers = 4;
+
+    let (code, _) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    let locked = endpoint.state.lock().unwrap();
+    assert!(
+        locked.data_bulk_number >= 3,
+        "the fixture must send the file in several bulks: {}",
+        locked.data_bulk_number
+    );
+    assert!(
+        locked.peak_data_bulks_in_flight >= 2,
+        "one file kept only {} data bulk(s) in flight with --workers 4",
+        locked.peak_data_bulks_in_flight
+    );
+    assert_eq!(data_rows(&locked).len(), 6_000, "every record landed");
+}
+
+/// One JSONL corpus run on the legacy path with this test's own staging
+/// threshold and free-space reading injected into its state directory.
+/// Returns the progress stream and the state directory's name.
+fn run_staging_fixture(available_bytes: u64) -> (String, String) {
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    // 1 KiB instead of 256 MiB, and a free-space reading this test chooses.
+    fs::write(
+        state_dir
+            .path()
+            .join(".autoindex-test-staging-note-min-bytes"),
+        "1024",
+    )
+    .unwrap();
+    fs::write(
+        state_dir
+            .path()
+            .join(".autoindex-test-staging-available-bytes"),
+        available_bytes.to_string(),
+    )
+    .unwrap();
+    let jsonl: String = (0..200)
+        .map(|i| format!("{{\"id\":{i},\"text\":\"record number {i} of the fixture\"}}\n"))
+        .collect();
+    fs::write(corpus.path().join("passages.jsonl"), &jsonl).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, _) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    assert_eq!(code, 0, "a note or a warning never changes the outcome");
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let name = state_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    (stream, name)
+}
+
+/// Phase B writes all of a file's records to a staging file in the state
+/// directory before it sends any of them. On the 10 GB single-JSONL report
+/// that was ~2.5 minutes and a 13.8 GB file under `~/.xerj/autoindex/…`
+/// before the first document, with nothing on the stream to say so. A large
+/// file now says what it stages, where, and how much room is there — before
+/// staging starts — and how much it staged once it is done.
+#[test]
+fn a_large_file_says_what_phase_b_stages_and_where_before_sending_it() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (stream, state_name) = run_staging_fixture(64 << 30);
+    let lines: Vec<&str> = stream.lines().collect();
+    let staging = lines
+        .iter()
+        .position(|line| line.starts_with("phase B: staging passages.jsonl ("))
+        .unwrap_or_else(|| panic!("no staging note: {stream}"));
+    assert!(lines[staging].contains(&state_name), "{}", lines[staging]);
+    assert!(
+        lines[staging].contains("(64.0 GB free there)"),
+        "{}",
+        lines[staging]
+    );
+    let staged = lines
+        .iter()
+        .position(|line| line.starts_with("phase B: passages.jsonl staged as "))
+        .unwrap_or_else(|| panic!("no staged note: {stream}"));
+    assert!(staging < staged, "{stream}");
+    assert!(!stream.contains("warning:"), "{stream}");
+}
+
+/// The same note, when the state directory's filesystem cannot even hold the
+/// file itself: a warning that survives `--quiet`, naming both numbers.
+#[test]
+fn phase_b_warns_when_the_state_dir_cannot_hold_a_large_file() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (stream, state_name) = run_staging_fixture(1000);
+    let warning = stream
+        .lines()
+        .find(|line| line.starts_with("warning: passages.jsonl stages up to about "))
+        .unwrap_or_else(|| panic!("no warning: {stream}"));
+    assert!(warning.contains(&state_name), "{warning}");
+    assert!(warning.contains("only 1000 B is free there"), "{warning}");
+    assert!(warning.contains("No space left on device"), "{warning}");
 }
 
 /// #955 on the legacy (graph) path, where the defect was SILENT. The catalog

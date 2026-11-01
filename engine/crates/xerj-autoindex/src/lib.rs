@@ -3187,24 +3187,197 @@ const UNITY_SAMPLE_LIMIT: u64 = 512 << 20;
 /// (all text, or all attachments) sees a bar that is uneven, never wrong.
 const CONTAINER_EXTRACT_PERCENT: u64 = 45;
 
-/// Progress position for "the splitter has reached `offset`" in a file of
-/// `size` bytes. `offset` is clamped to `size`: in a gzipped mailbox it counts
-/// DECOMPRESSED bytes and runs past the size on disk, and extraction must not
-/// spend the share that belongs to sending.
-fn container_extract_credit(size: u64, offset: u64) -> u64 {
-    // u128: a u64 byte position times 45 can overflow a u64.
-    ((u128::from(offset.min(size)) * u128::from(CONTAINER_EXTRACT_PERCENT)) / 100) as u64
+/// The same split for every other file: JSONL, CSV/TSV, logs, line text and
+/// any family whose reader reports how far into the file it has got
+/// (`extract::extract_tracked`).
+///
+/// Small, unlike [`CONTAINER_EXTRACT_PERCENT`], because staging these files is
+/// one parse-and-write pass while sending them is paced by the node. One
+/// 629,146,621-byte JSONL (475,479 records) against a local node finished
+/// staging under 20 s into a 2,638 s phase B; the single 10 GB JSONL this was
+/// reported on staged in about 2.5 minutes and then sent for hours. A share
+/// near that ratio keeps the two halves moving the bar at a similar speed, so
+/// the ETA — extrapolated from that speed — is not a minutes-long promise made
+/// while staging and broken by the send. At or under the progress module's 2%
+/// ETA floor, a lone file shows no ETA until its sending has been measured.
+/// Both ends stay exact whatever this is.
+const STREAM_EXTRACT_PERCENT: u64 = 1;
+
+/// Share of a file's progress that belongs to extracting and staging it.
+fn extract_percent(family: Family) -> u64 {
+    if family == Family::Mbox {
+        CONTAINER_EXTRACT_PERCENT
+    } else {
+        STREAM_EXTRACT_PERCENT
+    }
+}
+
+/// Progress position for "extraction has reached `offset`" in a file of
+/// `size` bytes whose first `percent` belongs to extraction. `offset` is
+/// clamped to `size`: in a gzipped mailbox it counts DECOMPRESSED bytes and
+/// runs past the size on disk, and extraction must not spend the share that
+/// belongs to sending.
+fn extract_credit(size: u64, offset: u64, percent: u64) -> u64 {
+    // u128: a u64 byte position times the percent can overflow a u64.
+    ((u128::from(offset.min(size)) * u128::from(percent)) / 100) as u64
 }
 
 /// Progress position for "`sent` of `staged` bytes have reached the engine",
-/// for a file of `size` bytes.
-fn container_send_credit(size: u64, sent: u64, staged: u64) -> u64 {
-    let base = container_extract_credit(size, size);
+/// for a file of `size` bytes whose first `percent` belongs to extraction.
+fn send_credit(size: u64, sent: u64, staged: u64, percent: u64) -> u64 {
+    let base = extract_credit(size, size, percent);
     if staged == 0 {
         return base;
     }
     let span = u128::from(size - base);
     base + ((span * u128::from(sent.min(staged))) / u128::from(staged)) as u64
+}
+
+/// A file — or a `--no-graph` snapshot — at least this large is announced
+/// before it is staged under the state directory.
+///
+/// Phase B writes ALL of a file's records to a compressed staging file there
+/// before it sends any of them: the #1911 second content check and the
+/// delete-before-replace of a changed file both need the whole file extracted
+/// first. A `--no-graph` seal copies every new source file into the snapshot
+/// and writes its prepared records next to it. For a large input that is
+/// minutes of local writes before the node sees one document. The compressed
+/// size depends on the data and is unknown until the stage is finished, so
+/// the input's own size stands in as the room to plan for. Below this size
+/// staging takes seconds and a note would be noise.
+const STAGING_NOTE_MIN_BYTES: u64 = 256 << 20;
+
+/// [`STAGING_NOTE_MIN_BYTES`], or a test's own value for this state directory.
+pub(crate) fn staging_note_min_bytes(state_dir: &Path) -> u64 {
+    #[cfg(test)]
+    if let Some(value) = staging_test_value(state_dir, "note-min-bytes") {
+        return value;
+    }
+    #[cfg(not(test))]
+    let _ = state_dir;
+    STAGING_NOTE_MIN_BYTES
+}
+
+/// Free bytes on the filesystem that holds `state_dir`; `None` when it cannot
+/// be measured.
+pub(crate) fn staging_free_bytes(state_dir: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(value) = staging_test_value(state_dir, "available-bytes") {
+        return Some(value);
+    }
+    fs2::available_space(state_dir).ok()
+}
+
+/// Test injection keyed on the run's own state directory — the shape of the
+/// PDF spool's probes — so a test running in parallel is never affected.
+#[cfg(test)]
+fn staging_test_value(state_dir: &Path, name: &str) -> Option<u64> {
+    std::fs::read_to_string(state_dir.join(format!(".autoindex-test-staging-{name}")))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn free_space_clause(free: Option<u64>) -> String {
+    match free {
+        Some(free) => format!("{} free there", estimate::human_bytes(free)),
+        None => "free space there could not be measured".to_string(),
+    }
+}
+
+/// Phase B, before a large file is staged: what will be written, where, and
+/// how much room there is — and a warning when the file alone does not fit.
+fn note_phase_b_staging(pr: &Progress, state_dir: &Path, rel: &str, size: u64) {
+    let free = staging_free_bytes(state_dir);
+    let size_text = estimate::human_bytes(size);
+    pr.note(&format!(
+        "phase B: staging {rel} ({size_text}) in {} before sending it — all of a file's records \
+         are written to a compressed staging file there and sent only after the whole file has \
+         been extracted and checked again, so plan for up to about {size_text} on that \
+         filesystem before the first of them reaches the node ({})",
+        state_dir.display(),
+        free_space_clause(free)
+    ));
+    if let Some(free) = free.filter(|free| *free < size) {
+        pr.warn(&format!(
+            "warning: {rel} stages up to about {size_text} in {}, and only {} is free there: \
+             staging can fail with 'No space left on device' if that filesystem fills. Free \
+             space there before this file is staged, or start the run again with --state-dir on \
+             a filesystem with more room",
+            state_dir.display(),
+            estimate::human_bytes(free)
+        ));
+    }
+}
+
+/// What a `--no-graph` seal writes before the first document is sent,
+/// counted before it starts (`sync_executor::create_snapshot_inner`).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SnapshotStaging {
+    /// Bytes copied from the source tree into the snapshot.
+    pub(crate) copy_bytes: u64,
+    /// Of those, the copies that stay: files with nothing to prepare
+    /// (junk/skipped, or every file of a plan-less snapshot).
+    pub(crate) kept_bytes: u64,
+    /// The largest copy that is released once its prepared records are on
+    /// disk (#2421): the most copy bytes held at once.
+    pub(crate) largest_released: u64,
+    /// Bytes the prior generation lends instead (a hardlinked copy, or
+    /// prepared records reused by identity).
+    pub(crate) reused_bytes: u64,
+}
+
+/// `--no-graph`, before a seal that copies a lot: the same note for the
+/// snapshot, whose copy size is known exactly before it starts.
+///
+/// Since #2421 a copy is released once its file's prepared records are on
+/// disk, so the seal does not hold a second copy of the corpus: at its peak
+/// it holds the prepared records (about the size of the files they come
+/// from), the copies that stay, and the one copy being prepared.
+pub(crate) fn note_snapshot_staging(
+    pr: &Progress,
+    state_dir: &Path,
+    snapshots: &Path,
+    staged: &SnapshotStaging,
+) {
+    let free = staging_free_bytes(state_dir);
+    let copy_text = estimate::human_bytes(staged.copy_bytes);
+    let kept = if staged.kept_bytes > 0 {
+        format!(
+            "; {} of files with nothing to prepare stay as copies",
+            estimate::human_bytes(staged.kept_bytes)
+        )
+    } else {
+        String::new()
+    };
+    let reused = if staged.reused_bytes > 0 {
+        format!(
+            "; {} unchanged since the last generation is reused, not copied",
+            estimate::human_bytes(staged.reused_bytes)
+        )
+    } else {
+        String::new()
+    };
+    pr.note(&format!(
+        "snapshot: sealing {copy_text} of source files in {}: each file is copied, its prepared \
+         records are written, and the copy is released once they are on disk{kept}{reused} ({})",
+        snapshots.display(),
+        free_space_clause(free)
+    ));
+    let need = staged.copy_bytes.saturating_add(staged.largest_released);
+    if let Some(free) = free.filter(|free| *free < need) {
+        pr.warn(&format!(
+            "warning: sealing this snapshot needs about {} in {} (the prepared records, about the \
+             size of the files they come from, plus the copy being prepared), and only {} is free \
+             there: sealing will fail with 'No space left on device' once that filesystem is \
+             full. Free space there before the run seals, or start it again with --state-dir on \
+             a filesystem with more room",
+            estimate::human_bytes(need),
+            snapshots.display(),
+            estimate::human_bytes(free)
+        ));
+    }
 }
 
 fn sample_limit_bytes(family: Family, path: &Path) -> Option<u64> {
@@ -3503,7 +3676,17 @@ struct PipeState {
     /// are coming" signal that flushes a residual buffer.
     parked_workers: usize,
     /// Bulk bodies currently on the wire. Capped at [`MAX_IN_FLIGHT`].
+    /// In sender mode it also counts the jobs queued for a sender.
     in_flight: usize,
+    /// Jobs detached from the buffer and waiting for a sender thread
+    /// (sender mode only; see [`BulkPipe::use_senders`]).
+    queue: std::collections::VecDeque<PipeJob>,
+    /// Sender threads serving `queue`; 0 = the inline mode, where the worker
+    /// that detaches a job sends it itself.
+    senders: usize,
+    /// Set once no worker can add bytes any more: senders drain `queue` and
+    /// exit.
+    closing: bool,
 }
 
 /// How many bulk bodies may be on the wire at once. 8 matches the server
@@ -3513,6 +3696,51 @@ struct PipeState {
 /// phase B than the per-file code it replaced — extraction and sending
 /// must overlap, not alternate).
 const MAX_IN_FLIGHT: usize = 8;
+
+/// Start up to `wanted` bulk sender threads and return how many started.
+///
+/// #2428 for the senders: a refused spawn (`EAGAIN` from `pthread_create`,
+/// or the spawn gate saying no) is retried with the worker spawn's backoff
+/// ([`sync_executor::WORKER_SPAWN_ATTEMPTS`] attempts, doubling from
+/// [`sync_executor::WORKER_SPAWN_BACKOFF`]) before the set shrinks. A sender
+/// that still cannot start ends the loop: the pipe runs with the senders that
+/// did start, and with none it stays inline, as before.
+pub(crate) fn start_bulk_senders<'scope, 'env, S, G, F>(
+    scope: &xerj_common::thread_spawn::Scope<'scope, 'env>,
+    spawner: &S,
+    gate: G,
+    wanted: usize,
+    sender: F,
+    pr: &Progress,
+) -> usize
+where
+    S: xerj_common::thread_spawn::Spawn + ?Sized,
+    G: Fn() -> bool + Copy,
+    F: FnOnce() + Send + Copy + 'scope,
+{
+    let mut started = 0usize;
+    for _ in 0..wanted {
+        match crate::sync_executor::spawn_scoped_with_backoff(
+            scope,
+            spawner,
+            gate,
+            "autoindex-sender",
+            crate::sync_executor::WORKER_SPAWN_ATTEMPTS,
+            crate::sync_executor::WORKER_SPAWN_BACKOFF,
+            sender,
+        ) {
+            Ok(()) => started += 1,
+            Err(error) => {
+                pr.note(&format!(
+                    "autoindex: could not start bulk sender {} ({error}); continuing with {started}",
+                    started + 1
+                ));
+                break;
+            }
+        }
+    }
+    started
+}
 
 /// ONE bulk buffer shared by every phase-B worker (#1147).
 ///
@@ -3527,8 +3755,7 @@ const MAX_IN_FLIGHT: usize = 8;
 ///
 /// Flush triggers, in order:
 /// 1. the shared buffer crosses the cut (`--bulk-mb` bytes or the doc cap) —
-///    shipped inline by the submitting worker, exactly where the per-file
-///    code flushed (it blocks here, so a worker's own chunks stay ordered);
+///    handed to a sender, or shipped inline when there are none;
 /// 2. half the live workers are parked settling — ship what is buffered
 ///    rather than wait for a full wave: extraction and sending must OVERLAP,
 ///    not alternate (the all-parked barrier alone measured 4.7x slower on
@@ -3542,11 +3769,11 @@ const MAX_IN_FLIGHT: usize = 8;
 ///
 /// The pipe lock is NOT held across the wire: a flush detaches the buffer as
 /// a job, drops the lock, sends, and resolves tokens on return, so up to
-/// [`MAX_IN_FLIGHT`] bulks are on the wire at once. Per-file order still
-/// holds — a file's cut chunks are sent synchronously by its own worker
-/// inside `submit`, so any later job carrying its tail ships after those
-/// completed; files interleave arbitrarily, exactly as the 32 parallel
-/// per-file buffers always did.
+/// [`MAX_IN_FLIGHT`] bulks are on the wire at once. With more than one worker
+/// a run uses sender threads ([`Self::use_senders`]), so bulks of one file can
+/// land out of order; records carry deterministic ids, so they converge.
+/// Inline mode (`--workers 1`, or no sender could start) sends a file's chunks
+/// on its own worker, in order.
 ///
 /// Durability semantics are the per-file code's, unchanged: a token settles
 /// `Ok` only after EVERY bulk carrying its records was accepted (server_errors
@@ -3605,6 +3832,71 @@ where
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Switch to sender mode: a detached job is queued for one of `senders`
+    /// threads running [`Self::sender_loop`] instead of being sent by the
+    /// worker that cut it, and at most `senders` jobs are queued or on the
+    /// wire. Call before any worker submits; 0 keeps the inline mode.
+    ///
+    /// Why: in inline mode a worker that cuts a bulk sends it and waits for
+    /// the node before it reads on, so a corpus that is ONE large file (one
+    /// worker) keeps exactly one bulk on the wire for the whole run and the
+    /// node indexes one request at a time. With senders, that worker keeps
+    /// staging while up to `senders` bulks of its file are being indexed.
+    /// Records carry deterministic per-record ids (one locator per record),
+    /// so bulks of one file landing out of order converge to the same index,
+    /// and a failure stays sticky per file exactly as in inline mode.
+    fn use_senders(&self, senders: usize) {
+        let mut st = self.lock();
+        st.senders = senders.min(MAX_IN_FLIGHT);
+        if st.senders > 0 && st.live_workers == 0 && st.buf.is_empty() {
+            st.closing = true;
+        }
+        drop(st);
+        self.ready.notify_all();
+    }
+
+    /// Body of a sender thread (sender mode): send queued jobs until every
+    /// worker retired and the queue is empty.
+    fn sender_loop(&self) {
+        let mut st = self.lock();
+        loop {
+            if let Some((body, tokens, owners)) = st.queue.pop_front() {
+                drop(st);
+                let outcome = (self.send)(body);
+                self.deliver(tokens, owners, outcome);
+                st = self.lock();
+                continue;
+            }
+            if st.closing {
+                return;
+            }
+            let (guard, _) = self
+                .ready
+                .wait_timeout(st, std::time::Duration::from_secs(30))
+                .unwrap_or_else(|p| p.into_inner());
+            st = guard;
+        }
+    }
+
+    /// Hand a detached job to the senders (sender mode) or send it on this
+    /// thread (inline mode). Takes the lock guard and returns it re-taken.
+    fn dispatch<'g>(
+        &'g self,
+        mut st: std::sync::MutexGuard<'g, PipeState>,
+        job: PipeJob,
+    ) -> std::sync::MutexGuard<'g, PipeState> {
+        if st.senders > 0 {
+            st.queue.push_back(job);
+            drop(st);
+            self.ready.notify_all();
+        } else {
+            drop(st);
+            let outcome = (self.send)(job.0);
+            self.deliver(job.1, job.2, outcome);
+        }
+        self.lock()
+    }
+
     /// Add one chunk of staged NDJSON lines to the shared buffer, flushing
     /// inline if the buffer crossed the cut. Never blocks on the network
     /// beyond that inline flush.
@@ -3636,6 +3928,13 @@ where
         // delivery frees one — backpressure, exactly like the per-file code
         // blocking inside its own bulk send.
         let job = loop {
+            // Another worker took the buffer while this one was parked: its
+            // bytes are on their way and there is nothing left to ship here.
+            // With every wire slot busy this is the normal case in sender
+            // mode, and waiting for `take_job` would park forever.
+            if st.buf.len() < self.bulk_cut && st.docs < self.doc_cap {
+                return;
+            }
             if let Some(job) = self.take_job(&mut st) {
                 break job;
             }
@@ -3647,9 +3946,7 @@ where
             st = guard;
             st.parked_workers -= 1;
         };
-        drop(st);
-        let outcome = (self.send)(job.0);
-        self.deliver(job.1, job.2, outcome);
+        drop(self.dispatch(st, job));
     }
 
     /// The server's reason when this token failed only on records over the
@@ -3671,10 +3968,7 @@ where
             }
             if buffered {
                 if let Some(job) = self.take_job(&mut st) {
-                    drop(st);
-                    let outcome = (self.send)(job.0);
-                    self.deliver(job.1, job.2, outcome);
-                    st = self.lock();
+                    st = self.dispatch(st, job);
                     continue;
                 }
             }
@@ -3715,10 +4009,7 @@ where
             let half = (st.parked_workers + 1) * 2 >= st.live_workers.max(1);
             if !st.buf.is_empty() && (all || half) {
                 if let Some(job) = self.take_job(&mut st) {
-                    drop(st);
-                    let outcome = (self.send)(job.0);
-                    self.deliver(job.1, job.2, outcome);
-                    st = self.lock();
+                    st = self.dispatch(st, job);
                     continue;
                 }
                 // Every wire slot is busy: park; a delivery will wake us.
@@ -3744,6 +4035,9 @@ where
         }
         let mut st = self.lock();
         st.live_workers = st.live_workers.saturating_sub(n);
+        if st.live_workers == 0 && st.buf.is_empty() {
+            st.closing = true;
+        }
         drop(st);
         self.ready.notify_all();
     }
@@ -3755,10 +4049,7 @@ where
         st.live_workers = st.live_workers.saturating_sub(1);
         while !st.buf.is_empty() {
             if let Some(job) = self.take_job(&mut st) {
-                drop(st);
-                let outcome = (self.send)(job.0);
-                self.deliver(job.1, job.2, outcome);
-                st = self.lock();
+                st = self.dispatch(st, job);
                 continue;
             }
             // Wire full: wait for a delivery to free a slot.
@@ -3768,6 +4059,11 @@ where
                 .unwrap_or_else(|p| p.into_inner());
             st = guard;
         }
+        // The last worker out: senders drain what is queued and stop.
+        if st.live_workers == 0 {
+            st.closing = true;
+        }
+        drop(st);
         // Live workers may have dropped to zero: anyone still parked must
         // re-check whether they are now the last one able to ship.
         self.ready.notify_all();
@@ -3776,7 +4072,12 @@ where
     /// Detach the buffer as a send job if a wire slot is free. Called with
     /// the lock held; the caller drops the lock before sending.
     fn take_job(&self, st: &mut PipeState) -> Option<PipeJob> {
-        if st.buf.is_empty() || st.in_flight >= MAX_IN_FLIGHT {
+        let limit = if st.senders > 0 {
+            st.senders
+        } else {
+            MAX_IN_FLIGHT
+        };
+        if st.buf.is_empty() || st.in_flight >= limit {
             return None;
         }
         st.in_flight += 1;
@@ -3885,13 +4186,21 @@ where
                             }
                             st.failed.insert(*t);
                             st.done.insert(*t, Err(msg));
-                        } else if !st.failed.contains(t) {
+                        } else if !st.failed.contains(t)
+                            && !st.in_flight_tokens.contains_key(t)
+                            && !st.pending.contains(t)
+                        {
                             st.done.insert(*t, Ok(()));
                         }
                     }
                 } else {
                     for t in &tokens {
-                        if !st.failed.contains(t) {
+                        // Complete only when no other piece of this file is
+                        // still queued, on the wire, or in the buffer.
+                        if !st.failed.contains(t)
+                            && !st.in_flight_tokens.contains_key(t)
+                            && !st.pending.contains(t)
+                        {
                             st.done.insert(*t, Ok(()));
                         }
                     }
@@ -4491,10 +4800,15 @@ fn scan_file(
     // 100_000-row CSV then looked like a 500-row one, and the dataset caps
     // (`dataset::DATASET_CAP_PROTECT_RECORDS`) merged it into a shared index
     // as if it were small. When the sample may have stopped early, count on
-    // with the same extractor up to the protect threshold. That is enough to
-    // decide the caps and stays bounded however large the file is.
+    // with the same extractor up to the larger of the protect threshold and
+    // the automatic `semantic_text` record cap. Both caps read this number, so
+    // stopping at the smaller one hid every line-record dataset from the
+    // semantic cap: 24 audit files of 24,000 rows each counted as 24 * 1,024
+    // rows, stayed under it, and their 574,000 rows were embedded into a graph
+    // larger than the source. It stays bounded however large the file is.
     if matches!(sn.family, Family::Csv | Family::Jsonl | Family::Logs) {
-        let threshold = dataset::DATASET_CAP_PROTECT_RECORDS;
+        let threshold =
+            dataset::DATASET_CAP_PROTECT_RECORDS.max(infer::SEMANTIC_DATA_MAX_RECORDS + 1);
         let sample_cut = |s: &GroupSketch| {
             s.population < threshold
                 && (s.records >= sample as u64 || limit.is_some_and(|l| sn.gzip || size > l))
@@ -4764,6 +5078,28 @@ mod clustering_key_tests {
         let small = scan(dir.path(), "small.csv", &csv_body("s", 10));
         assert_eq!(small.sketches[0].records, 10);
         assert_eq!(small.sketches[0].population, 10);
+    }
+
+    /// The semantic cap reads the same population, so several line-record
+    /// files that are each past the protect threshold must add up to their
+    /// real rows, not to the threshold times the file count.
+    #[test]
+    fn line_record_files_count_their_rows_up_to_the_semantic_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = dataset::DATASET_CAP_PROTECT_RECORDS as usize * 3;
+        let s = scan(dir.path(), "events.jsonl", &jsonl_body("e", rows));
+        assert_eq!(s.sketches[0].population, rows as u64);
+
+        let capped = scan(
+            dir.path(),
+            "huge.jsonl",
+            &jsonl_body("h", infer::SEMANTIC_DATA_MAX_RECORDS as usize + 50),
+        );
+        assert_eq!(
+            capped.sketches[0].population,
+            infer::SEMANTIC_DATA_MAX_RECORDS + 1,
+            "the count stops just past the cap"
+        );
     }
 
     /// End to end through `cluster()`: past the run cap, 2000-row CSV and
@@ -11399,6 +11735,13 @@ fn run_index_report_inner(
             // only source that can name a PDF page boundary's
             // predecessor (p2-s0 follows the LAST section of page 1).
             let mut prev_section: Option<(String, String)> = None;
+            // A large file is staged in full before any of it is sent: say
+            // what that costs, and where, before it starts.
+            let staging_started = Instant::now();
+            let announce_staging = f.size >= staging_note_min_bytes(&state_dir);
+            if announce_staging {
+                note_phase_b_staging(&pr, &state_dir, &f.rel, f.size);
+            }
             let mut staged = match stage::Stage::create_in(&state_dir) {
                 Ok(file) => file,
                 Err(error) => {
@@ -11472,6 +11815,11 @@ fn run_index_report_inner(
                     }
                 }
             }
+            // How far the extractor has read into this file on disk, and how
+            // much of the file's bar that reading may move (the rest moves as
+            // the staged records are sent, below).
+            let read_position = extract::ReadPosition::new();
+            let split = extract_percent(sn.family);
             {
                 let mut sink = |rec: extract::RawRecord| -> bool {
                     let Some(slug) = asg.get(&rec.group).or_else(|| asg.get(&None)) else {
@@ -11485,16 +11833,20 @@ fn run_index_report_inner(
                         file_junk += 1;
                         return true;
                     };
-                    // Progress INSIDE a mailbox. One Takeout mbox is
-                    // the whole corpus, so crediting its bytes only
-                    // when the file finishes left the bar at 0.0% and
-                    // `since_progress_s` climbing for the entire run.
-                    // Every mbox record says how far into the file its
-                    // message began; that is the position.
-                    if sn.family == Family::Mbox {
-                        if let Some(offset) = extract::mbox::locator_offset(&rec.locator) {
-                            in_flight.advance_to(container_extract_credit(f.size, offset));
-                        }
+                    // Progress INSIDE one file. One Takeout mbox, or one
+                    // multi-GB JSONL, is the whole corpus, so crediting its
+                    // bytes only when the file finishes left the bar at
+                    // 0.0% and `since_progress_s` climbing for the entire
+                    // run. Every mbox record says how far into the file
+                    // its message began; every other family's reader says
+                    // how far into the file it has read.
+                    let position = if sn.family == Family::Mbox {
+                        extract::mbox::locator_offset(&rec.locator)
+                    } else {
+                        Some(read_position.bytes())
+                    };
+                    if let Some(position) = position {
+                        in_flight.advance_to(extract_credit(f.size, position, split));
                     }
                     let mut fields = rec.fields;
                     // BEFORE coercion, not after: these are ordinary
@@ -11669,7 +12021,7 @@ fn run_index_report_inner(
                         }
                     }
                 } else {
-                    extract::extract(&f.path, &sn, None, &mut sink)
+                    extract::extract_tracked(&f.path, &sn, &read_position, &mut sink)
                 };
                 match res {
                     Ok(stats) => {
@@ -11808,10 +12160,14 @@ fn run_index_report_inner(
             // The stage is consumed here whether or not the send runs: an
             // early error drops it, and the unnamed file goes with it.
             let staged_len = staged.raw_bytes();
+            let mut staged_disk = 0u64;
             let mut reader = None;
             if send_err.is_none() {
                 match staged.into_reader() {
-                    Ok((r, _disk)) => reader = Some(r),
+                    Ok((r, disk)) => {
+                        reader = Some(r);
+                        staged_disk = disk;
+                    }
                     Err(error) => {
                         send_err = Some(format!("finish staged records for {}: {error}", f.rel));
                     }
@@ -11856,13 +12212,24 @@ fn run_index_report_inner(
                 }
             }
             if let Some(mut reader) = reader.filter(|_| send_err.is_none()) {
-                // The second half of a mailbox's bar: staged bytes
+                // The second half of the file's bar: staged bytes
                 // handed to the engine, out of staged bytes in total.
-                // Credit is taken at submission: the shared buffer
-                // (#1147) may hold these bytes for a moment before a
-                // flush carries them, and the bar measures reading
-                // work, not wire time.
-                let credit_send = sn.family == Family::Mbox;
+                // Every family, not only mailboxes: a single large
+                // JSONL spends nearly all of its time here, behind
+                // the node's ingest rate. Credit is taken at
+                // submission: the shared buffer (#1147) may hold these
+                // bytes for a moment before a flush carries them, and
+                // the bar measures reading work, not wire time.
+                if announce_staging {
+                    pr.note(&format!(
+                        "phase B: {} staged as {} of records ({} compressed) in {:.1}s; sending \
+                         them to the node now",
+                        f.rel,
+                        estimate::human_bytes(staged_len),
+                        estimate::human_bytes(staged_disk),
+                        staging_started.elapsed().as_secs_f64()
+                    ));
+                }
                 let mut staged_sent = 0u64;
                 // A LOCAL chunk, not the bulk: chunks join whatever
                 // the other workers are staging in the shared buffer,
@@ -11909,13 +12276,7 @@ fn run_index_report_inner(
                         pipe.submit(file_token, std::mem::take(&mut chunk), docs);
                         docs = 0;
                         chunk.reserve(bulk_cut);
-                        if credit_send {
-                            in_flight.advance_to(container_send_credit(
-                                f.size,
-                                staged_sent,
-                                staged_len,
-                            ));
-                        }
+                        in_flight.advance_to(send_credit(f.size, staged_sent, staged_len, split));
                     }
                 }
                 if !chunk.is_empty() && !pipe.failed(file_token) {
@@ -12091,6 +12452,27 @@ fn run_index_report_inner(
     // #2428: a refused spawn is retried with backoff first; a transient
     // `EAGAIN` must not cost the run a worker, let alone the run.
     xerj_common::thread_spawn::scope(|scope| {
+        // Sender threads first, so the pipe is in sender mode before any
+        // worker submits: a lone worker on one large file keeps staging while
+        // up to `--workers` of its bulks are being indexed (see
+        // `BulkPipe::use_senders`). `--workers 1` keeps the inline pipe
+        // exactly as before; threads that cannot start shrink the set, and
+        // none at all leaves the pipe inline too.
+        let sender = || pipe.sender_loop();
+        let wanted_senders = if cfg.workers > 1 {
+            cfg.workers.min(MAX_IN_FLIGHT)
+        } else {
+            0
+        };
+        let senders = start_bulk_senders(
+            scope,
+            &xerj_common::thread_spawn::StdSpawn,
+            xerj_common::thread_spawn::spawn_allowed,
+            wanted_senders,
+            sender,
+            &pr,
+        );
+        pipe.use_senders(senders);
         let mut started = 0usize;
         for _ in 0..worker_count {
             match crate::sync_executor::spawn_scoped_with_backoff(
@@ -16797,23 +17179,29 @@ mod unity_pipeline_tests {
 
 #[cfg(test)]
 mod container_progress_tests {
-    use super::{container_extract_credit, container_send_credit, CONTAINER_EXTRACT_PERCENT};
+    use super::{
+        extract_credit, extract_percent, send_credit, CONTAINER_EXTRACT_PERCENT,
+        STREAM_EXTRACT_PERCENT,
+    };
+    use crate::sniff::Family;
 
     /// Whatever the split, the two stages together cover the file EXACTLY:
     /// extraction ends where sending starts, sending ends on the file's size.
     #[test]
     fn the_two_stages_meet_and_end_on_the_file_size() {
-        for size in [0u64, 1, 99, 100, 1_073_777_879, u64::MAX] {
-            let seam = container_extract_credit(size, size);
-            assert_eq!(container_send_credit(size, 0, 1000), seam, "size={size}");
-            assert_eq!(container_send_credit(size, 1000, 1000), size, "size={size}");
-            assert!(seam <= size);
-            // Nothing staged (every entry was junk): stay at the seam; the
-            // guard's drop credits the rest.
-            assert_eq!(container_send_credit(size, 0, 0), seam);
+        for percent in [CONTAINER_EXTRACT_PERCENT, STREAM_EXTRACT_PERCENT] {
+            for size in [0u64, 1, 99, 100, 1_073_777_879, u64::MAX] {
+                let seam = extract_credit(size, size, percent);
+                assert_eq!(send_credit(size, 0, 1000, percent), seam, "size={size}");
+                assert_eq!(send_credit(size, 1000, 1000, percent), size, "size={size}");
+                assert!(seam <= size);
+                // Nothing staged (every entry was junk): stay at the seam; the
+                // guard's drop credits the rest.
+                assert_eq!(send_credit(size, 0, 0, percent), seam);
+            }
         }
         assert_eq!(
-            container_extract_credit(1000, 1000),
+            extract_credit(1000, 1000, CONTAINER_EXTRACT_PERCENT),
             10 * CONTAINER_EXTRACT_PERCENT
         );
     }
@@ -16821,17 +17209,19 @@ mod container_progress_tests {
     #[test]
     fn credit_is_monotonic_and_never_overflows() {
         let size = u64::MAX;
-        let mut last = 0;
-        for offset in [0, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
-            let c = container_extract_credit(size, offset);
-            assert!(c >= last && c <= size);
-            last = c;
-        }
-        let mut last = container_extract_credit(size, size);
-        for sent in [0u64, 1, 500, 999, 1000, 5000] {
-            let c = container_send_credit(size, sent, 1000);
-            assert!(c >= last && c <= size, "sent={sent}");
-            last = c;
+        for percent in [CONTAINER_EXTRACT_PERCENT, STREAM_EXTRACT_PERCENT] {
+            let mut last = 0;
+            for offset in [0, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+                let c = extract_credit(size, offset, percent);
+                assert!(c >= last && c <= size);
+                last = c;
+            }
+            let mut last = extract_credit(size, size, percent);
+            for sent in [0u64, 1, 500, 999, 1000, 5000] {
+                let c = send_credit(size, sent, 1000, percent);
+                assert!(c >= last && c <= size, "sent={sent}");
+                last = c;
+            }
         }
     }
 
@@ -16841,8 +17231,27 @@ mod container_progress_tests {
     fn a_decompressed_offset_past_the_file_size_is_clamped() {
         let size = 1000;
         assert_eq!(
-            container_extract_credit(size, 50_000),
-            container_extract_credit(size, size)
+            extract_credit(size, 50_000, CONTAINER_EXTRACT_PERCENT),
+            extract_credit(size, size, CONTAINER_EXTRACT_PERCENT)
+        );
+    }
+
+    /// A mailbox keeps its measured split; every other family stages with the
+    /// small streaming share, so a lone large JSONL moves its bar mostly while
+    /// it is being SENT, which is where its time goes.
+    #[test]
+    fn mailboxes_keep_their_split_and_every_other_family_streams() {
+        assert_eq!(extract_percent(Family::Mbox), CONTAINER_EXTRACT_PERCENT);
+        for family in [Family::Jsonl, Family::Csv, Family::Logs, Family::TxtLines] {
+            assert_eq!(
+                extract_percent(family),
+                STREAM_EXTRACT_PERCENT,
+                "{family:?}"
+            );
+        }
+        assert_eq!(
+            extract_credit(629_146_621, 629_146_621, STREAM_EXTRACT_PERCENT),
+            6_291_466
         );
     }
 }
@@ -17229,6 +17638,267 @@ mod bulk_pipe_tests {
             "at least two bodies were on the wire together, peak={}",
             peak.load(Ordering::SeqCst)
         );
+    }
+
+    /// Sender mode: ONE producer (the lone worker of a one-file corpus) cuts
+    /// several bulks, and they are on the wire together instead of one at a
+    /// time; every body is sent once, the token settles Ok, and the senders
+    /// stop when the worker retires.
+    #[test]
+    fn sender_mode_overlaps_one_producers_bulks_and_stops_on_retire() {
+        let bodies = Mutex::new(Vec::new());
+        let rejected = AtomicU64::new(0);
+        let concurrent = AtomicU64::new(0);
+        let peak = AtomicU64::new(0);
+        let pipe = BulkPipe::new(
+            {
+                let (bodies, concurrent, peak) = (&bodies, &concurrent, &peak);
+                move |body| {
+                    let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    concurrent.fetch_sub(1, Ordering::SeqCst);
+                    bodies.lock().unwrap().push(body);
+                    Ok(outcome())
+                }
+            },
+            64,
+            5000,
+            &rejected,
+            1,
+        );
+        pipe.use_senders(4);
+        // Retire before asserting: a sender waits for `retire`, so a panic
+        // inside the scope would hang the test instead of failing it.
+        let settled = std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| pipe.sender_loop());
+            }
+            let t = pipe.token();
+            for chunk in 0..8u8 {
+                pipe.submit(t, vec![b'a' + chunk; 100], 1);
+            }
+            let settled = pipe.settle(t);
+            pipe.retire();
+            settled
+        });
+        settled.expect("every bulk accepted");
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "one producer's bulks never overlapped, peak={}",
+            peak.load(Ordering::SeqCst)
+        );
+        let mut bodies = bodies.into_inner().unwrap();
+        bodies.sort();
+        assert_eq!(
+            bodies,
+            (0..8u8).map(|c| vec![b'a' + c; 100]).collect::<Vec<_>>(),
+            "each cut body sent exactly once"
+        );
+    }
+
+    /// A file is complete only when EVERY bulk carrying it was accepted. In
+    /// sender mode two bulks of one file can finish out of order: the later
+    /// (fast) one must not settle the file while the earlier (slow) one is
+    /// still on the wire — that would journal the file before all its records
+    /// were accepted, and a failure of the slow bulk would then be lost.
+    #[test]
+    fn a_file_settles_only_after_all_its_bulks_return() {
+        let rejected = AtomicU64::new(0);
+        let calls = AtomicU64::new(0);
+        let returned = AtomicU64::new(0);
+        let pipe = BulkPipe::new(
+            {
+                let (calls, returned) = (&calls, &returned);
+                move |_body| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    returned.fetch_add(1, Ordering::SeqCst);
+                    Ok(outcome())
+                }
+            },
+            64,
+            5000,
+            &rejected,
+            1,
+        );
+        pipe.use_senders(2);
+        let (settled, returned_at_settle) = std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| pipe.sender_loop());
+            }
+            let t = pipe.token();
+            pipe.submit(t, vec![b'x'; 100], 1);
+            pipe.submit(t, vec![b'y'; 100], 1);
+            let settled = pipe.settle(t);
+            let returned_at_settle = returned.load(Ordering::SeqCst);
+            pipe.retire();
+            (settled, returned_at_settle)
+        });
+        settled.expect("accepted");
+        assert_eq!(
+            returned_at_settle, 2,
+            "the file settled while one of its bulks was still on the wire"
+        );
+    }
+
+    /// A record refused in one bulk settles the files of that bulk. A file of
+    /// the same bulk with another bulk still on the wire is not complete yet,
+    /// so the refusal of a neighbour must not settle it Ok early.
+    #[test]
+    fn a_neighbour_refusal_does_not_settle_a_file_with_a_bulk_on_the_wire() {
+        let rejected = AtomicU64::new(0);
+        let calls = AtomicU64::new(0);
+        let returned = AtomicU64::new(0);
+        let pipe = BulkPipe::new(
+            {
+                let (calls, returned) = (&calls, &returned);
+                move |_body| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        returned.fetch_add(1, Ordering::SeqCst);
+                        return Ok(outcome());
+                    }
+                    returned.fetch_add(1, Ordering::SeqCst);
+                    let mut refusal = outcome();
+                    refusal.item_errors = 1;
+                    refusal.first_error = Some("mapper_parsing_exception".into());
+                    refusal.refused.push(crate::esclient::RefusedItem {
+                        id: Some("b1".into()),
+                        error: "mapper_parsing_exception".into(),
+                        too_large: false,
+                    });
+                    Ok(refusal)
+                }
+            },
+            200,
+            5000,
+            &rejected,
+            1,
+        );
+        pipe.use_senders(2);
+        let action = |id: &str| format!("{{\"index\":{{\"_id\":\"{id}\"}}}}\n{{}}\n").into_bytes();
+        let (a, b, returned_at_settle) = std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| pipe.sender_loop());
+            }
+            let (a, b) = (pipe.token(), pipe.token());
+            let mut first = action("a1");
+            first.resize(300, b'\n');
+            pipe.submit(a, first, 1);
+            pipe.submit(b, action("b1"), 1);
+            let mut last = action("a2");
+            last.resize(300, b'\n');
+            pipe.submit(a, last, 1);
+            let settled_a = pipe.settle(a);
+            let at_settle = returned.load(Ordering::SeqCst);
+            let settled_b = pipe.settle(b);
+            pipe.retire();
+            (settled_a, settled_b, at_settle)
+        });
+        a.expect("every record of a was accepted");
+        b.expect_err("b1 was refused");
+        assert_eq!(
+            returned_at_settle, 2,
+            "a settled while one of its bulks was still on the wire"
+        );
+    }
+
+    /// Two workers cross the cut while every sender slot is busy. One of them
+    /// takes the buffer; the other must leave `submit` when it wakes, not wait
+    /// for a job that no longer exists.
+    #[test]
+    fn a_worker_parked_on_a_full_wire_leaves_when_another_takes_the_buffer() {
+        let rejected = AtomicU64::new(0);
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        let bodies = Mutex::new(Vec::new());
+        let pipe = BulkPipe::new(
+            {
+                let bodies = &bodies;
+                move |body| {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    bodies.lock().unwrap().push(body);
+                    Ok(outcome())
+                }
+            },
+            64,
+            5000,
+            &rejected,
+            3,
+        );
+        pipe.use_senders(1);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for _ in 0..600 {
+                    if finished.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                eprintln!("a worker stayed parked in submit");
+                std::process::abort();
+            });
+            s.spawn(|| pipe.sender_loop());
+            let workers: Vec<_> = (0..3)
+                .map(|_| {
+                    s.spawn(|| {
+                        let t = pipe.token();
+                        for _ in 0..40 {
+                            pipe.submit(t, vec![b'x'; 100], 1);
+                        }
+                        let settled = pipe.settle(t);
+                        pipe.retire();
+                        settled
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap().expect("accepted");
+            }
+            finished.store(true, Ordering::SeqCst);
+        });
+        let sent: usize = bodies.into_inner().unwrap().iter().map(Vec::len).sum();
+        assert_eq!(sent, 3 * 40 * 100, "every byte was sent once");
+    }
+
+    /// Sender mode keeps a file's failure sticky: the first of its bulks
+    /// fails, later ones succeed, the file still settles Err (and is not
+    /// journaled complete).
+    #[test]
+    fn sender_mode_keeps_a_failure_sticky() {
+        let rejected = AtomicU64::new(0);
+        let attempts = AtomicU64::new(0);
+        let pipe = BulkPipe::new(
+            {
+                let attempts = &attempts;
+                move |_body| {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(anyhow::anyhow!("connection reset by peer"))
+                    } else {
+                        Ok(outcome())
+                    }
+                }
+            },
+            64,
+            5000,
+            &rejected,
+            1,
+        );
+        pipe.use_senders(2);
+        let settled = std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| pipe.sender_loop());
+            }
+            let t = pipe.token();
+            pipe.submit(t, vec![b'x'; 100], 1);
+            pipe.submit(t, vec![b'y'; 100], 1);
+            let settled = pipe.settle(t);
+            pipe.retire();
+            settled
+        });
+        let err = settled.expect_err("sticky failure");
+        assert!(err.contains("connection reset"), "{err}");
     }
 
     /// The concurrent shape phase B actually runs: many workers, many small

@@ -973,12 +973,17 @@ impl<'a> EsSyncBackend<'a> {
     /// over operations whose groups — and therefore whose documents, selected
     /// by `ax_file` content id — are disjoint. The body is the serial loop's
     /// `apply`, unchanged; only the receiver changed.
+    ///
+    /// `in_flight` is the operation's own progress entry. Its byte weight is
+    /// the sealed NDJSON the operation replays, so an upsert credits it bulk
+    /// by bulk as the node accepts them, instead of all at once at the end.
     fn apply_shared(
         &self,
         operation: &SyncOperation,
         base: &CommittedManifest,
         desired: &GenerationManifest,
         snapshot: &SourceSnapshot,
+        in_flight: Option<&crate::progress::FileGuard<'_>>,
     ) -> Result<()> {
         anyhow::ensure!(
             desired
@@ -1001,7 +1006,7 @@ impl<'a> EsSyncBackend<'a> {
                 let new = new.context("upsert operation has no desired group")?;
                 // Remove a partial prior retry of the desired identity too.
                 self.delete_group(new, &desired.plan)?;
-                self.replay_prepared(snapshot, &new.content_id)?;
+                self.replay_prepared(snapshot, &new.content_id, in_flight)?;
             }
             crate::sync::SyncOperationKind::Metadata => {
                 self.replay_metadata(
@@ -1013,7 +1018,12 @@ impl<'a> EsSyncBackend<'a> {
         Ok(())
     }
 
-    fn replay_prepared(&self, snapshot: &SourceSnapshot, content_id: &str) -> Result<()> {
+    fn replay_prepared(
+        &self,
+        snapshot: &SourceSnapshot,
+        content_id: &str,
+        in_flight: Option<&crate::progress::FileGuard<'_>>,
+    ) -> Result<()> {
         // Cache-first resolution of the sealed artifact (#1224): a linear
         // scan of the snapshot's files per upsert is quadratic over a corpus
         // run. Falls back to `prepared_for`'s scan when no replay cache
@@ -1025,8 +1035,17 @@ impl<'a> EsSyncBackend<'a> {
             .with_context(|| format!("content {content_id} has no sealed prepared artifact"))?;
         let snapshot_dir = self.state_dir.join("sync-snapshots").join(&snapshot.tx_id);
         let file = File::open(snapshot_dir.join(&prepared.relative_ndjson))?;
+        // Bodies are consecutive slices of the artifact, so their running
+        // length is the position in the bytes this operation is weighted by.
+        let mut accepted = 0u64;
         stream_ndjson_pairs(BufReader::new(file), self.bulk_bytes, |body| {
-            checked_bulk(self.es, body)
+            let length = body.len() as u64;
+            checked_bulk(self.es, body)?;
+            accepted += length;
+            if let Some(in_flight) = in_flight {
+                in_flight.advance_to(accepted);
+            }
+            Ok(())
         })
     }
 
@@ -1881,7 +1900,7 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         desired: &GenerationManifest,
         snapshot: &SourceSnapshot,
     ) -> Result<()> {
-        self.apply_shared(operation, base, desired, snapshot)
+        self.apply_shared(operation, base, desired, snapshot, self.in_flight.as_ref())
     }
 
     fn replay_operations(
@@ -1918,8 +1937,8 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             // The in-flight entry IS this worker's file: the guard counts the
             // item done on every exit path, exactly as the serial loop's
             // `operation_begins`/`operation_applied` pair does (#931).
-            let _guard = pr.file(&item.rel, item.bytes);
-            this.apply_shared(item.operation, base, desired, snapshot)
+            let guard = pr.file(&item.rel, item.bytes);
+            this.apply_shared(item.operation, base, desired, snapshot, Some(&guard))
         };
         /// The serial loop's two journal writes, verbatim: Started before
         /// dispatch, Committed after the apply returned — the durable order
@@ -3351,6 +3370,63 @@ fn create_snapshot_inner(
         })
         .unwrap_or_default();
     let mut files = Vec::with_capacity(inventory.files.len());
+    // Each file's preparation identity, computed once: the staging count below
+    // and the reuse test in the seal loop both need it. `None` = nothing to
+    // prepare (no plan, or a junk/skipped file).
+    let identities: Vec<Option<String>> = inventory
+        .keys
+        .iter()
+        .map(|content_id| {
+            let assignment = plan.and_then(|plan| plan.files.get(content_id.as_str()));
+            match (lookup.as_ref(), assignment) {
+                (Some(lookup), Some(assignment)) => prepared_artifact_identity(
+                    chunker_identity,
+                    lookup,
+                    content_id.as_str(),
+                    assignment,
+                )
+                .map(Some),
+                _ => Ok(None),
+            }
+        })
+        .collect::<Result<_>>()?;
+    // What this seal writes before the first document is sent, known exactly
+    // here, so said before it starts. Every file the prior generation cannot
+    // lend is copied. Since #2421 a copy whose file has prepared records is
+    // released once those records are on disk; only a file with nothing to
+    // prepare keeps its copy.
+    let mut staged = crate::SnapshotStaging::default();
+    for (((source, content_id), content_digest), identity) in inventory
+        .files
+        .iter()
+        .zip(&inventory.keys)
+        .zip(&inventory.digests)
+        .zip(&identities)
+    {
+        // The seal loop's reuse test (`reusable` below), on the same inputs.
+        let lent = reuse_by_content
+            .get(content_id.as_str())
+            .is_some_and(|prior| {
+                prior.content_digest == *content_digest
+                    && prior.content_size == source.size
+                    && (!prior.blob_released
+                        || (prior.prepared.is_some()
+                            && prior.prepared_identity.is_some()
+                            && prior.prepared_identity == *identity))
+            });
+        if lent {
+            staged.reused_bytes += source.size;
+        } else if identity.is_some() {
+            staged.copy_bytes += source.size;
+            staged.largest_released = staged.largest_released.max(source.size);
+        } else {
+            staged.copy_bytes += source.size;
+            staged.kept_bytes += source.size;
+        }
+    }
+    if staged.copy_bytes >= crate::staging_note_min_bytes(state_dir) {
+        crate::note_snapshot_staging(pr, state_dir, &root, &staged);
+    }
     // Entered only when there is work to report: a retry that reuses a verified
     // final snapshot returned above and never claims a phase it did not run.
     pr.phase("snapshot", inventory.files.len() as u64, source_bytes);
@@ -3378,15 +3454,7 @@ fn create_snapshot_inner(
         // mutable tree, and the inventory it is verified against lists the
         // file), but there is nothing to prepare for it: `prepared: None`.
         let assignment = plan.and_then(|plan| plan.files.get(content_id.as_str()));
-        let prepared_identity = match (lookup.as_ref(), assignment) {
-            (Some(lookup), Some(assignment)) => Some(prepared_artifact_identity(
-                chunker_identity,
-                lookup,
-                content_id.as_str(),
-                assignment,
-            )?),
-            _ => None,
-        };
+        let prepared_identity = identities[ordinal].clone();
         let reusable = reuse_by_content
             .get(content_id.as_str())
             .copied()
@@ -6158,6 +6226,36 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(spawner.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// #2428 for the bulk senders: the sender loop stopped at the first
+    /// refused spawn, so two refusals in a row left the pipe with none of its
+    /// four senders (inline, one bulk on the wire). Each refusal is now
+    /// retried with the worker spawn's backoff, and all four start.
+    #[test]
+    fn bulk_senders_retry_a_refused_spawn_before_the_set_shrinks() {
+        let spawner = FlakySpawn::refusing(2);
+        let ran = std::sync::atomic::AtomicUsize::new(0);
+        let ran_ref = &ran;
+        let (pr, _buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_millis(40),
+        );
+        let started = xerj_common::thread_spawn::scope(|scope| {
+            crate::start_bulk_senders(
+                scope,
+                &spawner,
+                || true,
+                4,
+                move || {
+                    ran_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+                &pr,
+            )
+        });
+        assert_eq!(started, 4);
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(spawner.calls.load(std::sync::atomic::Ordering::SeqCst), 6);
     }
 
     /// A backend whose Nth `apply` is the server still answering 429 after

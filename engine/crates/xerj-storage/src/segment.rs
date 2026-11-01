@@ -340,6 +340,13 @@ pub struct SegmentMeta {
     /// Relative path of the `.sidx` file from the index root.
     #[serde(default)]
     pub sidx_path: String,
+    /// Decoded size of the stored section, the canonical JSON a merge
+    /// materialises, recorded by the writer of the segment
+    /// ([`SegmentWriter::set_stored_decoded_bytes`]). 0 = unknown: a segment
+    /// written before this field existed, or one recovered from disk without
+    /// its manifest entry.
+    #[serde(default)]
+    pub stored_decoded_bytes: u64,
 }
 
 // ── SegmentWriter ─────────────────────────────────────────────────────────────
@@ -361,6 +368,7 @@ pub struct SegmentWriter {
     schema_version: u32,
     sections: Vec<(SectionType, Vec<u8>)>,
     created_at_ms: u64,
+    stored_decoded_bytes: u64,
 }
 
 impl SegmentWriter {
@@ -383,7 +391,17 @@ impl SegmentWriter {
             schema_version,
             sections: Vec::new(),
             created_at_ms,
+            stored_decoded_bytes: 0,
         })
+    }
+
+    /// Record the decoded size of the stored section this writer carries (the
+    /// canonical JSON the segment's documents serialise to), for
+    /// [`SegmentMeta::stored_decoded_bytes`]. The writer of the section knows
+    /// it: a merge holds the merged JSON, a flush charges each document's
+    /// size to its memtable. Unset, the segment records 0 (unknown).
+    pub fn set_stored_decoded_bytes(&mut self, bytes: u64) {
+        self.stored_decoded_bytes = bytes;
     }
 
     /// Add a named section with raw bytes.
@@ -520,6 +538,7 @@ impl SegmentWriter {
 
         debug!(id = %self.id, size = buf.len(), doc_count, "segment written");
 
+        let stored_decoded_bytes = self.stored_decoded_bytes;
         Ok(SegmentMeta {
             id: self.id.clone(),
             doc_count,
@@ -530,6 +549,7 @@ impl SegmentWriter {
             has_tombstones,
             seg_path: seg_filename,
             sidx_path: sidx_filename,
+            stored_decoded_bytes,
         })
     }
 }

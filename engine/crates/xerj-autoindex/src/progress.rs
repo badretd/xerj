@@ -267,6 +267,15 @@ pub fn install_test_sink(buffer: &Arc<Mutex<Vec<u8>>>) -> TestSinkGuard {
     TestSinkGuard
 }
 
+/// `pct=` of one plain `xerj-progress` record read back from a test sink;
+/// `None` for `pct=unknown`.
+#[cfg(test)]
+pub(crate) fn record_pct(line: &str) -> Option<f64> {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("pct="))
+        .and_then(|value| value.parse().ok())
+}
+
 #[cfg(test)]
 pub struct TestSinkGuard;
 
