@@ -7470,6 +7470,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "xerj-common",
+ "xerj-pagedir",
  "xerj-wasm",
  "xxhash-rust",
  "zip 9.1.3",

@@ -95,6 +95,9 @@ fn check(dir: &Path, name: &str, lines: &[Vec<u8>], sizes: &[u32], strip_nl: boo
                 assert_eq!(&d.read(&f, i64_, Expect::LineHash(h), o).unwrap(), line);
             }
         }
+        for (i, &s) in starts.iter().enumerate() {
+            assert_eq!(d.passage_at(&f, s).unwrap(), i as u64, "{name} page {pg}");
+        }
         let mut before = 0;
         for p in 0..d.pages() {
             let c = pages.iter().filter(|&&x| x == p).count() as u64;

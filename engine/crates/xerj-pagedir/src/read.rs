@@ -318,6 +318,38 @@ impl PageDir {
         Ok((start - p, z1 - start))
     }
 
+    /// The passage whose line starts at byte `offset`, found through its page. For an indexer that
+    /// holds byte locators. An offset that is no line start is a stale file.
+    pub fn passage_at(&self, f: &File, offset: u64) -> Result<u64> {
+        let page = offset >> self.shift;
+        let (first, count) = self.passages_in_page(page)?;
+        let loc = Located {
+            page,
+            rank: 0,
+            count,
+        };
+        let buf = self.read_page(f, loc, false)?;
+        let at = (offset - (page << self.shift)) as usize;
+        let stale = || Error::Stale(format!("byte {offset} is not a line start"));
+        if at > buf.len() || count == 0 {
+            return Err(stale());
+        }
+        if at > 0 && buf[at - 1] != b'\n' {
+            return Err(stale());
+        }
+        let before = memchr_iter(b'\n', &buf[..at]).count() as u64;
+        let body = buf.len().min(self.header.page_size as usize).saturating_sub(1);
+        let interior = memchr_iter(b'\n', &buf[..body]).count() as u64;
+        // Byte 0 starts a record exactly when the page holds one record more than its interior
+        // newlines announce.
+        let byte0 = interior + 1 == count;
+        if at == 0 && !byte0 {
+            return Err(stale());
+        }
+        // With byte 0 a start, the n-th newline in the page starts record n; without, record n - 1.
+        Ok(first + before - u64::from(!byte0))
+    }
+
     fn read_page(&self, f: &File, loc: Located, prefetch: bool) -> Result<Vec<u8>> {
         let pg = self.header.page_size as usize;
         let want = if prefetch && loc.rank + 1 == loc.count {
