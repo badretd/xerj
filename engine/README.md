@@ -319,7 +319,13 @@ HTTP Request
 | `xerj-rerank` | Second-stage reranking client for `_search`: strict `rerank` block parser, provider call with batching and a deadline, degrade-on-deadline / surface-on-contract failure policy. A leaf the API layer calls; the engine does not link it |
 | `xerj-hub` | Corpus Hub v2 client behind `xerj ask` / `xerj "<question>"`, `xerj hub …` and `xerj code <corpus> --def`: pulls, verifies and restores signed pre-indexed packs, builds them for CI, and routes a question to a corpus. Depends on `xerj-autoindex`; the engine does not link it |
 | `xerj-wasm` | Pluggable ingest-time document transform pipeline |
-| `xerj-facts` | SPIKE (local branch, not upstream): the XERJ-R facts store behind `/_facts`, its exact executor and learned compiler; built only with the `facts` feature (off by default) and linked to the research crates by path |
+| `xerj-facts` | XERJ-R facts store behind `/_facts`, its exact executor and learned compiler; on in the default build |
+| `xerj-store` | XERJ-R versioned record store |
+| `xerj-index` | XERJ-R entity linker and subject, relation and text indexes |
+| `xerj-exec` | XERJ-R exact program executor |
+| `xerj-infer` | XERJ-R model runtime, CPU, FP32 and weight-only INT8 |
+| `xerj-serve` | XERJ-R serving path: compile, verify, `decline_v2` policy |
+| `xerj-pagedir` | Page-pointer directories with self-checking reads, for text left in the original file |
 
 Every crate under `crates/` appears in this table — `crates/xerj-engine/tests/docs_capability_lists.rs`
 fails if one is missing or if the table names a crate that no longer exists. Five of them

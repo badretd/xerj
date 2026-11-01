@@ -3857,13 +3857,16 @@ mod decide_flag_tests {
     #[test]
     fn help_counts_the_mcp_tools_actually_served() {
         // The count is `tool_specs()`, the same list `tools/list` returns:
-        // twenty without a hub key, twenty-three with the three hub tools.
+        // twenty without a hub key, three more with the hub tools, one more
+        // when the build carries facts.
         let served = super::mcp_tool_count();
+        let facts = usize::from(cfg!(feature = "facts"));
         if xerj_common::hub::hub_key_configured() {
-            assert_eq!(served, 23, "tool_specs() with a hub key: {served}");
+            assert_eq!(served, 23 + facts, "tool_specs() with a hub key: {served}");
         } else {
             assert_eq!(
-                served, 20,
+                served,
+                20 + facts,
                 "a no-key process must not count the hub tools it does not serve"
             );
         }
