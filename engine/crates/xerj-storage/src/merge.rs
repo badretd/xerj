@@ -611,6 +611,7 @@ mod tests {
             has_tombstones: false,
             seg_path: format!("{id}.seg"),
             sidx_path: format!("{id}.sidx"),
+            stored_decoded_bytes: 0,
         };
 
         let segments = vec![
@@ -668,6 +669,7 @@ mod tests {
             has_tombstones: false,
             seg_path: String::new(),
             sidx_path: String::new(),
+            stored_decoded_bytes: 0,
         }
     }
 

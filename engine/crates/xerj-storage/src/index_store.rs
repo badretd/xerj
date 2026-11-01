@@ -1288,6 +1288,7 @@ impl IndexStore {
                         has_tombstones: true,
                         seg_path: seg_filename,
                         sidx_path: format!("{prefix}.sidx"),
+                        stored_decoded_bytes: 0,
                     });
                     continue;
                 }
@@ -1392,6 +1393,8 @@ impl IndexStore {
                 has_tombstones,
                 seg_path: seg_filename,
                 sidx_path: format!("{prefix}.sidx"),
+                // Recovered without its manifest entry: unknown.
+                stored_decoded_bytes: 0,
             });
         }
 
@@ -2513,6 +2516,14 @@ impl IndexStore {
             writer.add_section(SectionType::Tombstones, &ts_bytes)?;
         }
 
+        // What a merge of this segment will decode: each document's charged
+        // size (its raw JSON, or a structural estimate within ~10 % of it)
+        // plus the `{"_id":..,"_seq_no":..,"_source":..}` wrapper.
+        let stored_decoded_bytes: u64 = live_entries
+            .iter()
+            .map(|e| e.charge.saturating_add(e.doc_id.len() as u64 + 48))
+            .sum();
+        writer.set_stored_decoded_bytes(stored_decoded_bytes);
         let t_wfin = std::time::Instant::now();
         let meta = writer.finish(doc_count, min_seq, max_seq)?;
         let prof_wfin_us = t_wfin.elapsed().as_micros();
@@ -5604,6 +5615,7 @@ mod tests {
             has_tombstones: false,
             seg_path: seg_name.clone(),
             sidx_path: format!("{segment_id}.sidx"),
+            stored_decoded_bytes: 0,
         };
         store.write_flush_completion_manifest(&meta).unwrap();
         assert!(store.validate_flush_completion_manifest(segment_id, 2, 10, 11));
@@ -5711,6 +5723,7 @@ mod tests {
             has_tombstones: false,
             seg_path: format!("{segment_id}.seg"),
             sidx_path: format!("{segment_id}.sidx"),
+            stored_decoded_bytes: 0,
         };
         store.write_flush_completion_manifest(&meta).unwrap();
         assert!(store.validate_flush_completion_manifest(segment_id, 1, 1, 1));
@@ -5750,6 +5763,7 @@ mod tests {
             has_tombstones: false,
             seg_path: format!("{segment_id}.seg"),
             sidx_path: format!("{segment_id}.sidx"),
+            stored_decoded_bytes: 0,
         };
         store.write_flush_completion_manifest(&meta).unwrap();
         assert!(store.validate_flush_completion_manifest(segment_id, 1, 1, 1));

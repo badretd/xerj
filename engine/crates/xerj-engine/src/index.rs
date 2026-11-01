@@ -10730,6 +10730,9 @@ pub struct SegmentInfo {
     pub deleted_doc_count: u64,
     /// The segment's on-disk size in bytes.
     pub size_bytes: u64,
+    /// Decoded size of its stored section, the canonical JSON a merge of it
+    /// materialises (`SegmentMeta::stored_decoded_bytes`); 0 when unknown.
+    pub stored_decoded_bytes: u64,
 }
 
 /// Statistics about an index.
@@ -16449,6 +16452,9 @@ impl Index {
                         encoded.len(),
                     );
                     let stored_us = stored_timer.elapsed().as_micros();
+                    // The merged JSON IS the decoded stored section: record its
+                    // size on the merged segment.
+                    writer.set_stored_decoded_bytes(merged_json_buf.len() as u64);
                     drop(merged_json_buf);
                     crate::ingest_memory::observe_checkpoint(
                         crate::ingest_memory::Category::MergeJsonBuffer,
@@ -30237,6 +30243,7 @@ impl Index {
                 doc_count: meta.doc_count,
                 deleted_doc_count: deleted,
                 size_bytes: meta.size_bytes,
+                stored_decoded_bytes: meta.stored_decoded_bytes,
             });
         }
         out
