@@ -2271,7 +2271,10 @@ mod tests {
     #[test]
     fn an_ask_that_names_no_rule_gets_decline_v2_and_served_stays_available() {
         assert!(matches!(verify_rule(None), Ok(VerifyRule::DeclineV2)));
-        assert!(matches!(verify_rule(Some("served")), Ok(VerifyRule::Served)));
+        assert!(matches!(
+            verify_rule(Some("served")),
+            Ok(VerifyRule::Served)
+        ));
         assert!(matches!(
             verify_rule(Some("decline_v2")),
             Ok(VerifyRule::DeclineV2)
@@ -2284,7 +2287,16 @@ mod tests {
 
     #[test]
     fn threads_are_half_the_cores_between_one_and_four_unless_named() {
-        for (cores, want) in [(1, 1), (2, 1), (3, 1), (4, 2), (6, 3), (8, 4), (20, 4), (128, 4)] {
+        for (cores, want) in [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (6, 3),
+            (8, 4),
+            (20, 4),
+            (128, 4),
+        ] {
             for unset in [None, Some("0"), Some("x")] {
                 let s = speed_from(unset, None, cores);
                 assert_eq!(s.threads, want, "{cores} cores, {unset:?}");
