@@ -25,7 +25,7 @@ c = Client(a.port)
 st, b = c.call("POST", f"/_facts/{ns}/_bulk", bulk_body(w))
 r.check("no model: writes work", st == 200, str(b)[:200])
 st, o = c.call("POST", f"/_facts/{ns}/_ask", {"question": q, "item_id": s["item_id"]})
-r.check("no model: _ask is 503 MODEL_UNAVAILABLE, not retryable", st == 503 and "MODEL_UNAVAILABLE" in json.dumps(o) and o.get("retryable") is False, [st, str(o)[:300]])
+r.check("no model: _ask is 503 MODEL_UNAVAILABLE, not retryable", st == 503 and "MODEL_UNAVAILABLE" in json.dumps(o) and o["error"].get("retryable") is False, [st, str(o)[:300]])
 srv.stop()
 
 srv = Server(a.bin, a.model, os.path.join(a.out, "data_plain"), a.port, a.cpus, threads=0)
