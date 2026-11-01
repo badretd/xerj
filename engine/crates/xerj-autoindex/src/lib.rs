@@ -17708,6 +17708,68 @@ mod bulk_pipe_tests {
         );
     }
 
+    /// A record refused in one bulk settles the files of that bulk. A file of
+    /// the same bulk with another bulk still on the wire is not complete yet,
+    /// so the refusal of a neighbour must not settle it Ok early.
+    #[test]
+    fn a_neighbour_refusal_does_not_settle_a_file_with_a_bulk_on_the_wire() {
+        let rejected = AtomicU64::new(0);
+        let calls = AtomicU64::new(0);
+        let returned = AtomicU64::new(0);
+        let pipe = BulkPipe::new(
+            {
+                let (calls, returned) = (&calls, &returned);
+                move |_body| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        returned.fetch_add(1, Ordering::SeqCst);
+                        return Ok(outcome());
+                    }
+                    returned.fetch_add(1, Ordering::SeqCst);
+                    let mut refusal = outcome();
+                    refusal.item_errors = 1;
+                    refusal.first_error = Some("mapper_parsing_exception".into());
+                    refusal.refused.push(crate::esclient::RefusedItem {
+                        id: Some("b1".into()),
+                        error: "mapper_parsing_exception".into(),
+                        too_large: false,
+                    });
+                    Ok(refusal)
+                }
+            },
+            200,
+            5000,
+            &rejected,
+            1,
+        );
+        pipe.use_senders(2);
+        let action = |id: &str| format!("{{\"index\":{{\"_id\":\"{id}\"}}}}\n{{}}\n").into_bytes();
+        let (a, b, returned_at_settle) = std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| pipe.sender_loop());
+            }
+            let (a, b) = (pipe.token(), pipe.token());
+            let mut first = action("a1");
+            first.resize(300, b'\n');
+            pipe.submit(a, first, 1);
+            pipe.submit(b, action("b1"), 1);
+            let mut last = action("a2");
+            last.resize(300, b'\n');
+            pipe.submit(a, last, 1);
+            let settled_a = pipe.settle(a);
+            let at_settle = returned.load(Ordering::SeqCst);
+            let settled_b = pipe.settle(b);
+            pipe.retire();
+            (settled_a, settled_b, at_settle)
+        });
+        a.expect("every record of a was accepted");
+        b.expect_err("b1 was refused");
+        assert_eq!(
+            returned_at_settle, 2,
+            "a settled while one of its bulks was still on the wire"
+        );
+    }
+
     /// Sender mode keeps a file's failure sticky: the first of its bulks
     /// fails, later ones succeed, the file still settles Err (and is not
     /// journaled complete).

@@ -349,6 +349,9 @@ const SHRINK_COOLDOWN: Duration = Duration::from_secs(1);
 /// breaker/drain cycle repeated every ~12 s, so a window shorter than that
 /// (1 s before, or 2 s) still lets one trip halve the window five times.
 const EPISODE_MAX_COOLDOWN: Duration = Duration::from_secs(15);
+/// Where a loading run's window starts: enough to overlap two bulks, never the
+/// whole `--workers` before the node has answered one.
+const INITIAL_LIMIT: usize = 2;
 /// Clean bulks required before the limit is probed upward by one below
 /// `ssthresh` (above `ssthresh`, congestion avoidance scales this by `limit`).
 const RECOVER_AFTER: usize = 8;
@@ -428,6 +431,18 @@ impl BulkAdmission {
         }
     }
 
+    /// Start at [`INITIAL_LIMIT`] and earn the rest of the window with clean
+    /// bulks, instead of offering the full `--workers` to a node whose memory
+    /// nobody has measured yet.
+    fn with_slow_start(self) -> Self {
+        {
+            let mut state = self.inner.lock().unwrap();
+            state.limit = self.ceiling.min(INITIAL_LIMIT);
+            state.announced_limit = state.limit;
+        }
+        self
+    }
+
     /// Tests use a short budget. Production sets this from the bulk HTTP
     /// timeout in `Es::with_bulk_concurrency`.
     fn with_wait_budget(mut self, budget: Duration) -> Self {
@@ -444,8 +459,7 @@ impl BulkAdmission {
         self.announce
     }
 
-    /// Current admission limit; equals the ceiling until the server pushes
-    /// back. `0` when the gate is off.
+    /// Current admission limit. `0` when the gate is off.
     pub fn limit(&self) -> usize {
         if !self.enabled() {
             return 0;
@@ -832,12 +846,32 @@ impl BackpressureExhausted {
 /// One attempt of a retried request, as [`Es::retry_loop`] sees it.
 enum Attempt<T> {
     Done(T),
-    /// HTTP 429, with the server's stated reason when it gave one.
-    Throttled(Option<String>),
+    /// HTTP 429, with the server's stated reason and `Retry-After` when it
+    /// gave them.
+    Throttled(Option<String>, Option<Duration>),
     /// 5xx or a transport error.
     Failed(anyhow::Error),
     /// Not retryable: returned to the caller as-is.
     Abort(anyhow::Error),
+}
+
+/// The longest wait a `Retry-After` can ask of one attempt. The value comes
+/// from the server, and a run's patience is measured against wall time, so a
+/// wrong header must not spend all of it in one sleep.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// A 429's `Retry-After` in seconds, capped at [`MAX_RETRY_AFTER`]. The
+/// HTTP-date form is not used by any XERJ node and reads as absent.
+fn retry_after(resp: &reqwest::blocking::Response) -> Option<Duration> {
+    let seconds: u64 = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds).min(MAX_RETRY_AFTER))
 }
 
 /// What one round of a bulk request said, item by item.
@@ -853,6 +887,8 @@ struct Round {
     throttle_reason: Option<String>,
     /// Items in the response, for alignment with the request body.
     items: usize,
+    /// The response's `Retry-After`, when it had one.
+    retry_after: Option<Duration>,
     /// Set when the server refused the WHOLE request as too large (#955),
     /// with the dimension it named. Nothing in such a request was written.
     too_large: Option<TooLarge>,
@@ -978,6 +1014,7 @@ fn parse_round(v: &Value) -> Round {
         first_settled_error: None,
         throttle_reason: None,
         items: items.map_or(0, Vec::len),
+        retry_after: None,
         too_large: None,
     };
     if !v.get("errors").and_then(|e| e.as_bool()).unwrap_or(false) {
@@ -1352,7 +1389,9 @@ impl Es {
 
     pub fn with_bulk_concurrency(mut self, workers: usize, announce: bool) -> Self {
         self.admission = Arc::new(
-            BulkAdmission::new(workers.max(1), announce).with_wait_budget(self.bulk_timeout),
+            BulkAdmission::new(workers.max(1), announce)
+                .with_slow_start()
+                .with_wait_budget(self.bulk_timeout),
         );
         self
     }
@@ -1565,6 +1604,7 @@ impl Es {
     ) -> Attempt<T> {
         let status = resp.status();
         if status.as_u16() == 429 {
+            let retry_after = retry_after(&resp);
             let reason = server_reason(resp);
             if let Some(reason) = reason.as_deref().filter(|r| is_query_allocation_refusal(r)) {
                 // The per-query memory guard prices THIS request against a
@@ -1577,7 +1617,7 @@ impl Es {
                      memory guard refuses the same query again)"
                 ));
             }
-            return Attempt::Throttled(reason);
+            return Attempt::Throttled(reason, retry_after);
         }
         if status.is_server_error() {
             return Attempt::Failed(match server_reason(resp) {
@@ -1644,10 +1684,12 @@ impl Es {
         let started = Instant::now();
         let mut last_notice: Option<Instant> = None;
         loop {
+            let mut wait = delay;
             match attempt() {
                 Attempt::Done(v) => return Ok(v),
                 Attempt::Abort(e) => return Err(e),
-                Attempt::Throttled(reason) => {
+                Attempt::Throttled(reason, retry_after) => {
+                    wait = retry_after.map_or(delay, |asked| asked.max(delay));
                     self.admission.on_congestion();
                     let raw = reason.as_deref().unwrap_or("HTTP 429");
                     let err = match &reason {
@@ -1703,7 +1745,7 @@ impl Es {
                     );
                 }
             }
-            self.backoff(delay);
+            self.backoff(wait);
             // Another worker may have latched the node while this one slept.
             if let Some(down) = self.latched_down() {
                 return Err(down);
@@ -2058,7 +2100,7 @@ impl Es {
                 .items_reissued
                 .fetch_add(round.throttled.len() as u64, Ordering::Relaxed);
             body = retry;
-            self.backoff(delay);
+            self.backoff(round.retry_after.map_or(delay, |asked| asked.max(delay)));
             delay = (delay * 2).min(self.retry_max_delay);
         }
     }
@@ -2167,6 +2209,7 @@ impl Es {
                 });
             }
             if status.as_u16() == 429 {
+                let asked = retry_after(&resp);
                 let text = match resp.text() {
                     Ok(text) => text,
                     Err(e) => return Attempt::Failed(anyhow!(e).context("read bulk 429 body")),
@@ -2175,10 +2218,17 @@ impl Es {
                     .ok()
                     .filter(|v| v.get("items").is_some_and(Value::is_array))
                 {
-                    Some(v) => Attempt::Done(parse_round(&v)),
+                    Some(v) => {
+                        let mut round = parse_round(&v);
+                        round.retry_after = asked;
+                        Attempt::Done(round)
+                    }
                     None => {
                         throttles.set(throttles.get() + 1);
-                        Attempt::Throttled(Some(text.chars().take(SERVER_REASON_MAX).collect()))
+                        Attempt::Throttled(
+                            Some(text.chars().take(SERVER_REASON_MAX).collect()),
+                            asked,
+                        )
                     }
                 };
             }
@@ -3886,12 +3936,16 @@ mod tests {
         let server = serve(listener, plan);
 
         let es = client(address, 8);
-        assert_eq!(es.bulk_concurrency_limit(), 8, "starts at --workers");
+        assert_eq!(
+            es.bulk_concurrency_limit(),
+            2,
+            "starts at the slow-start window"
+        );
 
         es.bulk(BULK.to_vec()).unwrap();
         assert_eq!(
             es.bulk_concurrency_limit(),
-            4,
+            1,
             "a 429 must halve the offered concurrency"
         );
         assert_eq!(es.bulk_congestion_events(), 1);
@@ -3901,7 +3955,7 @@ mod tests {
         }
         assert_eq!(
             es.bulk_concurrency_limit(),
-            5,
+            2,
             "recovery is additive: one worker back per clean streak, not a reset"
         );
         assert_eq!(es.bulk_congestion_events(), 1);
@@ -3929,7 +3983,7 @@ mod tests {
         assert_eq!(outcome.server_errors, 1);
         assert_eq!(
             es.bulk_concurrency_limit(),
-            2,
+            1,
             "an item-level 429 must shrink the window too"
         );
         server.join().unwrap();
@@ -4204,6 +4258,80 @@ mod tests {
             ),
             None => format!(r#"{{"index":{{"_index":"i","_id":"{id}","status":{status}}}}}"#),
         }
+    }
+
+    /// A 429 asks for one second and the capped backoff is 20 ms: the wait is
+    /// the larger of the two, on both shapes the node answers with.
+    #[test]
+    fn a_retry_after_longer_than_the_backoff_is_honoured() {
+        let whole = b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 2\r\n\
+                      Connection: close\r\n\r\n{}";
+        let items = items_response(&[item("a", 429, Some(BREAKER))], true);
+        let mut per_item = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            items.len()
+        )
+        .into_bytes();
+        per_item.extend_from_slice(&items);
+        for refusal in [whole.to_vec(), per_item] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_request(&mut stream);
+                stream.write_all(&refusal).unwrap();
+                let (mut stream, _) = listener.accept().unwrap();
+                read_request(&mut stream);
+                respond_json(&mut stream, &items_response(&[item("a", 201, None)], false));
+            });
+            let es = client(address, 4);
+            es.bulk(pair("a")).unwrap();
+            server.join().unwrap();
+            let waits = es.backoff_delays.lock().unwrap().clone();
+            assert_eq!(waits.len(), 1, "{waits:?}");
+            assert_eq!(waits[0].0, Duration::from_secs(1), "{waits:?}");
+        }
+    }
+
+    /// A number the server gets wrong cannot spend a run's patience at once.
+    #[test]
+    fn a_huge_retry_after_is_capped() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 86400\r\n\
+                      Content-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let resp = reqwest::blocking::get(format!("http://{address}/")).unwrap();
+        assert_eq!(super::retry_after(&resp), Some(super::MAX_RETRY_AFTER));
+        server.join().unwrap();
+    }
+
+    /// A loading run starts at two bulks and earns `--workers` with clean ones.
+    #[test]
+    fn the_bulk_window_starts_small_and_grows_while_clean() {
+        let admission = super::BulkAdmission::new(4, false).with_slow_start();
+        assert_eq!(admission.limit(), 2);
+        for expected in [3, 4] {
+            for _ in 0..super::RECOVER_AFTER {
+                admission.on_success();
+            }
+            assert_eq!(admission.limit(), expected);
+        }
+        // One worker stays one bulk.
+        assert_eq!(
+            super::BulkAdmission::new(1, false)
+                .with_slow_start()
+                .limit(),
+            1
+        );
     }
 
     fn items_response(items: &[String], errors: bool) -> Vec<u8> {
