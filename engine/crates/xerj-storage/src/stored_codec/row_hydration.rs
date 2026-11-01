@@ -595,9 +595,9 @@ fn select_column_rows(
                 Err(()) => return Ok(Err(None)),
             }
         }
-        ColCodec::RawJsonBlocks => {
+        ColCodec::RawJsonBlocks | ColCodec::RawJsonBlocksDict => {
             // Only the blocks that hold a selected row are decompressed.
-            let blocks = RawBlocks::parse(column.payload, directory.num_docs)?;
+            let blocks = RawBlocks::parse_column(column.codec, column.payload, directory.num_docs)?;
             let mut values = Vec::with_capacity(selected.len());
             let mut next = 0usize;
             for block in 0..blocks.len() {
