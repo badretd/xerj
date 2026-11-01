@@ -45,7 +45,11 @@ use crate::{Result, SeqNo, StorageError};
 /// versus `ss`). A v3 binary reads v1 raw side-cars and v2 encoded side-cars.
 /// A v2 binary must refuse the directory once a v3 side-car can be created:
 /// it would look `page_Id` up as a literal filename and silently skip it.
-const DATA_DIR_FORMAT_VERSION: u32 = 3;
+///
+/// Version 4 permits the compact codecs: `.post` files with the ZPS4 envelope
+/// (a v3 binary would take its unknown magic for the raw legacy layout and read
+/// garbage). A v3 binary therefore refuses such a directory at open.
+const DATA_DIR_FORMAT_VERSION: u32 = 4;
 
 /// Baseline written for fresh and pre-marker directories.
 ///
@@ -56,6 +60,9 @@ const DATA_DIR_BASE_FORMAT_VERSION: u32 = 1;
 
 /// First layout version that permits digest-derived FTS field components.
 const DATA_DIR_FTS_ENCODED_FIELD_COMPONENT_VERSION: u32 = 2;
+
+/// First layout version that permits the compact postings codecs.
+const DATA_DIR_COMPACT_CODECS_VERSION: u32 = 4;
 
 /// First layout version that digest-encodes field names which collide under
 /// NTFS case folding but were portable literals in layout v2.
@@ -562,6 +569,7 @@ pub struct IndexStore {
     /// 2 → 3. Confirming v3 also latches the v2 flag so a later v2 preflight
     /// cannot rewrite the marker back down.
     fts_v3_marker_durability_confirmed: AtomicBool,
+    compact_codecs_marker_durability_confirmed: AtomicBool,
     #[cfg(any(test, feature = "test-hooks"))]
     data_dir_format_write_failpoint: std::sync::atomic::AtomicU8,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -946,6 +954,7 @@ impl IndexStore {
             data_dir_format_lock: Mutex::new(()),
             fts_v2_marker_durability_confirmed: AtomicBool::new(false),
             fts_v3_marker_durability_confirmed: AtomicBool::new(false),
+            compact_codecs_marker_durability_confirmed: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-hooks"))]
             data_dir_format_write_failpoint: std::sync::atomic::AtomicU8::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
@@ -4403,9 +4412,19 @@ impl IndexStore {
         )
     }
 
+    /// Durably fence a writer before it creates a segment in a compact codec.
+    /// Advances the marker to v4, after which older builds refuse the directory
+    /// at open instead of misreading it. Same protocol as the filename fences.
+    pub fn ensure_compact_codecs_format(&self) -> Result<()> {
+        self.ensure_fts_filename_component_format(DATA_DIR_COMPACT_CODECS_VERSION)
+    }
+
     fn ensure_fts_filename_component_format(&self, target: u32) -> Result<()> {
         let _format_guard = self.data_dir_format_lock.lock().unwrap();
-        let already = if target >= DATA_DIR_FTS_CASE_DISTINGUISHED_FIELD_COMPONENT_VERSION {
+        let already = if target >= DATA_DIR_COMPACT_CODECS_VERSION {
+            self.compact_codecs_marker_durability_confirmed
+                .load(Ordering::Acquire)
+        } else if target >= DATA_DIR_FTS_CASE_DISTINGUISHED_FIELD_COMPONENT_VERSION {
             self.fts_v3_marker_durability_confirmed
                 .load(Ordering::Acquire)
         } else {
@@ -4519,6 +4538,10 @@ impl IndexStore {
     }
 
     fn note_fts_filename_format_confirmed(&self, target: u32) {
+        if target >= DATA_DIR_COMPACT_CODECS_VERSION {
+            self.compact_codecs_marker_durability_confirmed
+                .store(true, Ordering::Release);
+        }
         if target >= DATA_DIR_FTS_CASE_DISTINGUISHED_FIELD_COMPONENT_VERSION {
             #[cfg(any(test, feature = "test-hooks"))]
             self.fts_v3_marker_durability_confirmations
@@ -8253,6 +8276,25 @@ mod tests {
     }
 
     /// A successful open stamps the data-dir format marker.
+    #[test]
+    fn compact_codecs_fence_makes_older_builds_refuse_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_test_store(dir.path());
+        IndexStore::check_data_dir_version_with_max(dir.path(), 3).unwrap();
+        store.ensure_fts_encoded_field_component_format().unwrap();
+        IndexStore::check_data_dir_version_with_max(dir.path(), 3).unwrap();
+        store.ensure_compact_codecs_format().unwrap();
+        store.ensure_compact_codecs_format().unwrap();
+        // The filename fences must not write the marker downwards.
+        store
+            .ensure_fts_case_distinguished_field_component_format()
+            .unwrap();
+        store.ensure_fts_encoded_field_component_format().unwrap();
+        let error = IndexStore::check_data_dir_version_with_max(dir.path(), 3).unwrap_err();
+        assert!(error.to_string().contains("newer xerj"), "{error}");
+        IndexStore::check_data_dir_version_with_max(dir.path(), 4).unwrap();
+    }
+
     #[test]
     fn open_stamps_data_dir_format_marker() {
         let dir = tempfile::tempdir().unwrap();

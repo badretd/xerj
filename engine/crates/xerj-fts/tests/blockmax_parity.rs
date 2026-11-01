@@ -49,8 +49,25 @@ fn word(i: usize) -> String {
 
 /// `docs` documents with fields `body` (positions), `title` (positions) and `tags` (docs-only)
 fn build_segment(dir: &Path, segment: &str, docs: usize, seed: u64) {
+    build_segment_with(
+        dir,
+        segment,
+        docs,
+        seed,
+        xerj_fts::postings::BlockCodec::Packed,
+    )
+}
+
+fn build_segment_with(
+    dir: &Path,
+    segment: &str,
+    docs: usize,
+    seed: u64,
+    codec: xerj_fts::postings::BlockCodec,
+) {
     let registry = Arc::new(AnalyzerRegistry::default());
-    let mut writer = FtsIndexWriter::new(dir, segment, Arc::clone(&registry));
+    let mut writer =
+        FtsIndexWriter::new(dir, segment, Arc::clone(&registry)).with_block_codec(codec);
     writer.configure_field("body", FieldIndexConfig::default());
     writer.configure_field("title", FieldIndexConfig::default());
     writer.configure_field(
@@ -303,4 +320,42 @@ fn cross_segment_floor_keeps_the_merged_page() {
             }
         }
     }
+}
+
+/// The experimental ZPS3 codec (Elias-Fano doc ids, arithmetic-coded frequencies) answers through the
+/// same block index and walk: same contract against the generic path, which reads ZPS3 too.
+#[test]
+fn match_walk_parity_on_the_elias_fano_ac_codec() {
+    let dir = TempDir::new().unwrap();
+    build_segment_with(
+        dir.path(),
+        "seg-e",
+        4_000,
+        0x00dd_ba11,
+        xerj_fts::postings::BlockCodec::EliasFanoAc,
+    );
+    let post = std::fs::read(dir.path().join("seg-e.body.post")).unwrap();
+    assert_eq!(&post[..4], b"ZPS3");
+    let reader = FtsIndexReader::open(dir.path(), "seg-e", &["body", "title", "tags"]).unwrap();
+    assert!(reader.block_index("body").is_some());
+    drop(reader);
+    let qs = queries(0x00e1_a5f0, 25);
+    check(&searcher(dir.path(), "seg-e"), &qs, "ZPS3");
+}
+
+/// ZPS4 answers like ZPS2 through the same walk and contract.
+#[test]
+fn match_walk_parity_without_position_counts() {
+    let dir = TempDir::new().unwrap();
+    build_segment_with(
+        dir.path(),
+        "seg-n",
+        4_000,
+        0x00dd_ba11,
+        xerj_fts::postings::BlockCodec::PackedNoCounts,
+    );
+    let post = std::fs::read(dir.path().join("seg-n.body.post")).unwrap();
+    assert_eq!(&post[..4], b"ZPS4");
+    let qs = queries(0x00e1_a5f0, 25);
+    check(&searcher(dir.path(), "seg-n"), &qs, "ZPS4");
 }
