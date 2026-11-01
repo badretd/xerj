@@ -67,7 +67,7 @@
 //! - **Model errors are sticky.** A missing or broken model directory is `503 MODEL_UNAVAILABLE` with
 //!   `retryable: false` until the node restarts.
 
-/// The facts compiler preload at server start-up (`XERJ_FACTS_PRELOAD`, off by default): see
+/// The facts compiler preload at server start-up (`XERJ_FACTS_PRELOAD`, on when a model directory is set): see
 /// [`xerj_facts::start_early_preload`]. Re-exported for `xerj-server`, which reaches the facts crate through this one.
 pub use xerj_facts::start_early_preload;
 
@@ -129,8 +129,8 @@ const LINKERS: &[&str] = &[
 /// The `manifest` values `_ask` accepts: the reference manifests (default) or the opt-in `relation_aware` choice where a
 /// manifest cap binds (`xerj_index::direction::RelPref`).
 const MANIFESTS: &[&str] = &["reference", "relation_aware"];
-/// The `verify` values `_ask` accepts (`xerj_facts::VerifyRule`): the served rule (default) or the opt-in exact-binding
-/// rules, for the owner's decision on the verify rule. None changes the program or the raw answer.
+/// The `verify` values `_ask` accepts (`xerj_facts::VerifyRule`); without one, `decline_v2` decides what is served. None
+/// changes the program or the raw answer.
 const VERIFY_RULES: &[&str] = &xerj_facts::VerifyRule::NAMES;
 /// `Retry-After` of the retryable 503 / 504 answers, in seconds.
 const RETRY_AFTER_SECS: u64 = 1;

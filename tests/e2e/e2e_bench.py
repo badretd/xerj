@@ -92,7 +92,7 @@ def load():
         if st != 200:
             raise RuntimeError((st, str(b)[:200]))
         with lock:
-            f.write(json.dumps({"item_id": i, "to_rev": b["committed"]["to_rev"], "ms": (time.perf_counter() - t) * 1e3, "records": b["records_indexed"]}) + "\n")
+            f.write(json.dumps({"item_id": i, "to_rev": (b.get("committed") or {}).get("to_rev"), "ms": (time.perf_counter() - t) * 1e3, "records": b["records_indexed"]}) + "\n")
             f.flush()
 
     t0 = time.time()

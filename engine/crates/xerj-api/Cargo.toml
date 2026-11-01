@@ -19,11 +19,11 @@ neural = ["xerj-engine/neural"]
 # #1060): the same loader, the same model directory, the same loaded copy.
 decide-local = ["dep:xerj-ai", "xerj-ai/decide-local", "xerj-rerank/judge-local"]
 onnx-experimental = ["xerj-engine/onnx-experimental"]
-# SPIKE (local branch spike/facts-68m, never pushed): /_facts with the XERJ-R facts store, exact executor and compiler.
+# /_facts with the XERJ-R facts store, exact executor and compiler.
 # Also reserves the `-facts` suffix in namespace and brain names (`authz::FACTS_SUFFIX_RESERVED`), here and in
 # xerj-autoindex.
 facts = ["dep:xerj-facts", "xerj-autoindex/facts"]
-# Test-only (local branch): the facts store's crash points (`xerj-facts/failpoints`) for the kill-and-restart tests. Off by
+# Test-only: the facts store's crash points (`xerj-facts/failpoints`) for the kill-and-restart tests. Off by
 # default and in no shipped feature set.
 facts-failpoints = ["facts", "xerj-facts/failpoints"]
 
@@ -46,7 +46,7 @@ xerj-cluster = { path = "../xerj-cluster" }
 # Local decision head (feature `decide-local`); no other purpose, so the
 # dependency itself is optional.
 xerj-ai      = { path = "../xerj-ai", optional = true }
-# SPIKE: /_facts (feature `facts`)
+# /_facts (feature `facts`)
 xerj-facts   = { path = "../xerj-facts", optional = true }
 # Note: this crate intentionally does NOT depend on xerj-console-api.
 # Xerj Console is a peer product mounted at the server level (`xerj-server`)

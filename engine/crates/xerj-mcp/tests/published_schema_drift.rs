@@ -74,9 +74,7 @@ fn published_tool_names_match_the_server() {
     // `XERJ_HUB_PUBKEY=none` omits the three hub tools from `tool_specs()`;
     // that omission is covered in the library tests, and must not look like
     // the committed schema drifted.
-    // The published file is also the *default build's* list: `xerj_facts_ask`
-    // is served only with the off-by-default `facts` feature and is not in it.
-    let served = names(&xerj_mcp::tool_specs_full(true, false));
+    let served = names(&xerj_mcp::tool_specs_full(true, true));
     let doc = names(&published()["tools"]);
     assert_eq!(
         doc, served,

@@ -105,7 +105,10 @@ def t1(c):
     st, o = ask(c, ns2, q(w), iid(w))
     r.check("the same question over documents without facts serves no answer", st == 200 and o.get("final_status") != "ANSWER", str(o)[:300])
     st, o = ask(c, ns, q(w), iid(w), verify=None)
-    r.check("default response has none of the decline fields", st == 200 and not ({"decline", "reason_code", "final_evidence_ids", "repair"} & set(o)) and all("locator" not in e["source"] for e in o["evidence"]), sorted(o))
+    st2, o2 = ask(c, ns, q(w), iid(w))
+    r.check("the default response is the decline_v2 response", st == 200 and st2 == 200 and outcome(o) == outcome(o2) and o.get("verify", {}).get("option") == "decline_v2", sorted(o))
+    st, o = ask(c, ns, q(w), iid(w), verify="served")
+    r.check("verify=served has none of the decline fields", st == 200 and not ({"decline", "reason_code", "final_evidence_ids", "repair"} & set(o)) and all("locator" not in e["source"] for e in o["evidence"]), sorted(o))
     return r.end()
 
 
