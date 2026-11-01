@@ -1,0 +1,24 @@
+# component<TAB>regex over a frame's function name; a sample is charged to the deepest (closest to the leaf) matching frame,
+# except context rules (name starts with ^): checked first, in order, against every frame of the stack. The merge encode
+# runs as a job on the merge pool (#2234), so its stacks start at the pool's spawn closure, not at merge_pass_locked.
+^merge_stored_encode	encode_stored_v2_merge
+^merge	merge_pass_locked|merge_from_segments|fts_merge_readers|xerj_storage::merge
+semantic_embed	apply_semantic_embeddings|local_embed|xerj_ai::|passage_chunk|chunker
+vectors_hnsw_sq8	hnsw|Hnsw|HNSW|sq8|Sq8|index_vectors|vector_column
+wal	WalWriter|xerj_storage::wal|wal_append|WalEntry|wal_maintain|force_wal_maintenance|replay_all_sorted
+storage_memtable	IndexStore::index\b|IndexStore>::index\b|prune_published_memtable|MemEntry
+fts_memtable	FtsMemtable|ShardedFtsMemtable|analyze_doc|insert_analyzed|DocValues::push|memtable::
+flush_fts_segment	FtsIndexWriter|PostingsWriter|xerj_fts::index::|fts::index::
+flush_doc_values	build_doc_value_columns|write_doc_values_sidecar|doc_values::
+stored_codec_encode	encode_v2_columns|encode_stored_v2
+flush_stored	stored_codec|build_flush_segment|SegmentWriter|publish_flush_segment|xerj_storage::segment
+flush_other	do_flush_shard|freeze_shard|after_flush_publish|Index::refresh|Index::flush
+merge	merge_pass_locked|merge_from_segments|try_run_merge_once|xerj_storage::merge
+schema_mapping	evolve_schema|persist_evolved_schema|save_schema|add_fields|validate_default_format_dates
+copy_to	apply_copy_to
+write_path_other	index_document|index_batch_turbo|create_document|update_document|write_publication|collection_publication|governor_write_gate
+bulk_parse	process_bulk|xerj_engine::bulk::|parse_bulk|BulkItem
+search	search_inner|search_at_generation|FtsSearcher|xerj_fts::search|stored_slices_for|count_docs|get_document
+http	hyper::|axum::|h2::|tower::|xerj_api::
+runtime_sched	tokio::runtime|crossbeam|rayon_core::sleep|parking_lot|std::thread::park
+resource_sampler	resource::|governor::|spawn_resource_sampler|current_process_memory
