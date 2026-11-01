@@ -4793,10 +4793,15 @@ fn scan_file(
     // 100_000-row CSV then looked like a 500-row one, and the dataset caps
     // (`dataset::DATASET_CAP_PROTECT_RECORDS`) merged it into a shared index
     // as if it were small. When the sample may have stopped early, count on
-    // with the same extractor up to the protect threshold. That is enough to
-    // decide the caps and stays bounded however large the file is.
+    // with the same extractor up to the larger of the protect threshold and
+    // the automatic `semantic_text` record cap. Both caps read this number, so
+    // stopping at the smaller one hid every line-record dataset from the
+    // semantic cap: 24 audit files of 24,000 rows each counted as 24 * 1,024
+    // rows, stayed under it, and their 574,000 rows were embedded into a graph
+    // larger than the source. It stays bounded however large the file is.
     if matches!(sn.family, Family::Csv | Family::Jsonl | Family::Logs) {
-        let threshold = dataset::DATASET_CAP_PROTECT_RECORDS;
+        let threshold =
+            dataset::DATASET_CAP_PROTECT_RECORDS.max(infer::SEMANTIC_DATA_MAX_RECORDS + 1);
         let sample_cut = |s: &GroupSketch| {
             s.population < threshold
                 && (s.records >= sample as u64 || limit.is_some_and(|l| sn.gzip || size > l))
@@ -5066,6 +5071,28 @@ mod clustering_key_tests {
         let small = scan(dir.path(), "small.csv", &csv_body("s", 10));
         assert_eq!(small.sketches[0].records, 10);
         assert_eq!(small.sketches[0].population, 10);
+    }
+
+    /// The semantic cap reads the same population, so several line-record
+    /// files that are each past the protect threshold must add up to their
+    /// real rows, not to the threshold times the file count.
+    #[test]
+    fn line_record_files_count_their_rows_up_to_the_semantic_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = dataset::DATASET_CAP_PROTECT_RECORDS as usize * 3;
+        let s = scan(dir.path(), "events.jsonl", &jsonl_body("e", rows));
+        assert_eq!(s.sketches[0].population, rows as u64);
+
+        let capped = scan(
+            dir.path(),
+            "huge.jsonl",
+            &jsonl_body("h", infer::SEMANTIC_DATA_MAX_RECORDS as usize + 50),
+        );
+        assert_eq!(
+            capped.sketches[0].population,
+            infer::SEMANTIC_DATA_MAX_RECORDS + 1,
+            "the count stops just past the cap"
+        );
     }
 
     /// End to end through `cluster()`: past the run cap, 2000-row CSV and
