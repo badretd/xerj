@@ -222,6 +222,41 @@ fn drop_cache(f: &File, upto: u64) {
 #[cfg(not(target_os = "linux"))]
 fn drop_cache(_f: &File, _upto: u64) {}
 
+/// `--codec packed|efac` (efac = the experimental ZPS3 Elias-Fano + arithmetic full blocks; this
+/// line is patched out of benchmark builds of branches without the codec switch)
+fn codec_from(name: &str) -> xerj_fts::postings::BlockCodec {
+    match name {
+        "packed" => xerj_fts::postings::BlockCodec::Packed,
+        "efac" => xerj_fts::postings::BlockCodec::EliasFanoAc,
+        "nocounts" => xerj_fts::postings::BlockCodec::PackedNoCounts,
+        _ => panic!("--codec packed|efac"),
+    }
+}
+
+/// Byte accounting of every `.post` file in `dir`: file bytes (zstd envelope), the decompressed
+/// postings the reader holds in RAM (the envelope's length field), and the block-index frame.
+fn post_bytes(dir: &Path) -> Value {
+    let (mut file, mut decompressed, mut frame, mut n) = (0u64, 0u64, 0u64, 0u64);
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".post") {
+            continue;
+        }
+        let bytes = std::fs::read(e.path()).unwrap_or_default();
+        n += 1;
+        file += bytes.len() as u64;
+        if bytes.len() >= 8 && (&bytes[..3] == b"ZPS") {
+            decompressed += u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as u64;
+            if bytes.len() >= 16
+                && u32::from_le_bytes(bytes[8..12].try_into().unwrap()) == 0x184D_2A5B
+            {
+                frame += 8 + u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as u64;
+            }
+        }
+    }
+    json!({"files": n, "file_bytes": file, "decompressed_postings_bytes": decompressed, "block_index_frame_bytes": frame})
+}
+
 fn dir_bytes(p: &Path) -> u64 {
     std::fs::read_dir(p)
         .map(|rd| {
@@ -261,6 +296,8 @@ fn build(a: &HashMap<String, String>) {
     let n_max: usize = arg(a, "n", "0").parse().unwrap();
     let n_max = if n_max == 0 { usize::MAX } else { n_max };
     let seg_docs: usize = arg(a, "seg-docs", "128000").parse().unwrap();
+    let codec_name = arg(a, "codec", "packed");
+    let codec = codec_from(&codec_name);
     let analyzer_name = arg(a, "analyzer", "standard");
     std::fs::create_dir_all(&out).unwrap();
     let registry = Arc::new(AnalyzerRegistry::default());
@@ -287,7 +324,8 @@ fn build(a: &HashMap<String, String>) {
     let mut eof = false;
     while !eof && lines < n_max {
         let seg_id = format!("seg-{:05}", segments.len());
-        let mut w = FtsIndexWriter::new(&out, seg_id.clone(), Arc::clone(&registry));
+        let mut w = FtsIndexWriter::new(&out, seg_id.clone(), Arc::clone(&registry))
+            .with_block_codec(codec);
         w.configure_field(FIELD, field_config.clone());
         let mut ord = 0u32;
         let t_seg = Instant::now();
@@ -349,7 +387,8 @@ fn build(a: &HashMap<String, String>) {
                   "finish_s": finish_s, "cpu_s": cpu_seconds() - cpu0,
                   "docs_per_s": lines as f64 / total_s, "mb_per_s": text_bytes as f64 / 1e6 / total_s,
                   "peak_rss_bytes": proc_kb("VmHWM:") * 1024},
-        "disk_bytes": dir_bytes(&out), "segment_list": segments,
+        "disk_bytes": dir_bytes(&out), "codec": codec_name, "postings": post_bytes(&out),
+        "segment_list": segments,
         "machine": {"loadavg_start": la0, "loadavg_end": loadavg(), "memfree_gib_start": free0,
                     "memfree_gib_min_sampled": min_free, "hottest_c_end": hottest_mc() as f64 / 1000.0},
     });
@@ -867,14 +906,363 @@ fn parity(a: &HashMap<String, String>) {
     }
 }
 
+fn vbyte_at(b: &[u8], pos: &mut usize) -> u64 {
+    // xerj-fts vbyte: high bit set on the LAST byte
+    let (mut v, mut shift) = (0u64, 0);
+    loop {
+        let c = b[*pos];
+        *pos += 1;
+        v |= ((c & 0x7f) as u64) << shift;
+        if c & 0x80 != 0 {
+            return v;
+        }
+        shift += 7;
+    }
+}
+
+/// `bytes --dir DIR --out F.json`: the doc-id and frequency frame bytes of every FULL block of every
+/// term with a block-index entry (parsed at the offsets the index stores; read-only), per codec
+/// framing, plus the postings those blocks hold. Residuals (< 128 postings per term) and positions
+/// are the same under both codecs and are reported as the remainder of the decompressed postings.
+fn bytes(a: &HashMap<String, String>) {
+    let dir = PathBuf::from(arg(a, "dir", ""));
+    let ix = load(&dir);
+    let b: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("build.json")).unwrap()).unwrap();
+    let (mut doc_bytes, mut freq_bytes, mut full_postings, mut blocks, mut terms) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut magic = String::new();
+    for (si, r) in ix.readers.iter().enumerate() {
+        let seg = b["segment_list"][si]["id"].as_str().unwrap();
+        let post = std::fs::read(dir.join(format!("{seg}.{FIELD}.post"))).unwrap();
+        magic = String::from_utf8_lossy(&post[..4]).into_owned();
+        let efac = &post[..4] == b"ZPS3";
+        let Some(bi) = r.block_index(FIELD) else {
+            continue;
+        };
+        let has_positions = r.field_has_positions(FIELD);
+        let mut names = Vec::new();
+        r.for_each_term(FIELD, |t| {
+            names.push(t.to_string());
+            true
+        });
+        for t in &names {
+            let Some(tp) = r.lookup_term(FIELD, t) else {
+                continue;
+            };
+            let Some(tb) = bi.term(tp.postings_offset) else {
+                continue;
+            };
+            let Some(data) = r.postings_data(FIELD, &tp) else {
+                continue;
+            };
+            let freqs_stored = has_positions && tp.total_term_frequency != tp.doc_frequency as u64;
+            terms += 1;
+            let nfull = tp.doc_frequency as usize / 128;
+            for blk in 0..nfull {
+                let mut pos = tb.offset[blk] as usize;
+                let start = pos;
+                if efac {
+                    let l = data[pos] as u64;
+                    pos += 1;
+                    let u = vbyte_at(data, &mut pos);
+                    pos += ((128 * l + 128 + ((u - 1) >> l) + 1) as usize).div_ceil(8);
+                } else {
+                    let w = data[pos] as usize;
+                    pos += 1;
+                    vbyte_at(data, &mut pos);
+                    pos += 16 * w;
+                }
+                doc_bytes += (pos - start) as u64;
+                if freqs_stored {
+                    let fstart = pos;
+                    if efac {
+                        pos += 1;
+                        let len = vbyte_at(data, &mut pos) as usize;
+                        pos += len;
+                    } else {
+                        let w = data[pos] as usize;
+                        pos += 1;
+                        vbyte_at(data, &mut pos);
+                        pos += 16 * w;
+                    }
+                    freq_bytes += (pos - fstart) as u64;
+                }
+                blocks += 1;
+                full_postings += 128;
+            }
+        }
+    }
+    let decompressed = b["postings"]["decompressed_postings_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    let res = json!({"mode": "bytes", "dir": dir, "envelope": magic, "codec": b["codec"],
+        "terms_with_block_index": terms, "full_blocks": blocks, "full_block_postings": full_postings,
+        "doc_frame_bytes": doc_bytes, "freq_frame_bytes": freq_bytes,
+        "doc_bits_per_posting": doc_bytes as f64 * 8.0 / full_postings.max(1) as f64,
+        "freq_bits_per_posting": freq_bytes as f64 * 8.0 / full_postings.max(1) as f64,
+        "decompressed_postings_bytes": decompressed,
+        "residuals_and_positions_bytes": decompressed.saturating_sub(doc_bytes + freq_bytes),
+        "post_file_bytes": b["postings"]["file_bytes"], "block_index_frame_bytes": b["postings"]["block_index_frame_bytes"]});
+    std::fs::write(
+        arg(a, "out", "bytes.json"),
+        serde_json::to_string_pretty(&res).unwrap(),
+    )
+    .unwrap();
+    println!("{}", serde_json::to_string(&res).unwrap());
+}
+
+/// `attrib --dir DIR --out F.json`: every byte of the decompressed `.post` of the corpus field by
+/// class (ZPS2 only), each class's size under zstd on its own, what the rest of the segment holds,
+/// and what two position layouts would cost.
+fn attrib(a: &HashMap<String, String>) {
+    #[derive(Default)]
+    struct Class {
+        raw: Vec<u8>,
+    }
+    let dir = PathBuf::from(arg(a, "dir", ""));
+    let level: i32 = arg(a, "level", "3").parse().unwrap();
+    let ix = load(&dir);
+    let b: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("build.json")).unwrap()).unwrap();
+    let names = [
+        "block_doc_ids",
+        "block_tf",
+        "block_pos_counts",
+        "block_pos_gaps",
+        "tail_header",
+        "tail_doc_ids",
+        "tail_tf",
+        "tail_pos_counts",
+        "tail_pos_gaps",
+    ];
+    let mut c: Vec<Class> = names.iter().map(|_| Class::default()).collect();
+    let (mut postings, mut positions, mut count_ne_tf, mut gap_1b, mut gap_2b, mut gap_big) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut gaps_all: Vec<u32> = Vec::new();
+    let mut for128: Vec<u8> = Vec::new();
+    // Whole-layout candidates: every stream as it would sit in the file.
+    let (mut s1, mut s2_main, mut s2_pos, mut s3_main, mut s3_pos) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut front: Vec<u8> = Vec::new();
+    let mut pos_stream_vb = 0u64;
+    for (si, r) in ix.readers.iter().enumerate() {
+        let _ = si;
+        let has_positions = r.field_has_positions(FIELD);
+        let mut terms = Vec::new();
+        r.for_each_term(FIELD, |t| {
+            terms.push(t.to_string());
+            true
+        });
+        // Front-coded dictionary in 16-term buckets, as the study's: shared prefix, suffix.
+        let mut prev: &[u8] = b"";
+        for (i, t) in terms.iter().enumerate() {
+            let b = t.as_bytes();
+            let shared = if i % 16 == 0 {
+                0
+            } else {
+                b.iter().zip(prev).take_while(|(x, y)| x == y).count()
+            };
+            xerj_fts::postings::vbyte_encode(shared as u32, &mut front);
+            xerj_fts::postings::vbyte_encode((b.len() - shared) as u32, &mut front);
+            front.extend_from_slice(&b[shared..]);
+            prev = b;
+        }
+        let mut tps: Vec<_> = terms
+            .iter()
+            .filter_map(|t| r.lookup_term(FIELD, t))
+            .collect();
+        tps.sort_by_key(|t| t.postings_offset);
+        for tp in &tps {
+            let Some(data) = r.postings_data(FIELD, tp) else {
+                continue;
+            };
+            let freqs = has_positions && tp.total_term_frequency != tp.doc_frequency as u64;
+            let df = tp.doc_frequency as usize;
+            let mut pos = 0usize;
+            gaps_all.clear();
+            // The group's gaps without its count, and the same split by first or later in the doc.
+            let group = |pos: &mut usize,
+                             counts: usize,
+                             gaps: usize,
+                             c: &mut Vec<Class>,
+                             tf: Option<u64>,
+                             st: &mut (u64, u64, u64, u64, u64),
+                             ga: &mut Vec<u32>,
+                             out: &mut Vec<u8>| {
+                let s = *pos;
+                let n = vbyte_at(data, pos);
+                c[counts].raw.extend_from_slice(&data[s..*pos]);
+                if tf.is_some_and(|t| t != n) {
+                    st.0 += 1;
+                }
+                st.1 += n;
+                for _ in 0..n {
+                    let s = *pos;
+                    let g = vbyte_at(data, pos);
+                    ga.push(g as u32);
+                    c[gaps].raw.extend_from_slice(&data[s..*pos]);
+                    out.extend_from_slice(&data[s..*pos]);
+                    match *pos - s {
+                        1 => st.2 += 1,
+                        2 => st.3 += 1,
+                        _ => st.4 += 1,
+                    }
+                }
+            };
+            let mut st = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for _ in 0..df / 128 {
+                let s = pos;
+                let w = data[pos] as usize;
+                pos += 1;
+                vbyte_at(data, &mut pos);
+                pos += 16 * w;
+                c[0].raw.extend_from_slice(&data[s..pos]);
+                s1.extend_from_slice(&data[s..pos]);
+                s2_main.extend_from_slice(&data[s..pos]);
+                s3_main.extend_from_slice(&data[s..pos]);
+                let mut tfs = [1u64; 128];
+                if freqs {
+                    let s = pos;
+                    let w = data[pos] as usize;
+                    pos += 1;
+                    let min = vbyte_at(data, &mut pos);
+                    let end = pos + 16 * w;
+                    if w == 0 {
+                        tfs = [min; 128];
+                    } else {
+                        // Only the equal-count statistic needs them, and that needs the unpack.
+                        tfs = [0; 128];
+                    }
+                    pos = end;
+                    c[1].raw.extend_from_slice(&data[s..pos]);
+                    s1.extend_from_slice(&data[s..pos]);
+                    s2_main.extend_from_slice(&data[s..pos]);
+                    s3_main.extend_from_slice(&data[s..pos]);
+                }
+                if has_positions {
+                    let mut out = Vec::new();
+                    for &tf in &tfs {
+                        let tf = (tf != 0).then_some(tf);
+                        group(&mut pos, 2, 3, &mut c, tf, &mut st, &mut gaps_all, &mut out);
+                    }
+                    s1.extend_from_slice(&out);
+                    s2_pos.extend_from_slice(&out);
+                    s3_pos.extend_from_slice(&out);
+                }
+                postings += 128;
+            }
+            let tail = df % 128;
+            if tail > 0 {
+                c[4].raw.push(data[pos]);
+                s1.push(data[pos]);
+                s2_main.push(data[pos]);
+                s3_main.push(data[pos]);
+                pos += 1;
+                for _ in 0..tail {
+                    let s = pos;
+                    vbyte_at(data, &mut pos);
+                    c[5].raw.extend_from_slice(&data[s..pos]);
+                    s1.extend_from_slice(&data[s..pos]);
+                    s2_main.extend_from_slice(&data[s..pos]);
+                    s3_main.extend_from_slice(&data[s..pos]);
+                    let mut tf = if has_positions { Some(1) } else { None };
+                    if freqs {
+                        let s = pos;
+                        tf = Some(vbyte_at(data, &mut pos));
+                        c[6].raw.extend_from_slice(&data[s..pos]);
+                        s1.extend_from_slice(&data[s..pos]);
+                        s2_main.extend_from_slice(&data[s..pos]);
+                        s3_main.extend_from_slice(&data[s..pos]);
+                    }
+                    if has_positions {
+                        let mut out = Vec::new();
+                        group(&mut pos, 7, 8, &mut c, tf, &mut st, &mut gaps_all, &mut out);
+                        s1.extend_from_slice(&out);
+                        s2_main.extend_from_slice(&out);
+                        s3_pos.extend_from_slice(&out);
+                    }
+                }
+                postings += tail as u64;
+            }
+            assert_eq!(pos, data.len(), "walked past the term");
+            count_ne_tf += st.0;
+            positions += st.1;
+            gap_1b += st.2;
+            gap_2b += st.3;
+            gap_big += st.4;
+            pos_stream_vb += gaps_all.len() as u64;
+            for chunk in gaps_all.chunks(128) {
+                if chunk.len() == 128 {
+                    use bitpacking::BitPacker;
+                    let max = *chunk.iter().max().unwrap();
+                    let w = (32 - max.leading_zeros()) as u8;
+                    let lanes: [u32; 128] = chunk.try_into().unwrap();
+                    let mut out = vec![0u8; 16 * w as usize];
+                    bitpacking::BitPacker4x::new().compress(&lanes, &mut out, w);
+                    for128.push(w);
+                    for128.extend_from_slice(&out);
+                } else {
+                    for &g in chunk {
+                        xerj_fts::postings::vbyte_encode(g, &mut for128);
+                    }
+                }
+            }
+        }
+    }
+    let mut classes = serde_json::Map::new();
+    for (name, class) in names.iter().zip(&c) {
+        let z = zstd::bulk::compress(&class.raw, level).unwrap();
+        classes.insert(
+            name.to_string(),
+            json!({"raw_bytes": class.raw.len(), "zstd_bytes": z.len()}),
+        );
+    }
+    let z = |b: &[u8]| zstd::bulk::compress(b, level).unwrap().len();
+    let layouts = json!({
+        "inline_no_counts": z(&s1),
+        "block_positions_apart": [z(&s2_main), z(&s2_pos)],
+        "all_positions_apart": [z(&s3_main), z(&s3_pos)],
+        "front_coded_terms_raw": front.len(), "front_coded_terms_zstd": z(&front),
+    });
+    let mut ext: HashMap<String, u64> = HashMap::new();
+    for e in std::fs::read_dir(&dir).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let parts: Vec<&str> = name.rsplitn(3, '.').collect();
+        let key = match parts.as_slice() {
+            [x, f, _] => format!("{f}.{x}"),
+            [x, ..] => x.to_string(),
+            [] => continue,
+        };
+        *ext.entry(key).or_default() += e.metadata().map_or(0, |m| m.len());
+    }
+    let res = json!({"mode": "attrib", "dir": dir, "codec": b["codec"], "postings": postings,
+        "positions": positions, "position_count_differs_from_tf": count_ne_tf,
+        "gap_bytes_1": gap_1b, "gap_bytes_2": gap_2b, "gap_bytes_3_plus": gap_big,
+        "classes": classes, "layouts": layouts, "files_by_field_and_ext": ext,
+        "counterfactual_gaps_for128_raw": for128.len(),
+        "counterfactual_gaps_for128_zstd": zstd::bulk::compress(&for128, level).unwrap().len(), "gaps_counted": pos_stream_vb,
+        "post_file_bytes": b["postings"]["file_bytes"],
+        "block_index_frame_bytes": b["postings"]["block_index_frame_bytes"],
+        "decompressed_postings_bytes": b["postings"]["decompressed_postings_bytes"]});
+    std::fs::write(
+        arg(a, "out", "attrib.json"),
+        serde_json::to_string_pretty(&res).unwrap(),
+    )
+    .unwrap();
+    println!("{}", serde_json::to_string(&res).unwrap());
+}
+
 fn main() {
     let (mode, a) = args();
     match mode.as_str() {
         "build" => build(&a),
         "query" => query(&a),
         "parity" => parity(&a),
+        "bytes" => bytes(&a),
+        "attrib" => attrib(&a),
         _ => {
-            eprintln!("usage: fts_corpus_bench build|query|parity ... (see the module docs)");
+            eprintln!("usage: fts_corpus_bench build|query|parity|bytes ... (see the module docs)");
             std::process::exit(2);
         }
     }

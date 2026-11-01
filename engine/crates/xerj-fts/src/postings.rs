@@ -375,7 +375,7 @@ impl PostingsWriter {
     /// are serialised.  See the module docs' "Skip-list acceleration: NOT
     /// implemented" note.
     pub fn encode_term(&self, term: &str, output: &mut Vec<u8>) -> Option<(u64, Vec<SkipEntry>)> {
-        self.encode_term_inner(term, output, None)
+        self.encode_term_inner(term, output, None, BlockCodec::Packed)
             .map(|(offset, skips, _)| (offset, skips))
     }
 
@@ -392,7 +392,19 @@ impl PostingsWriter {
         output: &mut Vec<u8>,
         norm_of: &dyn Fn(u32) -> u8,
     ) -> Option<(u64, Option<TermBlockData>)> {
-        self.encode_term_inner(term, output, Some(norm_of))
+        self.encode_term_indexed_with(term, output, norm_of, BlockCodec::Packed)
+    }
+
+    /// [`Self::encode_term_indexed`] with an explicit full-block codec
+    /// ([`BlockCodec::EliasFanoAc`] is the experimental ZPS3 layout).
+    pub fn encode_term_indexed_with(
+        &self,
+        term: &str,
+        output: &mut Vec<u8>,
+        norm_of: &dyn Fn(u32) -> u8,
+        codec: BlockCodec,
+    ) -> Option<(u64, Option<TermBlockData>)> {
+        self.encode_term_inner(term, output, Some(norm_of), codec)
             .map(|(offset, _, blocks)| (offset, blocks))
     }
 
@@ -401,6 +413,7 @@ impl PostingsWriter {
         term: &str,
         output: &mut Vec<u8>,
         norm_of: Option<&dyn Fn(u32) -> u8>,
+        codec: BlockCodec,
     ) -> Option<(u64, Vec<SkipEntry>, Option<TermBlockData>)> {
         let postings = self.postings.get(term)?;
 
@@ -458,12 +471,29 @@ impl PostingsWriter {
                 });
             }
 
-            encode_block_doc_ids(block, output, prev_block_last_doc_id);
+            match codec {
+                BlockCodec::Packed | BlockCodec::PackedNoCounts => {
+                    encode_block_doc_ids(block, output, prev_block_last_doc_id)
+                }
+                BlockCodec::EliasFanoAc => {
+                    let base = if block_count == 0 {
+                        0
+                    } else {
+                        prev_block_last_doc_id + 1
+                    };
+                    encode_block_doc_ids_ef(block, output, base)
+                }
+            }
             if self.store_positions && !freq_omitted {
-                encode_block_freqs(block, output);
+                match codec {
+                    BlockCodec::Packed | BlockCodec::PackedNoCounts => {
+                        encode_block_freqs(block, output)
+                    }
+                    BlockCodec::EliasFanoAc => encode_block_freqs_ac(block, output),
+                }
             }
             if self.store_positions {
-                encode_block_positions(block, output);
+                encode_block_positions(block, output, codec != BlockCodec::PackedNoCounts);
             }
             // docs-only mode: emit nothing after the packed doc-id block.
             // The reader is told about the mode via the field meta and
@@ -486,6 +516,7 @@ impl PostingsWriter {
                 prev_block_last_doc_id,
                 self.store_positions,
                 freq_omitted,
+                codec != BlockCodec::PackedNoCounts,
             );
             record(&mut blocks, &mut impacts, residual, block_offset);
         }
@@ -497,6 +528,18 @@ impl PostingsWriter {
             impacts.drain_into(&mut b.term_impacts, MAX_TERM_IMPACTS);
         }
         Some((start_offset, skip_table, blocks))
+    }
+
+    /// Whether every posting holds exactly `term_freq` positions, the condition
+    /// for [`BlockCodec::PackedNoCounts`]. A field that fails it (no indexing
+    /// path makes one, but the format never forbade it) keeps its counts.
+    pub fn positions_match_freqs(&self) -> bool {
+        !self.store_positions
+            || self
+                .postings
+                .values()
+                .flatten()
+                .all(|p| p.positions.len() as u64 == p.term_freq as u64)
     }
 
     pub fn terms(&self) -> impl Iterator<Item = &str> {
@@ -662,13 +705,15 @@ fn encode_block_freqs(block: &[RawPosting], output: &mut Vec<u8>) {
     pack_u32_block_v2(&freqs, output);
 }
 
-fn encode_block_positions(block: &[RawPosting], output: &mut Vec<u8>) {
+fn encode_block_positions(block: &[RawPosting], output: &mut Vec<u8>, counts: bool) {
     // Positions: variable-byte encode per-document, delta within document.
     // No length prefix — the reader decodes exactly BLOCK_SIZE documents'
     // (count + deltas) groups, which pins the stream's end; the u32 the old
     // framing spent per block was information the structure already had.
     for posting in block {
-        vbyte_encode(posting.positions.len() as u32, output);
+        if counts {
+            vbyte_encode(posting.positions.len() as u32, output);
+        }
         let mut prev = 0u32;
         for &pos in &posting.positions {
             vbyte_encode(pos - prev, output);
@@ -683,6 +728,7 @@ fn encode_residual(
     prev_last_doc_id: u32,
     store_positions: bool,
     freq_omitted: bool,
+    counts: bool,
 ) {
     // Mark as residual with a sentinel: count byte
     output.push(residual.len() as u8);
@@ -702,7 +748,9 @@ fn encode_residual(
             vbyte_encode(posting.term_freq, output);
         }
         if store_positions {
-            vbyte_encode(posting.positions.len() as u32, output);
+            if counts {
+                vbyte_encode(posting.positions.len() as u32, output);
+            }
             let mut prev_pos = 0u32;
             for &pos in &posting.positions {
                 vbyte_encode(pos - prev_pos, output);
@@ -710,6 +758,448 @@ fn encode_residual(
             }
         }
     }
+}
+
+// ── Full-block codecs: packed (ZPS1/ZPS2) and Elias-Fano + arithmetic (ZPS3) ──
+
+/// How a writer encodes the doc ids and frequencies of FULL 128-posting
+/// blocks (residuals and positions are the same in both).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BlockCodec {
+    /// ZPS2: frame-of-reference bit packing (the format every reader knows).
+    #[default]
+    Packed,
+    /// ZPS3, EXPERIMENTAL: per-block Elias-Fano doc ids and arithmetic-coded
+    /// frequencies (the compression study's "exact compressed" codec).
+    /// Readers that predate ZPS3 would misread such a segment, so writing it
+    /// needs a data-directory format gate before any production use; it
+    /// exists to measure the size / speed trade-off behind the same block
+    /// index and walk.
+    EliasFanoAc,
+    /// ZPS4: ZPS2 without the vbyte position count of every posting, which always
+    /// equals its term frequency. On the 1M corpus that count was 93 M bytes of
+    /// the 418 MB of decompressed postings. Refused by older builds through the
+    /// data-directory format gate.
+    PackedNoCounts,
+}
+
+/// Doc ids of one full block (absolute), any codec. `prev_last` is the
+/// previous block's last doc (0 before the first block).
+#[inline]
+fn decode_full_block_docs(
+    codec: PostCodec,
+    data: &[u8],
+    cur: &mut Cursor<&[u8]>,
+    prev_last: u32,
+    first_block: bool,
+    out: &mut [u32; BLOCK_SIZE],
+) -> io::Result<()> {
+    match codec {
+        PostCodec::V1 | PostCodec::V2 { .. } | PostCodec::V4 { .. } => {
+            let mut deltas = [0u32; BLOCK_SIZE];
+            match codec {
+                PostCodec::V1 => unpack_u32_block_v1(data, cur, &mut deltas)?,
+                _ => unpack_u32_block_v2(data, cur, &mut deltas)?,
+            }
+            let mut prev = prev_last;
+            for (d, &delta) in out.iter_mut().zip(deltas.iter()) {
+                prev = prev.wrapping_add(delta);
+                *d = prev;
+            }
+            Ok(())
+        }
+        PostCodec::V3 { .. } => {
+            let base = if first_block {
+                0
+            } else {
+                prev_last.wrapping_add(1)
+            };
+            decode_block_doc_ids_ef(data, cur, base, out)
+        }
+    }
+}
+
+/// Frequencies of one full block, any codec.
+#[inline]
+fn decode_full_block_freqs(
+    codec: PostCodec,
+    data: &[u8],
+    cur: &mut Cursor<&[u8]>,
+    out: &mut [u32; BLOCK_SIZE],
+) -> io::Result<()> {
+    match codec {
+        PostCodec::V1 => unpack_u32_block_v1(data, cur, out),
+        PostCodec::V2 { .. } | PostCodec::V4 { .. } => unpack_u32_block_v2(data, cur, out),
+        PostCodec::V3 { .. } => decode_block_freqs_ac(data, cur, out),
+    }
+}
+
+/// Step over one full block's frequency frame, any codec.
+fn skip_full_block_freqs(codec: PostCodec, data: &[u8], cur: &mut Cursor<&[u8]>) -> io::Result<()> {
+    match codec {
+        PostCodec::V1 | PostCodec::V2 { .. } | PostCodec::V4 { .. } => {
+            skip_u32_block(codec, data, cur)
+        }
+        PostCodec::V3 { .. } => {
+            cur.read_u8()?;
+            let len = vbyte_decode(cur)? as usize;
+            let end = cur.position() as usize + len;
+            if end > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "postings data truncated",
+                ));
+            }
+            cur.set_position(end as u64);
+            Ok(())
+        }
+    }
+}
+
+/// Elias-Fano over one full block: values `doc - base` (non-decreasing),
+/// universe `u = last + 1`, `l = floor(log2(u / 128))` low bits each, high
+/// parts in unary.  Layout: `[l: u8][u: vbyte][low bits, then high bits,
+/// LSB first]`.
+fn encode_block_doc_ids_ef(block: &[RawPosting], output: &mut Vec<u8>, base: u32) {
+    debug_assert_eq!(block.len(), BLOCK_SIZE);
+    let n = BLOCK_SIZE;
+    let rel: Vec<u64> = block.iter().map(|p| (p.doc_id - base) as u64).collect();
+    let u = rel[n - 1] + 1;
+    let l = if u <= n as u64 {
+        0
+    } else {
+        63 - (u / n as u64).leading_zeros()
+    };
+    output.push(l as u8);
+    vbyte_encode(u as u32, output);
+    let high_bits = n + ((u - 1) >> l) as usize + 1;
+    let total = n * l as usize + high_bits;
+    let mut words = vec![0u64; total.div_ceil(64) + 1];
+    let low_mask = if l == 0 { 0 } else { (1u64 << l) - 1 };
+    for (j, &r) in rel.iter().enumerate() {
+        if l > 0 {
+            let bit = j * l as usize;
+            let v = r & low_mask;
+            words[bit / 64] |= v << (bit % 64);
+            if bit % 64 + l as usize > 64 {
+                words[bit / 64 + 1] |= v >> (64 - bit % 64);
+            }
+        }
+        let p = n * l as usize + (r >> l) as usize + j;
+        words[p / 64] |= 1u64 << (p % 64);
+    }
+    let nbytes = total.div_ceil(8);
+    for i in 0..nbytes {
+        output.push((words[i / 8] >> (8 * (i % 8))) as u8);
+    }
+}
+
+fn decode_block_doc_ids_ef(
+    data: &[u8],
+    cur: &mut Cursor<&[u8]>,
+    base: u32,
+    out: &mut [u32; BLOCK_SIZE],
+) -> io::Result<()> {
+    let n = BLOCK_SIZE;
+    let l = cur.read_u8()? as usize;
+    let u = vbyte_decode(cur)? as u64;
+    if l > 31 || u == 0 {
+        return Err(invalid("Elias-Fano block header"));
+    }
+    let high_bits = n + ((u - 1) >> l) as usize + 1;
+    let total = n * l + high_bits;
+    let nbytes = total.div_ceil(8);
+    let start = cur.position() as usize;
+    let end = start + nbytes;
+    if end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "postings data truncated",
+        ));
+    }
+    // copy into aligned words (the block is at most 128 * 31 + 3 * 128 bits)
+    let mut w = [0u64; 70];
+    let nwords = nbytes.div_ceil(8);
+    if nwords + 1 > w.len() {
+        return Err(invalid("Elias-Fano block too large"));
+    }
+    for (i, chunk) in data[start..end].chunks(8).enumerate() {
+        let mut b = [0u8; 8];
+        b[..chunk.len()].copy_from_slice(chunk);
+        w[i] = u64::from_le_bytes(b);
+    }
+    let low_mask = if l == 0 { 0 } else { (1u64 << l) - 1 };
+    let mut p = n * l; // high part cursor (bits)
+    for (j, slot) in out.iter_mut().enumerate() {
+        let low = if l == 0 {
+            0
+        } else {
+            let bit = j * l;
+            let (i, o) = (bit / 64, bit % 64);
+            let mut v = w[i] >> o;
+            if o + l > 64 {
+                v |= w[i + 1] << (64 - o);
+            }
+            v & low_mask
+        };
+        // next set bit at or after p
+        loop {
+            let i = p / 64;
+            if i >= nwords {
+                return Err(invalid("Elias-Fano high bits"));
+            }
+            let bits = w[i] >> (p % 64);
+            if bits != 0 {
+                p += bits.trailing_zeros() as usize;
+                break;
+            }
+            p = (i + 1) * 64;
+        }
+        let high = (p - n * l - j) as u64;
+        *slot = base.wrapping_add(((high << l) | low) as u32);
+        p += 1;
+    }
+    cur.set_position(end as u64);
+    Ok(())
+}
+
+/// LZMA-style adaptive binary range coder (32-bit range, 64-bit low with
+/// carry, 15-bit probabilities), ported from the compression study
+/// (bench_compress/xcomp xpost.rs, C1.10c).
+struct RcEnc {
+    low: u64,
+    range: u32,
+    cache: u8,
+    cache_size: u64,
+    out: Vec<u8>,
+    started: bool,
+}
+
+impl RcEnc {
+    fn new() -> Self {
+        RcEnc {
+            low: 0,
+            range: 0xFFFF_FFFF,
+            cache: 0,
+            cache_size: 1,
+            out: Vec::new(),
+            started: false,
+        }
+    }
+    fn shift_low(&mut self) {
+        if (self.low as u32) < 0xFF00_0000 || (self.low >> 32) != 0 {
+            let carry = (self.low >> 32) as u8;
+            let mut temp = self.cache;
+            loop {
+                let byte = temp.wrapping_add(carry);
+                if self.started {
+                    self.out.push(byte);
+                } else {
+                    // the first byte of the stream is always 0: not stored
+                    self.started = true;
+                }
+                temp = 0xFF;
+                self.cache_size -= 1;
+                if self.cache_size == 0 {
+                    break;
+                }
+            }
+            self.cache = ((self.low >> 24) & 0xFF) as u8;
+        }
+        self.cache_size += 1;
+        self.low = (self.low & 0x00FF_FFFF) << 8;
+    }
+    #[inline]
+    fn encode(&mut self, p0: u32, bit: u32) {
+        let bound = (self.range >> 15) * p0;
+        if bit == 0 {
+            self.range = bound;
+        } else {
+            self.low += bound as u64;
+            self.range -= bound;
+        }
+        while self.range < (1 << 24) {
+            self.range <<= 8;
+            self.shift_low();
+        }
+    }
+    fn finish(mut self) -> Vec<u8> {
+        for k in (1..=4).rev() {
+            let m = 1u64 << (8 * k);
+            let v = (self.low + m - 1) & !(m - 1);
+            if v < self.low + self.range as u64 {
+                self.low = v;
+                break;
+            }
+        }
+        for _ in 0..5 {
+            self.shift_low();
+        }
+        while self.out.last() == Some(&0) {
+            self.out.pop();
+        }
+        self.out
+    }
+}
+
+struct RcDec<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    range: u32,
+    code: u32,
+}
+
+impl<'a> RcDec<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        let mut d = RcDec {
+            buf,
+            pos: 0,
+            range: 0xFFFF_FFFF,
+            code: 0,
+        };
+        for _ in 0..4 {
+            d.code = (d.code << 8) | d.next() as u32;
+        }
+        d
+    }
+    #[inline]
+    fn next(&mut self) -> u8 {
+        let b = self.buf.get(self.pos).copied().unwrap_or(0);
+        self.pos += 1;
+        b
+    }
+    #[inline]
+    fn decode(&mut self, p0: u32) -> u32 {
+        let bound = (self.range >> 15) * p0;
+        let bit = if self.code < bound {
+            self.range = bound;
+            0
+        } else {
+            self.code -= bound;
+            self.range -= bound;
+            1
+        };
+        while self.range < (1 << 24) {
+            self.range <<= 8;
+            self.code = (self.code << 8) | self.next() as u32;
+        }
+        bit
+    }
+}
+
+/// Adaptive bit model: Krichevsky-Trofimov estimate, counts halved past 65535.
+#[derive(Clone, Copy)]
+struct Ctx {
+    c0: u32,
+    c1: u32,
+}
+
+impl Ctx {
+    #[inline]
+    fn p0(&self) -> u32 {
+        let p = (((2 * self.c0 as u64 + 1) << 15) / (2 * (self.c0 + self.c1) as u64 + 2)) as u32;
+        p.clamp(1, 32767)
+    }
+    #[inline]
+    fn update(&mut self, bit: u32) {
+        if bit == 0 {
+            self.c0 += 1;
+        } else {
+            self.c1 += 1;
+        }
+        if self.c0 + self.c1 > 65535 {
+            self.c0 = self.c0.div_ceil(2);
+            self.c1 = self.c1.div_ceil(2);
+        }
+    }
+    /// prior of the "tf > 1" flag from the block's exception rate `q / 255`
+    fn prior(q: u32) -> Ctx {
+        Ctx {
+            c0: ((255 - q) * 16 + 127) / 255,
+            c1: (q * 16 + 127) / 255,
+        }
+    }
+}
+
+/// Frequencies of one full block: `[q: u8][len: vbyte][stream]`, `q` = the
+/// block's share of tf > 1 in 1/255 steps (the flag's prior), the stream =
+/// per posting an adaptive "tf > 1" flag and, when set, `tf - 1` as
+/// exp-Golomb (adaptive unary length, raw mantissa).
+fn encode_block_freqs_ac(block: &[RawPosting], output: &mut Vec<u8>) {
+    let exc = block.iter().filter(|p| p.term_freq > 1).count();
+    let q = ((exc as f64 / block.len() as f64) * 255.0).round() as u32;
+    let mut rc = RcEnc::new();
+    let mut flag = Ctx::prior(q);
+    let mut lens = [Ctx { c0: 0, c1: 0 }; 33];
+    for p in block {
+        let bit = (p.term_freq > 1) as u32;
+        rc.encode(flag.p0(), bit);
+        flag.update(bit);
+        if bit == 1 {
+            let w = p.term_freq - 1; // >= 1
+            let k = (32 - w.leading_zeros()) - 1;
+            for ctx in lens.iter_mut().take(k as usize) {
+                rc.encode(ctx.p0(), 1);
+                ctx.update(1);
+            }
+            rc.encode(lens[k as usize].p0(), 0);
+            lens[k as usize].update(0);
+            for i in (0..k).rev() {
+                rc.encode(16384, (w >> i) & 1);
+            }
+        }
+    }
+    let stream = rc.finish();
+    output.push(q as u8);
+    vbyte_encode(stream.len() as u32, output);
+    output.extend_from_slice(&stream);
+}
+
+fn decode_block_freqs_ac(
+    data: &[u8],
+    cur: &mut Cursor<&[u8]>,
+    out: &mut [u32; BLOCK_SIZE],
+) -> io::Result<()> {
+    let q = cur.read_u8()? as u32;
+    let len = vbyte_decode(cur)? as usize;
+    let start = cur.position() as usize;
+    let end = start + len;
+    if end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "postings data truncated",
+        ));
+    }
+    let mut rc = RcDec::new(&data[start..end]);
+    let mut flag = Ctx::prior(q);
+    let mut lens = [Ctx { c0: 0, c1: 0 }; 33];
+    for slot in out.iter_mut() {
+        let bit = rc.decode(flag.p0());
+        flag.update(bit);
+        if bit == 0 {
+            *slot = 1;
+        } else {
+            let mut k = 0usize;
+            loop {
+                let b = rc.decode(lens[k].p0());
+                lens[k].update(b);
+                if b == 0 {
+                    break;
+                }
+                k += 1;
+                if k >= 32 {
+                    return Err(invalid("arithmetic-coded frequency"));
+                }
+            }
+            let mut w = 1u32;
+            for _ in 0..k {
+                w = (w << 1) | rc.decode(16384);
+            }
+            *slot = w + 1;
+        }
+    }
+    cur.set_position(end as u64);
+    Ok(())
 }
 
 // ── Variable-byte encoding ────────────────────────────────────────────────────
@@ -826,6 +1316,10 @@ fn decode_position_group_into(cursor: &mut Cursor<&[u8]>, out: &mut Vec<u32>) ->
 /// reports.
 fn skip_position_group(cursor: &mut Cursor<&[u8]>) -> io::Result<()> {
     let count = vbyte_decode(cursor)? as usize;
+    skip_position_deltas(cursor, count)
+}
+
+fn skip_position_deltas(cursor: &mut Cursor<&[u8]>, count: usize) -> io::Result<()> {
     let data: &[u8] = cursor.get_ref();
     let mut pos = cursor.position() as usize;
     let mut remaining = count;
@@ -849,6 +1343,38 @@ fn skip_position_group(cursor: &mut Cursor<&[u8]>) -> io::Result<()> {
         }
     }
     cursor.set_position(pos as u64);
+    Ok(())
+}
+
+/// Step over a document's positions: its group, or for
+/// [`PostCodec::V4`] exactly `tf` deltas.
+fn skip_positions_of(cursor: &mut Cursor<&[u8]>, codec: PostCodec, tf: u32) -> io::Result<()> {
+    if matches!(codec, PostCodec::V4 { .. }) {
+        skip_position_deltas(cursor, tf as usize)
+    } else {
+        skip_position_group(cursor)
+    }
+}
+
+/// Decode a document's positions, see [`skip_positions_of`].
+fn decode_positions_of_into(
+    cursor: &mut Cursor<&[u8]>,
+    codec: PostCodec,
+    tf: u32,
+    out: &mut Vec<u32>,
+) -> io::Result<()> {
+    if !matches!(codec, PostCodec::V4 { .. }) {
+        return decode_position_group_into(cursor, out);
+    }
+    #[cfg(test)]
+    POSITION_GROUPS_MATERIALISED.with(|c| c.set(c.get() + 1));
+    out.clear();
+    out.reserve(tf as usize);
+    let mut prev = 0u32;
+    for _ in 0..tf {
+        prev += vbyte_decode(cursor)?;
+        out.push(prev);
+    }
     Ok(())
 }
 
@@ -1297,12 +1823,12 @@ impl<'a> TermBlocks<'a> {
 
 // ── BlockCursor: positions-free, block-skipping posting cursor ─────────────
 
-/// Step over one packed 128-value frame (either framing) without unpacking it.
+/// Step over one packed 128-value frame (ZPS1 / ZPS2 framing) without unpacking it.
 fn skip_u32_block(codec: PostCodec, data: &[u8], cur: &mut Cursor<&[u8]>) -> io::Result<()> {
     let num_bits = cur.read_u8()?;
     let len = match codec {
         PostCodec::V1 => cur.read_u32::<LittleEndian>()? as usize,
-        PostCodec::V2 { .. } => {
+        PostCodec::V2 { .. } | PostCodec::V3 { .. } | PostCodec::V4 { .. } => {
             vbyte_decode(cur)?;
             if num_bits > 32 {
                 return Err(invalid("invalid bit width"));
@@ -1420,7 +1946,11 @@ impl<'a> BlockCursor<'a> {
         let nblocks = nfull + usize::from(!(doc_frequency as usize).is_multiple_of(BLOCK_SIZE));
         let freq_omitted = match codec {
             PostCodec::V1 => !has_positions,
-            PostCodec::V2 { freq_omitted } => freq_omitted || !has_positions,
+            PostCodec::V2 { freq_omitted }
+            | PostCodec::V3 { freq_omitted }
+            | PostCodec::V4 { freq_omitted } => {
+                freq_omitted || !has_positions
+            }
         };
         // an index entry that does not describe this list is ignored
         let blocks = blocks.filter(|b| {
@@ -1487,14 +2017,14 @@ impl<'a> BlockCursor<'a> {
             };
             cur.set_position(off as u64);
             while idx < self.i {
-                skip_position_group(&mut cur)?;
+                skip_positions_of(&mut cur, self.codec, self.tfs[idx])?;
                 idx += 1;
             }
-            decode_position_group_into(&mut cur, out)?;
+            decode_positions_of_into(&mut cur, self.codec, self.tfs[self.i], out)?;
             self.pos_next = (self.i + 1, cur.position() as usize);
         } else {
             cur.set_position(u64::from(self.res_pos[self.i]));
-            decode_position_group_into(&mut cur, out)?;
+            decode_positions_of_into(&mut cur, self.codec, self.tfs[self.i], out)?;
         }
         Ok(true)
     }
@@ -1569,27 +2099,23 @@ impl<'a> BlockCursor<'a> {
         let mut cur = Cursor::new(self.data);
         cur.set_position(pos as u64);
         if b < self.nfull {
-            let mut deltas = [0u32; BLOCK_SIZE];
-            match self.codec {
-                PostCodec::V1 => unpack_u32_block_v1(self.data, &mut cur, &mut deltas)?,
-                PostCodec::V2 { .. } => unpack_u32_block_v2(self.data, &mut cur, &mut deltas)?,
-            }
-            let mut prev = base;
-            for (d, &delta) in self.docs.iter_mut().zip(deltas.iter()) {
-                prev = prev.wrapping_add(delta);
-                *d = prev;
-            }
-            if self.has_positions && !self.freq_omitted && self.want_tf {
-                match self.codec {
-                    PostCodec::V1 => unpack_u32_block_v1(self.data, &mut cur, &mut self.tfs)?,
-                    PostCodec::V2 { .. } => {
-                        unpack_u32_block_v2(self.data, &mut cur, &mut self.tfs)?
-                    }
-                }
+            decode_full_block_docs(
+                self.codec,
+                self.data,
+                &mut cur,
+                base,
+                b == 0,
+                &mut self.docs,
+            )?;
+            // Without position counts, sequential mode needs the frequencies to
+            // step over the positions.
+            let tf_steps = self.blocks.is_none() && matches!(self.codec, PostCodec::V4 { .. });
+            if self.has_positions && !self.freq_omitted && (self.want_tf || tf_steps) {
+                decode_full_block_freqs(self.codec, self.data, &mut cur, &mut self.tfs)?;
             } else {
                 if self.has_positions && !self.freq_omitted && self.blocks.is_none() {
                     // sequential mode still has to step over the frame
-                    skip_u32_block(self.codec, self.data, &mut cur)?;
+                    skip_full_block_freqs(self.codec, self.data, &mut cur)?;
                 }
                 self.tfs = [1; BLOCK_SIZE];
             }
@@ -1606,9 +2132,9 @@ impl<'a> BlockCursor<'a> {
                         let len = cur.read_u32::<LittleEndian>()? as u64;
                         cur.set_position(cur.position() + len);
                     }
-                    PostCodec::V2 { .. } => {
-                        for _ in 0..BLOCK_SIZE {
-                            skip_position_group(&mut cur)?;
+                    PostCodec::V2 { .. } | PostCodec::V3 { .. } | PostCodec::V4 { .. } => {
+                        for k in 0..BLOCK_SIZE {
+                            skip_positions_of(&mut cur, self.codec, self.tfs[k])?;
                         }
                     }
                 }
@@ -1633,7 +2159,7 @@ impl<'a> BlockCursor<'a> {
                         vbyte_decode(&mut cur)?
                     };
                     self.res_pos[k] = cur.position() as u32;
-                    skip_position_group(&mut cur)?;
+                    skip_positions_of(&mut cur, self.codec, tf)?;
                     tf
                 } else {
                     1
@@ -1733,10 +2259,37 @@ impl<'a> BlockCursor<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostCodec {
     V1,
-    V2 { freq_omitted: bool },
+    V2 {
+        freq_omitted: bool,
+    },
+    /// ZPS3 (experimental, see [`BlockCodec::EliasFanoAc`]): ZPS2 with each
+    /// full block's doc ids Elias-Fano coded and its frequencies
+    /// arithmetic-coded; residuals and positions as ZPS2.
+    V3 {
+        freq_omitted: bool,
+    },
+    /// ZPS4: ZPS2 without the per-document position count, which always equals
+    /// the term frequency (see [`BlockCodec::PackedNoCounts`]).
+    V4 {
+        freq_omitted: bool,
+    },
 }
 
 impl PostCodec {
+    /// [`Self::v2_for`] for a ZPS3 envelope.
+    pub fn v3_for(has_positions: bool, total_term_frequency: u64, doc_frequency: u32) -> Self {
+        PostCodec::V3 {
+            freq_omitted: has_positions && total_term_frequency == doc_frequency as u64,
+        }
+    }
+
+    /// [`Self::v2_for`] for a ZPS4 envelope.
+    pub fn v4_for(has_positions: bool, total_term_frequency: u64, doc_frequency: u32) -> Self {
+        PostCodec::V4 {
+            freq_omitted: has_positions && total_term_frequency == doc_frequency as u64,
+        }
+    }
+
     /// The codec decision a ZPS2 reader makes for one term from facts the
     /// `.meta` record already carries.  The writer applies the identical
     /// predicate at encode time, so the two cannot drift.
@@ -1940,22 +2493,22 @@ impl<'a> PostingsReader<'a> {
 
     fn decode_next_full_block(&mut self) -> io::Result<()> {
         // Read doc_id deltas
-        let mut deltas = [0u32; BLOCK_SIZE];
-        match self.codec {
-            PostCodec::V1 => unpack_u32_block_v1(self.data, &mut self.cursor, &mut deltas)?,
-            PostCodec::V2 { .. } => unpack_u32_block_v2(self.data, &mut self.cursor, &mut deltas)?,
-        }
+        let mut docs = [0u32; BLOCK_SIZE];
+        decode_full_block_docs(
+            self.codec,
+            self.data,
+            &mut self.cursor,
+            self.last_doc_id,
+            self.blocks_processed == 0,
+            &mut docs,
+        )?;
 
-        // Reconstruct absolute doc IDs, into the reader's own buffer: a block
-        // is decoded once per 128 postings, and allocating fresh `Vec`s for
-        // it on every block was measurable on million-posting stopwords.
+        // Absolute doc IDs, into the reader's own buffer: a block is decoded
+        // once per 128 postings, and allocating fresh `Vec`s for it on every
+        // block was measurable on million-posting stopwords.
         self.block_docs.resize(BLOCK_SIZE, 0);
-        let mut doc = self.last_doc_id;
-        for (slot, delta) in self.block_docs.iter_mut().zip(deltas) {
-            doc += delta;
-            *slot = doc;
-        }
-        self.last_doc_id = doc;
+        self.block_docs.copy_from_slice(&docs);
+        self.last_doc_id = self.block_docs[BLOCK_SIZE - 1];
 
         // A positioned term whose freq stream was elided (ttf == df) or a
         // docs-only field: every frequency is 1 by construction, so the
@@ -1964,12 +2517,7 @@ impl<'a> PostingsReader<'a> {
         self.block_freqs.resize(BLOCK_SIZE, 1);
         if freq_stored {
             let mut freqs = [0u32; BLOCK_SIZE];
-            match self.codec {
-                PostCodec::V1 => unpack_u32_block_v1(self.data, &mut self.cursor, &mut freqs)?,
-                PostCodec::V2 { .. } => {
-                    unpack_u32_block_v2(self.data, &mut self.cursor, &mut freqs)?
-                }
-            }
+            decode_full_block_freqs(self.codec, self.data, &mut self.cursor, &mut freqs)?;
             self.block_freqs.copy_from_slice(&freqs);
         } else {
             self.block_freqs.fill(1);
@@ -2010,9 +2558,10 @@ impl<'a> PostingsReader<'a> {
                 }
                 self.cursor.set_position(pos_end as u64);
             }
-            PostCodec::V2 { .. } => {
-                for _ in 0..BLOCK_SIZE {
-                    skip_position_group(&mut self.cursor)?;
+            PostCodec::V2 { .. } | PostCodec::V3 { .. } | PostCodec::V4 { .. } => {
+                for k in 0..BLOCK_SIZE {
+                    let tf = self.block_freqs[k];
+                    skip_positions_of(&mut self.cursor, self.codec, tf)?;
                 }
             }
         }
@@ -2024,7 +2573,9 @@ impl<'a> PostingsReader<'a> {
     fn freq_omitted(&self) -> bool {
         match self.codec {
             PostCodec::V1 => false,
-            PostCodec::V2 { freq_omitted } => freq_omitted || !self.has_positions,
+            PostCodec::V2 { freq_omitted }
+            | PostCodec::V3 { freq_omitted }
+            | PostCodec::V4 { freq_omitted } => freq_omitted || !self.has_positions,
         }
     }
 
@@ -2054,9 +2605,17 @@ impl<'a> PostingsReader<'a> {
                 }
                 self.cursor.set_position(pos_end as u64);
             }
-            PostCodec::V2 { .. } => {
+            PostCodec::V2 { .. } | PostCodec::V3 { .. } => {
                 for _ in 0..BLOCK_SIZE {
                     positions.push(decode_position_group(&mut self.cursor)?);
+                }
+            }
+            PostCodec::V4 { .. } => {
+                for k in 0..BLOCK_SIZE {
+                    let mut group = Vec::new();
+                    let tf = self.block_freqs[k];
+                    decode_positions_of_into(&mut self.cursor, self.codec, tf, &mut group)?;
+                    positions.push(group);
                 }
             }
         }
@@ -2083,10 +2642,14 @@ impl<'a> PostingsReader<'a> {
                     vbyte_decode(&mut self.cursor)?
                 };
                 if !self.positions_wanted {
-                    skip_position_group(&mut self.cursor)?;
+                    skip_positions_of(&mut self.cursor, self.codec, term_freq)?;
                     (term_freq, Vec::new())
                 } else {
-                    let pos_count = vbyte_decode(&mut self.cursor)? as usize;
+                    let pos_count = if matches!(self.codec, PostCodec::V4 { .. }) {
+                        term_freq as usize
+                    } else {
+                        vbyte_decode(&mut self.cursor)? as usize
+                    };
                     let mut positions = Vec::with_capacity(pos_count);
                     let mut prev_pos = 0u32;
                     for _ in 0..pos_count {
@@ -2584,6 +3147,17 @@ mod tests {
         seed: u64,
         norm_of: &dyn Fn(u32) -> u8,
     ) -> IndexedList {
+        indexed_list_with(n, positions, tf_one, seed, norm_of, BlockCodec::Packed)
+    }
+
+    fn indexed_list_with(
+        n: usize,
+        positions: bool,
+        tf_one: bool,
+        seed: u64,
+        norm_of: &dyn Fn(u32) -> u8,
+        codec: BlockCodec,
+    ) -> IndexedList {
         let mut rng = Lcg(seed);
         let mut writer = if positions {
             PostingsWriter::new()
@@ -2616,15 +3190,19 @@ mod tests {
             expected.push((doc, if positions { tf } else { 1 }));
         }
         let mut data = Vec::new();
-        let (off, blocks) = writer.encode_term_indexed("t", &mut data, norm_of).unwrap();
+        let (off, blocks) = writer
+            .encode_term_indexed_with("t", &mut data, norm_of, codec)
+            .unwrap();
         assert_eq!(off, 0);
-        // identical bytes to the plain encoder
-        let mut plain = Vec::new();
-        writer.encode_term("t", &mut plain);
-        assert_eq!(
-            plain, data,
-            "encode_term_indexed must not change the encoding"
-        );
+        if codec == BlockCodec::Packed {
+            // identical bytes to the plain encoder
+            let mut plain = Vec::new();
+            writer.encode_term("t", &mut plain);
+            assert_eq!(
+                plain, data,
+                "encode_term_indexed must not change the encoding"
+            );
+        }
         (data, blocks, expected, n as u32, ttf)
     }
 
@@ -2829,5 +3407,126 @@ mod tests {
         short.truncate(frame.len() - 1);
         assert!(split_block_index_frame(&short).is_none());
         assert!(split_block_index_frame(b"ZPS2abcd").is_none());
+    }
+
+    #[test]
+    fn elias_fano_ac_blocks_decode_like_packed_ones() {
+        blocks_decode_like_packed_ones(BlockCodec::EliasFanoAc, PostCodec::v3_for);
+    }
+
+    #[test]
+    fn no_count_blocks_decode_like_packed_ones() {
+        blocks_decode_like_packed_ones(BlockCodec::PackedNoCounts, PostCodec::v4_for);
+    }
+
+    fn blocks_decode_like_packed_ones(
+        block_codec: BlockCodec,
+        post_codec: fn(bool, u64, u32) -> PostCodec,
+    ) {
+        let norm_of = |d: u32| (d % 251) as u8;
+        let mut case = 500u64;
+        for n in [128usize, 129, 255, 256, 1000, 4097] {
+            for (positions, tf_one) in [(true, false), (true, true), (false, false)] {
+                case += 1;
+                let (packed, pblocks, expected, df, ttf) =
+                    indexed_list_with(n, positions, tf_one, case, &norm_of, BlockCodec::Packed);
+                let (efac, eblocks, expected2, _, _) = indexed_list_with(
+                    n,
+                    positions,
+                    tf_one,
+                    case,
+                    &norm_of,
+                    block_codec,
+                );
+                assert_eq!(expected, expected2);
+                assert_eq!(
+                    pblocks.as_ref().map(|b| &b.last_doc),
+                    eblocks.as_ref().map(|b| &b.last_doc)
+                );
+                let codec = post_codec(positions, ttf, df);
+                let label = format!("n={n} positions={positions} tf_one={tf_one}");
+                // the linear reader (generic path, merges) on ZPS3 blocks
+                let mut reader =
+                    PostingsReader::new_with_codec(&efac, df, positions, codec).without_positions();
+                let mut linear = Vec::new();
+                while let Some(step) = reader.next_doc() {
+                    linear.push(step);
+                }
+                assert_eq!(linear, expected, "{label}: linear");
+                if positions {
+                    // positions still decode (they follow the coded frames)
+                    let mut full = PostingsReader::new_with_codec(&efac, df, positions, codec);
+                    let mut same = PostingsReader::new_with_codec(
+                        &packed,
+                        df,
+                        positions,
+                        PostCodec::v2_for(positions, ttf, df),
+                    );
+                    let mut count = 0;
+                    while let Some(p) = full.next() {
+                        assert_eq!(p.positions.len() as u32, p.term_freq, "{label}: positions");
+                        let q = same.next().unwrap();
+                        assert_eq!(p.positions, q.positions, "{label}: positions");
+                        count += 1;
+                    }
+                    assert_eq!(count, n);
+                    // The cursor reads a document's positions at any point of the walk.
+                    let term = eblocks.as_ref().map(parsed);
+                    let term = term.as_ref().map(|ix| ix.term(0).unwrap());
+                    for tb in [term, None] {
+                        let mut c = BlockCursor::new(&efac, df, positions, codec, tb);
+                        let mut same = PostingsReader::new_with_codec(
+                            &packed,
+                            df,
+                            positions,
+                            PostCodec::v2_for(positions, ttf, df),
+                        );
+                        let mut out = Vec::new();
+                        while c.doc != u32::MAX {
+                            let q = same.next().unwrap();
+                            assert_eq!(c.doc, q.doc_id, "{label}");
+                            if c.positions(&mut out).unwrap() {
+                                assert_eq!(out, q.positions, "{label}: cursor positions");
+                            }
+                            c.next();
+                        }
+                    }
+                }
+                // the block cursor, indexed and sequential
+                let index = eblocks.as_ref().map(parsed);
+                let term = index.as_ref().map(|ix| ix.term(0).unwrap());
+                for tb in [term, None] {
+                    assert_eq!(
+                        walk(BlockCursor::new(&efac, df, positions, codec, tb)),
+                        expected,
+                        "{label}: walk"
+                    );
+                    let docs_only: Vec<u32> = walk(BlockCursor::with_frequencies(
+                        &efac, df, positions, codec, tb, false,
+                    ))
+                    .into_iter()
+                    .map(|(d, _)| d)
+                    .collect();
+                    assert_eq!(
+                        docs_only,
+                        expected.iter().map(|e| e.0).collect::<Vec<_>>(),
+                        "{label}: docs only"
+                    );
+                    let mut c = BlockCursor::new(&efac, df, positions, codec, tb);
+                    for e in expected.iter().step_by(61) {
+                        c.advance(e.0);
+                        assert_eq!((c.doc, c.tf()), *e, "{label}: advance");
+                    }
+                }
+                if !tf_one && positions && block_codec == BlockCodec::EliasFanoAc {
+                    assert!(
+                        efac.len() < packed.len() + n,
+                        "{label}: {} vs {}",
+                        efac.len(),
+                        packed.len()
+                    );
+                }
+            }
+        }
     }
 }

@@ -699,6 +699,15 @@ fn post_envelope_split(raw: &[u8]) -> Option<(usize, usize)> {
     Some((len as usize, 8))
 }
 
+/// EXPERIMENTAL ZPS3 = the ZPS2 envelope and framing with full blocks coded
+/// by [`crate::postings::BlockCodec::EliasFanoAc`] (written only on request,
+/// see [`FtsIndexWriter::with_block_codec`]).  A reader that predates it would
+/// take the unknown magic for the raw legacy layout, so this needs a
+/// data-directory format gate before any production use.
+const POST_MAGIC_ZSTD_V3: &[u8; 4] = b"ZPS3";
+/// ZPS2 without per-document position counts
+/// ([`crate::postings::BlockCodec::PackedNoCounts`]).
+const POST_MAGIC_ZSTD_V4: &[u8; 4] = b"ZPS4";
 /// Zstd compression level used for the durable segment artifacts
 /// (`.meta` ZFM4, `.post` ZPS1).  Reverted from 19 to 3: this constant
 /// is invoked at **flush** time, not just merge, so the ~25 MB/s/core
@@ -1307,6 +1316,8 @@ pub struct FtsIndexWriter {
     /// writer, so parallel tests do not share a process-global flag.
     #[cfg(test)]
     panic_on_field: Option<String>,
+    /// Full-block codec of the `.post` side-cars (ZPS2 packed by default).
+    block_codec: crate::postings::BlockCodec,
 }
 
 struct FieldData {
@@ -1341,6 +1352,7 @@ impl FtsIndexWriter {
             zstd_level: ZSTD_DURABLE_LEVEL,
             #[cfg(test)]
             panic_on_field: None,
+            block_codec: crate::postings::BlockCodec::Packed,
         }
     }
 
@@ -1350,6 +1362,15 @@ impl FtsIndexWriter {
     #[cfg(test)]
     fn panic_while_writing_field(&mut self, field: impl Into<String>) {
         self.panic_on_field = Some(field.into());
+    }
+
+    /// EXPERIMENTAL: write full blocks with `codec` (ZPS3 for
+    /// [`crate::postings::BlockCodec::EliasFanoAc`]).  For measurements only:
+    /// readers older than ZPS3 cannot read such a segment, so production use
+    /// needs a data-directory format gate first.
+    pub fn with_block_codec(mut self, codec: crate::postings::BlockCodec) -> Self {
+        self.block_codec = codec;
+        self
     }
 
     /// The configuration an UNCONFIGURED field is indexed with.
@@ -1787,6 +1808,7 @@ impl FtsIndexWriter {
         let zstd_level = self.zstd_level;
         #[cfg(test)]
         let panic_on_field = self.panic_on_field.clone();
+        let block_codec = self.block_codec;
 
         // Drain fields into a Vec so we can parallelise the iterator.
         // Cloning `stats` before consuming `field_data` — `stats` goes into
@@ -1857,6 +1879,7 @@ impl FtsIndexWriter {
                         field_data,
                         zstd_level,
                         layout,
+                        block_codec,
                     )
                 }));
                 match outcome {
@@ -1896,6 +1919,7 @@ impl FtsIndexWriter {
         field_data: FieldData,
         zstd_level: i32,
         layout: FilenameLayout,
+        block_codec: crate::postings::BlockCodec,
     ) -> Result<Vec<xerj_common::fsio::StagedFile>> {
         let mut staged = Vec::with_capacity(4);
         // NOTE: `PathBuf::with_extension` replaces the final `.ext` in the path,
@@ -1947,12 +1971,21 @@ impl FtsIndexWriter {
             .map(|(t, df, ttf)| (t, (df, ttf)))
             .collect();
 
-        for term in &sorted_terms {
-            if let Some((offset, blocks)) =
-                field_data
-                    .postings
-                    .encode_term_indexed(term, &mut post_data, &norm_of)
+        let block_codec = match block_codec {
+            crate::postings::BlockCodec::PackedNoCounts
+                if !field_data.postings.positions_match_freqs() =>
             {
+                crate::postings::BlockCodec::Packed
+            }
+            codec => codec,
+        };
+        for term in &sorted_terms {
+            if let Some((offset, blocks)) = field_data.postings.encode_term_indexed_with(
+                term,
+                &mut post_data,
+                &norm_of,
+                block_codec,
+            ) {
                 if let Some(blocks) = &blocks {
                     block_index.add(offset, blocks);
                 }
@@ -2003,7 +2036,14 @@ impl FtsIndexWriter {
                 .with_context(|| "ZBM1 block index")?;
             let compressed = zstd::bulk::compress(&post_data, zstd_level)
                 .with_context(|| "ZPS2 zstd compress")?;
-            let mut out = post_envelope_header(POST_MAGIC_ZSTD_V2, post_data.len());
+            let mut out = post_envelope_header(
+                match block_codec {
+                    crate::postings::BlockCodec::Packed => POST_MAGIC_ZSTD_V2,
+                    crate::postings::BlockCodec::EliasFanoAc => POST_MAGIC_ZSTD_V3,
+                    crate::postings::BlockCodec::PackedNoCounts => POST_MAGIC_ZSTD_V4,
+                },
+                post_data.len(),
+            );
             out.reserve(frame.len() + compressed.len());
             out.extend_from_slice(&frame);
             out.extend_from_slice(&compressed);
@@ -2223,15 +2263,9 @@ fn merge_field_from_segments(
                 ));
                 return false;
             };
-            let codec = if source.reader.field_post_block_v2(field) {
-                crate::postings::PostCodec::v2_for(
-                    has_positions,
-                    term_postings.total_term_frequency,
-                    term_postings.doc_frequency,
-                )
-            } else {
-                crate::postings::PostCodec::V1
-            };
+            let codec = source
+                .reader
+                .term_codec(field, has_positions, &term_postings);
             let mut decoded = crate::postings::PostingsReader::new_with_codec(
                 data,
                 term_postings.doc_frequency,
@@ -2550,6 +2584,11 @@ struct LoadedField {
     /// frame-of-reference layout (see `xerj_fts::postings`).  Every other
     /// envelope (ZPS1, ZPL1, raw) predates it and decodes as `PostCodec::V1`.
     post_block_v2: bool,
+    /// The envelope magic said `ZPS3` (experimental Elias-Fano + arithmetic
+    /// full blocks, see `POST_MAGIC_ZSTD_V3`).
+    post_block_v3: bool,
+    /// The `.post` envelope is `ZPS4` (no position counts).
+    post_block_v4: bool,
     /// Pre-parsed metadata (term postings, field stats) — small, stays owned.
     meta: FieldMeta,
     /// Per-document field lengths (see [`Norms`]).
@@ -2849,8 +2888,13 @@ impl FtsIndexReader {
                 fs::read(&post_path).with_context(|| format!("reading postings {:?}", post_path))?
             };
             let zstd_envelope = raw_post.len() >= 8
-                && (&raw_post[..4] == POST_MAGIC_ZSTD_V2 || &raw_post[..4] == POST_MAGIC_ZSTD);
+                && (&raw_post[..4] == POST_MAGIC_ZSTD_V2
+                    || &raw_post[..4] == POST_MAGIC_ZSTD_V3
+                    || &raw_post[..4] == POST_MAGIC_ZSTD_V4
+                    || &raw_post[..4] == POST_MAGIC_ZSTD);
             let post_block_v2 = raw_post.len() >= 4 && &raw_post[..4] == POST_MAGIC_ZSTD_V2;
+            let post_block_v3 = raw_post.len() >= 4 && &raw_post[..4] == POST_MAGIC_ZSTD_V3;
+            let post_block_v4 = raw_post.len() >= 4 && &raw_post[..4] == POST_MAGIC_ZSTD_V4;
             // The optional block-index frame (a zstd skippable frame right
             // after the header).  A frame that does not parse is ignored —
             // the walk is exact without it — rather than failing the field.
@@ -2864,7 +2908,7 @@ impl FtsIndexReader {
                 None
             };
             let frames_at = envelope.map_or(8, |(_, at)| at);
-            let block_index = if post_block_v2 {
+            let block_index = if post_block_v2 || post_block_v3 || post_block_v4 {
                 raw_post.get(frames_at..).and_then(crate::postings::split_block_index_frame).and_then(|(payload, _)| {
                     crate::postings::BlockIndex::parse(payload)
                         .map_err(|error| {
@@ -2961,6 +3005,8 @@ impl FtsIndexReader {
                     fst,
                     post_data,
                     post_block_v2,
+                    post_block_v3,
+                    post_block_v4,
                     meta,
                     norms,
                     block_index,
@@ -3217,15 +3263,7 @@ impl FtsIndexReader {
     ) -> Option<crate::postings::PostingsReader<'a>> {
         let data = self.postings_data(field, tp)?;
         let has_positions = self.field_has_positions(field);
-        let codec = if self.field_post_block_v2(field) {
-            crate::postings::PostCodec::v2_for(
-                has_positions,
-                tp.total_term_frequency,
-                tp.doc_frequency,
-            )
-        } else {
-            crate::postings::PostCodec::V1
-        };
+        let codec = self.term_codec(field, has_positions, tp);
         Some(crate::postings::PostingsReader::new_with_codec(
             data,
             tp.doc_frequency,
@@ -3234,12 +3272,36 @@ impl FtsIndexReader {
         ))
     }
 
-    /// Whether this field's `.post` envelope is ZPS2 (FOR inner framing).
-    fn field_post_block_v2(&self, field: &str) -> bool {
-        self.fields
-            .get(field)
-            .map(|loaded| loaded.post_block_v2)
-            .unwrap_or(false)
+    /// The inner codec a reader of one term of `field` must use (from the
+    /// envelope magic and the term's `.meta` record).
+    fn term_codec(
+        &self,
+        field: &str,
+        has_positions: bool,
+        tp: &TermPostings,
+    ) -> crate::postings::PostCodec {
+        let loaded = self.fields.get(field);
+        if loaded.is_some_and(|l| l.post_block_v4) {
+            crate::postings::PostCodec::v4_for(
+                has_positions,
+                tp.total_term_frequency,
+                tp.doc_frequency,
+            )
+        } else if loaded.is_some_and(|l| l.post_block_v3) {
+            crate::postings::PostCodec::v3_for(
+                has_positions,
+                tp.total_term_frequency,
+                tp.doc_frequency,
+            )
+        } else if loaded.is_some_and(|l| l.post_block_v2) {
+            crate::postings::PostCodec::v2_for(
+                has_positions,
+                tp.total_term_frequency,
+                tp.doc_frequency,
+            )
+        } else {
+            crate::postings::PostCodec::V1
+        }
     }
 
     /// Per-segment document frequency for a term (number of docs containing
@@ -3323,15 +3385,7 @@ impl FtsIndexReader {
     ) -> Option<crate::postings::BlockCursor<'a>> {
         let data = self.postings_data(field, tp)?;
         let has_positions = self.field_has_positions(field);
-        let codec = if self.field_post_block_v2(field) {
-            crate::postings::PostCodec::v2_for(
-                has_positions,
-                tp.total_term_frequency,
-                tp.doc_frequency,
-            )
-        } else {
-            crate::postings::PostCodec::V1
-        };
+        let codec = self.term_codec(field, has_positions, tp);
         let blocks = self
             .block_index(field)
             .and_then(|ix| ix.term(tp.postings_offset));
