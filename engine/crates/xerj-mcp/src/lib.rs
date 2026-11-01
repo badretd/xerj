@@ -44,7 +44,7 @@
 //! | `xerj_corpus_feedback` | `POST /api/corpus-feedback` (hub.xerj.org) | rate a hub corpus after using it (its Agent score); sends by default; `xerj_hub_ask` / `xerj_hub_def` also send an automatic review |
 //! | `xerj_map`             | `POST /autoindex-catalog/_search`     | per-index field map from the autoindex catalog (#1055) |
 //! | `xerj_hub_find` / `xerj_hub_def` / `xerj_hub_ask` | the `xerj ask` flow (`src/hub.rs`) | which hub corpus answers; one definition; one question — from local packs, never downloading |
-//! | `xerj_facts_ask` (feature `facts`, off by default) | `POST /_facts/{ns}/_ask` | read-only question over a facts namespace: exact executor over stored facts, cited evidence |
+//! | `xerj_facts_ask` (feature `facts`) | `POST /_facts/{ns}/_ask` | read-only question over a facts namespace: exact executor over stored facts, cited evidence |
 //!
 //! ## Honesty notes (must match the engine, never oversell)
 //!
@@ -929,14 +929,14 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
 
 /// Whether this build serves `xerj_facts_ask`: only with the cargo feature
 /// `facts`, which the engine's own `facts` feature (the `/_facts` routes) turns
-/// on. Off in the default build, whose tool list is the published schema.
+/// on. On in the default build, whose tool list is the published schema.
 fn facts_tools_served() -> bool {
     cfg!(feature = "facts")
 }
 
 /// [`tool_specs_with`] with the facts tool forced in or out as well. The
 /// published schema (`landing/docs/agents/schemas/mcp-tools.json`) is the
-/// default build's list, `tool_specs_full(true, false)`.
+/// default build's list, `tool_specs_full(true, true)`.
 pub fn tool_specs_full(include_hub: bool, include_facts: bool) -> Value {
     let mut specs = json!([
         def::spec(),
@@ -1673,10 +1673,14 @@ fn facts_ask_spec() -> Value {
              read-only. A small learned compiler (the model the node was started with) \
              turns the question into a short program (LOOKUP, CHAIN, comparisons); an \
              exact executor runs it over the namespace's records at one revision, and a \
-             deterministic rule checks the cited records. The result carries `status` \
-             (ANSWER, CONFLICT or UNKNOWN), `answer`, the cited `evidence` (fact id, \
-             subject, relation, value, quote and source document), the `program` and \
-             the `snapshot` revision. UNKNOWN means no active fact answered the question \
+             deterministic policy decides whether that answer may be served. Read \
+             `final_status` (ANSWER, CONFLICT, UNKNOWN or UNSUPPORTED) and `final_answer`; \
+             `reason_code` says why nothing was served or that a repair was made, and \
+             `status` and `answer` are the unchecked program's, not to be relied on. The \
+             result also carries the cited `evidence` of the served answer (fact id, \
+             subject, relation, value, quote and source document with its location and \
+             hash), the `program` and the `snapshot` revision. Counting questions are \
+             declined with COUNTING_OFF. UNKNOWN means no active fact answered the question \
              in this namespace at this revision: it is not proof that the fact is false. \
              Operational problems are HTTP errors, never an UNKNOWN, and come back \
              verbatim: 503 ENRICHMENT_PENDING (the namespace is being rebuilt; retry), \

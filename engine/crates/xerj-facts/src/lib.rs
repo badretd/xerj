@@ -969,7 +969,9 @@ pub struct AskReq {
     /// where no cap binds the manifests are the reference manifests.
     #[serde(default)]
     pub manifest: Option<String>,
-    /// "served" (the default: the stack-v5 rule `verify_v5`, unchanged) | "bindings" (rule (b) counts the question's exact
+    /// "decline_v2" (the default: the decline policy decides what is served; read `final_status`, `final_answer`,
+    /// `final_evidence_ids` and `reason_code`, while `status` and `answer` stay the raw program's) | "served" (the stack-v5 rule
+    /// `verify_v5`, which accepts wrong answers far more often and stays for comparison) | "bindings" (rule (b) counts the question's exact
     /// bindings, so a store name nested in a longer one, "Albania" in "Prime Minister of Albania", is not a second subject)
     /// | "bindings_path" (bindings, and every CHAIN record must continue the path) | "bindings_all" (bindings over every
     /// subject ever written, so a subject whose facts were withdrawn still counts). Opt-in ([`VerifyRule`]): the verify step
@@ -1068,6 +1070,19 @@ pub fn get_fact(
     })))
 }
 
+/// The rule of one ask: `decline_v2` when the request names none, a refused name is a 400.
+fn verify_rule(name: Option<&str>) -> Result<VerifyRule, FactsError> {
+    match name {
+        None => Ok(VerifyRule::DeclineV2),
+        Some(v) => VerifyRule::parse(v).ok_or_else(|| {
+            FactsError::BadRequest(format!(
+                "verify [{v}] is not one of {}",
+                VerifyRule::NAMES.join(", ")
+            ))
+        }),
+    }
+}
+
 /// One question: link, exact manifest, compiler decisions on the live exact executor, verify, plus the cited records.
 pub fn ask(slot: &ModelSlot, ns: &Namespace, req: &AskReq) -> Result<Value, FactsError> {
     ask_stoppable(slot, ns, req, None)
@@ -1137,15 +1152,7 @@ fn ask_inner(
             )))
         }
     };
-    let verify = match req.verify.as_deref() {
-        None => VerifyRule::Served,
-        Some(v) => VerifyRule::parse(v).ok_or_else(|| {
-            FactsError::BadRequest(format!(
-                "verify [{v}] is not one of {}",
-                VerifyRule::NAMES.join(", ")
-            ))
-        })?,
-    };
+    let verify = verify_rule(req.verify.as_deref())?;
     let stopped = |s: xerj_serve::engine::Stopped| FactsError::Stopped {
         decisions: s.decisions,
     };
@@ -1289,7 +1296,13 @@ pub struct FactsService {
     pub config_error: Option<String>,
 }
 
-/// `XERJ_FACTS_PRELOAD` values that turn the start-up load on (anything else, or unset, leaves it off)
+/// `XERJ_FACTS_PRELOAD`: unset loads the compiler at start-up when a model directory is set; a value turns it on only
+/// when [`preload_on`] reads it so.
+fn preload_wanted(v: Option<&str>) -> bool {
+    v.is_none() || preload_on(v)
+}
+
+/// Switch values that mean on (anything else, or unset, is off)
 fn preload_on(v: Option<&str>) -> bool {
     matches!(
         v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
@@ -1313,17 +1326,32 @@ fn parse_precision(precision: &str) -> (Precision, &'static str) {
     }
 }
 
-/// `XERJ_FACTS_THREADS` and `XERJ_FACTS_THREAD_QUEUE` as speed options (threads unset or unreadable: the default, one
-/// thread, no buffer reuse, no queue)
-fn speed_from(threads: Option<&str>, queue: Option<&str>) -> SpeedOptions {
-    match threads.and_then(|v| v.trim().parse::<usize>().ok()) {
-        Some(n) if n >= 1 => SpeedOptions {
-            threads: n.min(64),
-            reuse_sessions: true,
-            queue: preload_on(queue),
-        },
-        _ => SpeedOptions::default(),
+/// Threads per question when `XERJ_FACTS_THREADS` does not name a number: half the cores, between 1 and 4.
+fn auto_threads(cores: usize) -> usize {
+    (cores / 2).clamp(1, 4)
+}
+
+/// `XERJ_FACTS_THREADS` and `XERJ_FACTS_THREAD_QUEUE` as speed options on a machine of `cores` cores. Threads unset,
+/// unreadable or 0: [`auto_threads`]. Buffers are always kept between questions.
+fn speed_from(threads: Option<&str>, queue: Option<&str>, cores: usize) -> SpeedOptions {
+    let threads = threads
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| auto_threads(cores));
+    SpeedOptions {
+        threads: threads.min(64),
+        reuse_sessions: true,
+        queue: preload_on(queue),
     }
+}
+
+/// [`speed_from`] from the environment
+fn speed_from_env() -> SpeedOptions {
+    speed_from(
+        std::env::var("XERJ_FACTS_THREADS").ok().as_deref(),
+        std::env::var("XERJ_FACTS_THREAD_QUEUE").ok().as_deref(),
+        std::thread::available_parallelism().map_or(1, usize::from),
+    )
 }
 
 /// What a compiler load depends on: model directory, precision, int8 mode, speed options.
@@ -1345,10 +1373,7 @@ fn env_load_settings() -> (Option<LoadKey>, bool) {
     let dir = std::env::var_os("XERJ_FACTS_MODEL_DIR").map(PathBuf::from);
     let (precision, int8_mode) =
         parse_precision(&std::env::var("XERJ_FACTS_PRECISION").unwrap_or_default());
-    let speed = speed_from(
-        std::env::var("XERJ_FACTS_THREADS").ok().as_deref(),
-        std::env::var("XERJ_FACTS_THREAD_QUEUE").ok().as_deref(),
-    );
+    let speed = speed_from_env();
     let key = dir.map(|dir| LoadKey {
         dir,
         precision,
@@ -1359,7 +1384,7 @@ fn env_load_settings() -> (Option<LoadKey>, bool) {
     });
     (
         key,
-        preload_on(std::env::var("XERJ_FACTS_PRELOAD").ok().as_deref()),
+        preload_wanted(std::env::var("XERJ_FACTS_PRELOAD").ok().as_deref()),
     )
 }
 
@@ -1380,11 +1405,11 @@ fn spawn_load(cell: &ModelCell, key: &LoadKey) {
         });
 }
 
-/// `XERJ_FACTS_PRELOAD` (off by default) from the very start of the server's start-up: when the preload is on and a
+/// `XERJ_FACTS_PRELOAD` (on when a model directory is set) from the very start of the server's start-up: when the preload is on and a
 /// model directory is configured, start the compiler load now, in a background thread, so it runs while the engine
 /// opens its indices; the [`FactsService::from_env`] created afterwards adopts this load (same directory, precision and
 /// speed options) instead of starting its own, which used to begin only about 0.2 s before the server listened. Returns
-/// whether a load was started. Nothing changes when the preload is off: the model loads on the first ask, as before.
+/// whether a load was started. With the preload off the model loads on the first ask.
 pub fn start_early_preload() -> bool {
     let (Some(key), true) = env_load_settings() else {
         return false;
@@ -1419,13 +1444,13 @@ impl FactsService {
     /// `XERJ_FACTS_MODEL_DIR` (an xerj-infer export), `XERJ_FACTS_PRECISION` = w8 (default) | f32 | int8 | int8-guard, and the
     /// `_ask` limits `XERJ_FACTS_MAX_CONCURRENT_ASKS` / `XERJ_FACTS_ASK_DEADLINE_MS` / `XERJ_FACTS_MAX_QUEUED_ASKS` (unset =
     /// no limit).
-    /// `XERJ_FACTS_THREADS` = N (unset by default: off) turns on the answer-speed path: N threads per question (N >= 2) and
-    /// buffers kept between questions. Decisions are identical with and without it (see `xerj_serve::engine::SpeedOptions`).
+    /// `XERJ_FACTS_THREADS` = N sets the threads per question; unset, half the cores between 1 and 4. Buffers are kept
+    /// between questions. Decisions are identical at every thread count (see `xerj_serve::engine::SpeedOptions`).
     /// `XERJ_FACTS_THREAD_QUEUE` = 1 (unset by default: off; only with `XERJ_FACTS_THREADS` >= 2) makes concurrent
     /// questions take turns on all the threads, one computing at a time, instead of running the others single-threaded
     /// beside it (see `xerj_serve::engine::SpeedOptions::queue`); decisions are identical either way.
-    /// `XERJ_FACTS_PRELOAD` = 1 (unset by default: off) loads the compiler in a background thread at start-up instead of on
-    /// the first ask, so the first question after a restart does not wait for the load (a question that arrives during the
+    /// `XERJ_FACTS_PRELOAD`, on when unset and a model directory is set (0 turns it off), loads the compiler in a background
+    /// thread at start-up instead of on the first ask, so the first question after a restart does not wait for the load (a question that arrives during the
     /// load waits for that same load). Same model, same options, same result: only the moment of the load moves.
     /// `XERJ_FACTS_MAX_RESIDENT_NAMESPACES` = N (unset by default: no eviction) keeps at most N projections in memory.
     /// A load started earlier by [`start_early_preload`] with the same settings is adopted, not repeated.
@@ -1437,16 +1462,13 @@ impl FactsService {
             Ok(g) => svc.ask_gate = g,
             Err(e) => svc.config_error = Some(e),
         }
-        svc.speed = speed_from(
-            std::env::var("XERJ_FACTS_THREADS").ok().as_deref(),
-            std::env::var("XERJ_FACTS_THREAD_QUEUE").ok().as_deref(),
-        );
+        svc.speed = speed_from_env();
         svc.max_resident = std::env::var("XERJ_FACTS_MAX_RESIDENT_NAMESPACES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&n| n >= 1);
         if svc.model_dir.is_some()
-            && preload_on(std::env::var("XERJ_FACTS_PRELOAD").ok().as_deref())
+            && preload_wanted(std::env::var("XERJ_FACTS_PRELOAD").ok().as_deref())
         {
             match adopt_early(EARLY_PRELOAD.get(), &svc.load_key().expect("model dir")) {
                 Some(cell) => svc.model = cell,
@@ -2168,7 +2190,11 @@ mod tests {
     }
 
     #[test]
-    fn preload_is_off_unless_asked_for() {
+    fn preload_is_on_when_unset_and_a_value_can_turn_it_off() {
+        assert!(preload_wanted(None));
+        assert!(preload_wanted(Some("1")));
+        assert!(!preload_wanted(Some("0")));
+        assert!(!preload_wanted(Some("")));
         for v in ["1", "true", "TRUE", " yes ", "on"] {
             assert!(preload_on(Some(v)), "{v:?} turns the preload on");
         }
@@ -2199,7 +2225,7 @@ mod tests {
     fn an_early_preload_is_adopted_only_with_the_same_settings() {
         let key = |precision: &str, threads: Option<&str>| {
             let (precision, int8_mode) = parse_precision(precision);
-            let speed = speed_from(threads, None);
+            let speed = speed_from(threads, None, 8);
             LoadKey {
                 dir: PathBuf::from("/m"),
                 precision,
@@ -2219,7 +2245,6 @@ mod tests {
         for other in [
             key("f32", Some("4")),
             key("int8", Some("4")),
-            key("int8-guard", None),
             key("int8-guard", Some("2")),
         ] {
             assert!(adopt_early(Some(&early), &other).is_none(), "{other:?}");
@@ -2232,27 +2257,54 @@ mod tests {
         assert!(adopt_early(Some(&early), &queued).is_none());
         assert!(adopt_early(None, &key("int8-guard", Some("4"))).is_none());
         // the speed options as from_env reads them
-        assert_eq!(speed_from(Some("4"), None).threads, 4);
-        assert!(speed_from(Some("1"), None).reuse_sessions);
+        assert_eq!(speed_from(Some("4"), None, 8).threads, 4);
+        assert!(speed_from(Some("1"), None, 8).reuse_sessions);
         assert!(
-            !speed_from(Some("4"), None).queue,
+            !speed_from(Some("4"), None, 8).queue,
             "the queue is off by default"
         );
-        assert!(speed_from(Some("4"), Some("1")).queue);
-        assert!(!speed_from(Some("4"), Some("0")).queue);
-        assert!(
-            !speed_from(None, Some("1")).queue,
-            "no queue without threads"
-        );
-        assert_eq!(
-            speed_from(Some("0"), None).threads,
-            SpeedOptions::default().threads
-        );
-        assert_eq!(
-            speed_from(Some("x"), None).threads,
-            SpeedOptions::default().threads
-        );
-        assert_eq!(speed_from(Some("999"), None).threads, 64);
+        assert!(speed_from(Some("4"), Some("1"), 8).queue);
+        assert!(!speed_from(Some("4"), Some("0"), 8).queue);
+        assert_eq!(speed_from(Some("999"), None, 8).threads, 64);
+    }
+
+    #[test]
+    fn an_ask_that_names_no_rule_gets_decline_v2_and_served_stays_available() {
+        assert!(matches!(verify_rule(None), Ok(VerifyRule::DeclineV2)));
+        assert!(matches!(
+            verify_rule(Some("served")),
+            Ok(VerifyRule::Served)
+        ));
+        assert!(matches!(
+            verify_rule(Some("decline_v2")),
+            Ok(VerifyRule::DeclineV2)
+        ));
+        assert!(matches!(
+            verify_rule(Some("nonsense")),
+            Err(FactsError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn threads_are_half_the_cores_between_one_and_four_unless_named() {
+        for (cores, want) in [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (6, 3),
+            (8, 4),
+            (20, 4),
+            (128, 4),
+        ] {
+            for unset in [None, Some("0"), Some("x")] {
+                let s = speed_from(unset, None, cores);
+                assert_eq!(s.threads, want, "{cores} cores, {unset:?}");
+                assert!(s.reuse_sessions);
+            }
+        }
+        assert_eq!(speed_from(Some("1"), None, 20).threads, 1);
+        assert_eq!(speed_from(Some("7"), None, 2).threads, 7);
     }
 
     #[test]

@@ -19,9 +19,9 @@ name = "xerj-mcp"
 path = "src/main.rs"
 
 [features]
-# The read-only `xerj_facts_ask` tool (POST /_facts/{ns}/_ask). Off by default: the facts store itself is an
-# off-by-default engine feature, and the published tool schema (landing/docs/agents/schemas/mcp-tools.json) describes
-# the default build. xerj-server's `facts` feature turns it on together with the routes.
+# The read-only `xerj_facts_ask` tool (POST /_facts/{ns}/_ask), in the default build like the engine's `facts`
+# feature, so the published tool schema (landing/docs/agents/schemas/mcp-tools.json) lists it.
+default = ["facts"]
 facts = []
 
 [dependencies]

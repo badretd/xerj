@@ -976,6 +976,55 @@
       }
     },
     {
+      "name": "xerj_facts_ask",
+      "description": "Ask a question of a facts namespace and get an answer computed only from the facts stored in it. Proxies POST /_facts/{namespace}/_ask, which is read-only. A small learned compiler (the model the node was started with) turns the question into a short program (LOOKUP, CHAIN, comparisons); an exact executor runs it over the namespace's records at one revision, and a deterministic policy decides whether that answer may be served. Read `final_status` (ANSWER, CONFLICT, UNKNOWN or UNSUPPORTED) and `final_answer`; `reason_code` says why nothing was served or that a repair was made, and `status` and `answer` are the unchecked program's, not to be relied on. The result also carries the cited `evidence` of the served answer (fact id, subject, relation, value, quote and source document with its location and hash), the `program` and the `snapshot` revision. Counting questions are declined with COUNTING_OFF. UNKNOWN means no active fact answered the question in this namespace at this revision: it is not proof that the fact is false. Operational problems are HTTP errors, never an UNKNOWN, and come back verbatim: 503 ENRICHMENT_PENDING (the namespace is being rebuilt; retry), 503 MODEL_UNAVAILABLE (the node has no usable model; retrying will not help), 504 ASK_DEADLINE, 429 ASK_QUEUE_FULL (the node is answering as many questions as it allows; retry after a moment), 409 REVISION_NOT_COMMITTED, 403 (this key cannot read the namespace). Needs a node built with the facts store and started with a model directory.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "namespace": {
+            "type": "string",
+            "description": "The facts namespace: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit."
+          },
+          "question": {
+            "type": "string",
+            "description": "The question in plain words, naming the subject the way the stored facts do, e.g. 'Who is the head of government of Liberia?'."
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Answer as of this committed revision of the namespace (default: the latest)."
+          },
+          "explain": {
+            "type": "boolean",
+            "description": "Also return the candidate records and the hop reads the compiler saw."
+          },
+          "linker": {
+            "type": "string",
+            "enum": [
+              "exact",
+              "tolerant",
+              "tolerant_words"
+            ],
+            "description": "How names in the question are matched to stored subjects: `exact` (default), or the typo-tolerant `tolerant` / `tolerant_words`, which report the rewrite they made."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Give up after this many milliseconds (504 ASK_DEADLINE). It can only shorten the node's own deadline."
+          },
+          "wait_for_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How long to wait for a namespace that is being rebuilt before the node answers 503 ENRICHMENT_PENDING (default: as long as it takes)."
+          }
+        },
+        "required": [
+          "namespace",
+          "question"
+        ]
+      }
+    },
+    {
       "name": "xerj_hub_find",
       "description": "Discover which hub corpora can answer a question. Each candidate names the upstream repo (owner/name) and a one-line description of what that pack is, plus its pin, licence and whether the pack is already on this machine — not passages; ask one with xerj_hub_ask. A query that names a different project of the same slug (fabric.js vs the pack's repo) is reported as a different project instead of a silent match. A question that names a project no corpus covers is no_coverage (index it locally with xerj autoindex, then xerj code or xerj search); that is not an ambiguous tie. Routed exactly as `xerj ask` routes: your project's dependencies, the signed catalogue's term sketches, and the exact symbol a definition question names (offline: reads the catalogue `xerj hub sync` cached and never fetches it; this build has no hosted search). Excluded-licence corpora are never listed.",
       "inputSchema": {

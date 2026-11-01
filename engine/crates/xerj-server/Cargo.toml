@@ -70,7 +70,7 @@ prost.workspace = true
 # No special build, no separate binary. Build with
 # `--no-default-features` for a slimmer binary without the neural backend
 # (the lexical + proxy backends still work).
-default = ["neural", "decide-local"]
+default = ["neural", "decide-local", "facts"]
 neural = ["xerj-engine/neural"]
 onnx-experimental = ["xerj-engine/onnx-experimental"]
 # Tier-2 local decide head (issue #1057), ON by default since rc.80: the
@@ -85,10 +85,10 @@ onnx-experimental = ["xerj-engine/onnx-experimental"]
 # XERJ_DECIDE_MODE/XERJ_DECIDE_MODEL_DIR); without it a node boots on the
 # history vote exactly as before. `--no-default-features` still drops it.
 decide-local = ["xerj-api/decide-local"]
-# SPIKE (local branch spike/facts-68m, never pushed): /_facts (XERJ-R). Off by default. Also reserves the `-facts`
+# /_facts (XERJ-R), on by default; without a model directory `_ask` answers 503 MODEL_UNAVAILABLE. Also reserves the `-facts`
 # suffix in namespace and brain names (API, autoindex, console) and serves the read-only MCP tool `xerj_facts_ask`.
 facts = ["xerj-api/facts", "xerj-console-api/facts", "xerj-mcp/facts"]
-# Test-only (local branch): crash points in the facts commit and recovery steps, armed by XERJ_FACTS_FAILPOINTS, for the
+# Test-only: crash points in the facts commit and recovery steps, armed by XERJ_FACTS_FAILPOINTS, for the
 # kill-and-restart tests. Off by default; never in a release build.
 facts-failpoints = ["facts", "xerj-api/facts-failpoints"]
 # Diagnostic-only profiling. It is excluded from all shipped feature sets:

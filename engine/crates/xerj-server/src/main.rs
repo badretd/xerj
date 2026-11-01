@@ -4555,7 +4555,7 @@ async fn async_main() -> Result<()> {
         }
     }
 
-    // 3e. Facts compiler preload (`XERJ_FACTS_PRELOAD`, off by default): start the model load now, in a background
+    // 3e. Facts compiler preload (`XERJ_FACTS_PRELOAD`, on when a model directory is set): start the model load now, in a background
     //     thread, so it overlaps with opening the data directory and the engine; the facts service created in step 9
     //     adopts this load instead of starting its own just before the listeners open.
     #[cfg(feature = "facts")]
