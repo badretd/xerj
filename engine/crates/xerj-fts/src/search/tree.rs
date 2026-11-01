@@ -82,18 +82,25 @@ use anyhow::Result;
 pub(crate) const MAX_LEAVES: usize = 512;
 
 /// Whether this process routes the supported query trees through the tree
-/// walk (`XERJ_FTS_TREE_WALK` = `1` / `true` / `on` / `yes`, read once).
-/// Off by default.
+/// walk: on, unless `XERJ_FTS_TREE_WALK` = `0` / `false` / `off` / `no` (read
+/// once). The walk returns the page and totals of the generic path
+/// (`tests/tree_walk_parity.rs`), so the switch only opts out of the speed-up.
 pub fn tree_walk_enabled() -> bool {
+    if let Some(on) = TREE_WALK_THREAD_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("XERJ_FTS_TREE_WALK").is_ok_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
+        xerj_common::resource::switch_setting(std::env::var("XERJ_FTS_TREE_WALK").ok().as_deref())
     })
+}
+
+thread_local! {
+    /// An override of [`tree_walk_enabled`] for this thread, for the engine's
+    /// parity tests: a searcher is built by the engine, past any builder.
+    #[doc(hidden)]
+    pub static TREE_WALK_THREAD_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The query tree compiled against one segment.

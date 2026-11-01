@@ -4584,8 +4584,8 @@ impl IndexStore {
         let segments_dir = self.data_dir.join("segments");
         let mut total = 0usize;
 
-        // Opt-in (`XERJ_VERSION_MAP_THREADS` > 1): the segment pass below on
-        // several threads (`rebuild_version_map_parallel`, the same `set`
+        // `XERJ_VERSION_MAP_THREADS` > 1 (the default on two or more threads'
+        // worth of cores): the segment pass below on several threads (`rebuild_version_map_parallel`, the same `set`
         // calls); the loop then has nothing left to do.
         let threads = version_map_rebuild_threads();
         let sequential: &[SegmentMeta] = if threads > 1 && snap.segments.len() > 1 {
@@ -5676,22 +5676,24 @@ type VersionIds = Vec<(u64, String)>;
 
 /// `XERJ_VERSION_MAP_THREADS`: how many threads rebuild an index's version
 /// map from its segments when it opens
-/// (`IndexStore::rebuild_version_map_parallel`). Unset, `0` or `1` = off: one
-/// segment after the other, as before. Read once (tests:
-/// `VERSION_MAP_THREADS_TEST`).
+/// (`IndexStore::rebuild_version_map_parallel`). Unset: half the cores, four
+/// at most (`xerj_common::resource::read_threads`). `0` or `1` = one segment
+/// after the other. Read once (tests: `VERSION_MAP_THREADS_TEST`, sequential
+/// unless set, so a test's instruments stay on its thread).
+#[cfg(not(test))]
 fn version_map_rebuild_threads() -> usize {
-    #[cfg(test)]
-    if let Some(n) = VERSION_MAP_THREADS_TEST.with(|c| c.get()) {
-        return n;
-    }
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *THREADS.get_or_init(|| {
-        std::env::var("XERJ_VERSION_MAP_THREADS")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 64)
+        xerj_common::resource::threads_setting(
+            std::env::var("XERJ_VERSION_MAP_THREADS").ok().as_deref(),
+            xerj_common::resource::read_threads(),
+        )
     })
+}
+
+#[cfg(test)]
+fn version_map_rebuild_threads() -> usize {
+    VERSION_MAP_THREADS_TEST.with(|c| c.get()).unwrap_or(1)
 }
 
 #[cfg(test)]
