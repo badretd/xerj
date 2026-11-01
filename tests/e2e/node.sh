@@ -17,4 +17,5 @@ step latency_w8_t4 $PY $T/e2e_bench.py $COMMON --ids $D/select_ids.txt --out $D/
 step latency_f32_t4 $PY $T/e2e_bench.py $COMMON --ids $D/select_ids.txt --out $D/bench --phase latency --precision f32 --cpus $L4 --threads 4
 step latency_w8_t1 $PY $T/e2e_bench.py $COMMON --ids $D/select_ids.txt --out $D/bench --phase latency --precision unset --cpus $L --threads 1
 [ -f "$D/counting.jsonl" ] && step counting $PY $T/e2e_counting.py --bin $D/bin/xerj --model $D/model --worlds $D/counting.jsonl --out $D/func --cpus $CPUS
+step defaults $PY $T/e2e_defaults.py $COMMON --sample $D/sample.json --out $D/func --cpus $CPUS
 log DONE; touch "$D/DONE"

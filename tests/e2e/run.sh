@@ -39,7 +39,7 @@ fi
 ssh "$RUN_HOST" "mkdir -p $RD/bin $RD/tests; ln -sfn \$HOME/$MODEL $RD/model; ln -sfn \$HOME/$WORLDS $RD/worlds"
 if [ -n "${BIN:-}" ]; then ssh "$RUN_HOST" "test -f $RD/bin/xerj" || scp -q "$BIN" "$RUN_HOST:$RD/bin/xerj"
 else ssh "$RUN_HOST" "test -f $RD/bin/xerj" || scp -q -3 "$BUILD_HOST:$BASE/target_e2e/release/xerj" "$RUN_HOST:$RD/bin/xerj"; fi
-scp -q "$HERE"/e2e_lib.py "$HERE"/e2e_functional.py "$HERE"/e2e_bench.py "$HERE"/e2e_counting.py "$HERE"/node.sh "$RUN_HOST:$RD/tests/"
+scp -q "$HERE"/e2e_lib.py "$HERE"/e2e_functional.py "$HERE"/e2e_bench.py "$HERE"/e2e_counting.py "$HERE"/e2e_defaults.py "$HERE"/node.sh "$RUN_HOST:$RD/tests/"
 scp -q "$MVP/runs/e2e1/s5/sample.json" "$RUN_HOST:$RD/sample.json"
 scp -q "$OUT/select_ids.txt" "$RUN_HOST:$RD/select_ids.txt"
 [ -n "${COUNTING_WORLDS:-}" ] && scp -q "$COUNTING_WORLDS" "$RUN_HOST:$RD/counting.jsonl"

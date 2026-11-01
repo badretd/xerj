@@ -56,8 +56,13 @@ class Server:
         self.logpath = data_dir.rstrip("/") + ".engine.log"
 
     def start(self, ready_timeout=1800):
-        env = dict(os.environ, XERJ_FACTS_MODEL_DIR=self.model, XERJ_FACTS_PRELOAD="1", XERJ_FACTS_THREADS=str(self.threads), **self.extra_env)
-        env.pop("XERJ_FACTS_PRECISION", None)
+        env = dict(os.environ, **self.extra_env)
+        for k in ("XERJ_FACTS_MODEL_DIR", "XERJ_FACTS_PRELOAD", "XERJ_FACTS_THREADS", "XERJ_FACTS_PRECISION"):
+            env.pop(k, None)
+        if self.model:
+            env["XERJ_FACTS_MODEL_DIR"] = self.model
+        if self.threads:
+            env.update(XERJ_FACTS_PRELOAD="1", XERJ_FACTS_THREADS=str(self.threads))
         if self.precision:
             env["XERJ_FACTS_PRECISION"] = self.precision
         log = open(self.logpath, "ab")
