@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Facts in the default build: `/_facts`, the `xerj_facts_ask` MCP tool, and
+  `_ask` with `decline_v2` as the default rule (`verify: served` remains).
+  Read `final_status` and `final_answer`: under `decline_v2` the plain `status`
+  and `answer` are the unchecked program's. Counting stays off (`COUNTING_OFF`).
+  Without a model directory `_ask` answers 503 `MODEL_UNAVAILABLE`.
+- `xerj-pagedir`, page-pointer directories with self-checking reads. With
+  `XERJ_AUTOINDEX_SOURCE_REF=1` and `XERJ_SOURCE_REF_DIR` set on client and
+  server, long JSONL fields stay in the original file; an edited file gives an
+  error, never wrong text. Off by default.
+
 - A second Claude plugin in the xerj marketplace, `xerj-knowledge`, for
   document search rather than code: a skill and `/xerj-knowledge:index` and
   `/xerj-knowledge:find` commands that search local folders, notes, PDFs,
@@ -99,7 +109,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the top 3 for 22; every rank, misses included, is in
   `benchmarks/skills-intent/results/`. Part of #2644.
 
+### Changed
+
+- Stored text columns are 64 KiB row blocks with a per-column trained 112 KiB
+  zstd dictionary (codec 8), level 3 on flush, 9 on merge, 19 on `_forcemerge`,
+  and a page of results reads only its rows. Older builds refuse such segments.
+  Opt out: `XERJ_STORED_ROW_BLOCKS=0`, `XERJ_STORED_BLOCK_DICT=0`,
+  `XERJ_STORED_ROW_SELECT=0`.
+- New segments write postings as ZPS4, with no per-posting position count. The
+  data-directory format goes to 4 at the first such flush and older builds
+  refuse the directory at open. Opt out: `XERJ_FTS_POST_CODEC=packed`.
+- BM25 search walks block-max trees, shares a live floor across segments and
+  opens segments in parallel by default; threads default to min(4, cores/2).
+  Each switch remains an opt-out with identical results.
+- Autoindex sends several bulks of one file at once, with a window that starts
+  at 2, grows while clean and honours `Retry-After`; progress moves inside one
+  large file.
+
 ### Fixed
+
+- `_update` and `_update_by_query` re-embed changed `semantic_text`, so a stale
+  vector no longer stays stored.
+- Fields scored by passage no longer build an HNSW graph nobody can read.
+- The autoindex semantic cap counts past the first 1,024 rows of a file, and a
+  sender parked on a full wire no longer hangs the run.
 
 - `weighted_avg` now executes field-based requests (`value` / `weight`, each
   with a `field` and optional numeric `missing`) instead of returning HTTP 200
