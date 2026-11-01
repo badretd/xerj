@@ -18,12 +18,14 @@ use crate::{
     analyzer::AnalyzerRegistry,
     bm25::{Bm25Scorer, CollectionStats, QueryExplanation, ScoreBreakdown},
     index::FtsIndexReader,
-    postings::PostingsReader,
 };
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+mod tree;
+pub use tree::tree_walk_enabled;
 
 /// Per-term phrase postings: `doc_id → (term_freq, positions)`.
 type TermPostingsMap = std::collections::HashMap<u32, (u32, Vec<u32>)>;
@@ -66,6 +68,14 @@ impl Ord for ScoredHit {
 }
 
 // ── Bounded top-N collector ─────────────────────────────────────────────────
+
+#[cfg(test)]
+thread_local! {
+    /// How many candidate documents `wand_should_bool`'s MaxScore tail
+    /// visited after the match count was satisfied.
+    pub(crate) static MAX_SCORE_CANDIDATES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Bounded min-by-quality top-N collector.
 ///
@@ -145,6 +155,262 @@ impl TopN {
     pub fn finish(self) -> (Vec<ScoredHit>, u64) {
         let total = self.total;
         (self.heap.into_sorted_vec(), total)
+    }
+}
+
+// ── Match-walk helpers (see `FtsSearcher::wand_should_bool`) ────────────────
+
+/// Relative margin on every score bound of the match walk: a bound computed
+/// in f64 from the f32 scorer constants exceeds the f32 score it bounds by
+/// far less than this (f32 rounding is ~1e-7 per operation), so a document is
+/// never pruned because of rounding.
+const BOUND_MARGIN: f64 = 1e-4;
+
+#[inline]
+fn inflate(bound: f64) -> f64 {
+    bound + bound.abs() * BOUND_MARGIN
+}
+
+/// `k1 * (1 - b + b * dl / avgdl)` for the length every norm byte decodes to,
+/// exactly as `Bm25Scorer::tf_norm` forms it (`avgdl` floored at 1).
+fn norm_c_table(bm25: &crate::bm25::Bm25Scorer) -> Box<[f64; 256]> {
+    let (k1, b, avg) = (
+        f64::from(bm25.k1),
+        f64::from(bm25.b),
+        f64::from(bm25.avg_dl.max(1.0)),
+    );
+    let mut t = Box::new([0.0f64; 256]);
+    for (byte, slot) in t.iter_mut().enumerate() {
+        let dl = f64::from(crate::index::FieldLengths::length_of_norm(byte as u8));
+        *slot = k1 * (1.0 - b + b * (dl / avg));
+    }
+    t
+}
+
+/// Upper bound of `score_term * boost` over every posting a set of
+/// competitive `(tf, norm)` pairs dominates (see `postings::BlockIndex`).
+#[inline]
+fn impact_bound(
+    pairs: &[crate::postings::Impact],
+    norm_c: &[f64; 256],
+    k1p1: f64,
+    idf_boost: f64,
+) -> f64 {
+    let mut best = 0.0f64;
+    for p in pairs {
+        let v = if p.tf == crate::postings::Impact::TF_SATURATED {
+            k1p1 // tf -> inf
+        } else {
+            let tf = f64::from(p.tf);
+            tf * k1p1 / (tf + norm_c[p.norm as usize])
+        };
+        if v > best {
+            best = v;
+        }
+    }
+    inflate(best * idf_boost)
+}
+
+/// One clause of the match walk: its cursor, scorer and score bounds.
+struct Clause<'a, 'b> {
+    /// position in `bool.should` (the f32 summation order)
+    ord: usize,
+    tq: &'b TermQuery,
+    bm25: crate::bm25::Bm25Scorer,
+    score_df: u64,
+    cur: crate::postings::BlockCursor<'a>,
+    lengths: Option<crate::index::FieldLengths<'a>>,
+    /// index of this clause's field in the walk's norm tables
+    table: usize,
+    /// `idf * clause boost`, f64
+    idf_boost: f64,
+    /// `k1 + 1` as the scorer forms it (f32), f64
+    k1p1: f64,
+    /// upper bound of the clause's contribution over its whole list
+    ub: f64,
+    /// one-entry cache: block `bb_blk` has bound `bb_val`
+    bb_blk: usize,
+    bb_val: f64,
+    /// shallow block pointer of `bound_at` (only moves forward)
+    sh: usize,
+    /// the exact contribution at the candidate being evaluated
+    contrib: f32,
+    /// this clause's bound at the candidate being evaluated
+    at_d: f64,
+}
+
+impl Clause<'_, '_> {
+    #[inline]
+    fn block_bound(&mut self, b: usize, norm_c: &[f64; 256]) -> f64 {
+        if b == self.bb_blk {
+            return self.bb_val;
+        }
+        let Some(t) = self.cur.blocks().copied() else {
+            return self.ub;
+        };
+        let v = impact_bound(t.block_impacts(b), norm_c, self.k1p1, self.idf_boost);
+        self.bb_blk = b;
+        self.bb_val = v;
+        v
+    }
+
+    /// Bound of the block holding the cursor's current document.
+    #[inline]
+    fn current_block_bound(&mut self, norm_c: &[f64; 256]) -> f64 {
+        if self.cur.blocks().is_some() {
+            self.block_bound(self.cur.block(), norm_c)
+        } else {
+            self.ub
+        }
+    }
+
+    /// Last doc id of the decoded block.
+    #[inline]
+    fn current_block_last_doc(&self) -> u32 {
+        self.cur
+            .block_postings()
+            .0
+            .last()
+            .copied()
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Upper bound of this clause's contribution to document `d`, without
+    /// decoding: 0 when the clause cannot match `d`.
+    #[inline]
+    fn bound_at(&mut self, d: u32, norm_c: &[f64; 256]) -> f64 {
+        let doc = self.cur.doc;
+        if doc == u32::MAX || doc > d {
+            return 0.0;
+        }
+        if doc == d {
+            return self.current_block_bound(norm_c);
+        }
+        let Some(t) = self.cur.blocks().copied() else {
+            return self.ub;
+        };
+        let b = crate::postings::gallop(t.last_doc, self.sh.max(self.cur.block()), d);
+        self.sh = b;
+        if b >= t.len() {
+            return 0.0;
+        }
+        self.block_bound(b, norm_c)
+    }
+
+    #[inline]
+    fn doc_len(&self, d: u32) -> u32 {
+        self.lengths.and_then(|l| l.get(d)).unwrap_or(1) as u32
+    }
+}
+
+/// Move every essential clause sitting on `d` to its next posting.
+#[inline]
+fn advance_matching(clauses: &mut [Clause<'_, '_>], essential: &[bool], d: u32) {
+    for (c, &e) in clauses.iter_mut().zip(essential) {
+        if e && c.cur.doc == d {
+            c.cur.next();
+        }
+    }
+}
+
+/// Work of one match walk, published into [`WalkStats`] at the end.
+#[derive(Default)]
+struct WalkCounters {
+    postings_decoded: u64,
+    postings_counted: u64,
+    blocks_decoded: u64,
+    candidates: u64,
+    scored: u64,
+    windows_skipped: u64,
+    tree_pruned: u64,
+}
+
+impl WalkCounters {
+    fn publish(&self, stats: &WalkStats) {
+        use std::sync::atomic::Ordering::Relaxed;
+        stats.searches.fetch_add(1, Relaxed);
+        stats
+            .postings_decoded
+            .fetch_add(self.postings_decoded, Relaxed);
+        stats
+            .postings_counted
+            .fetch_add(self.postings_counted, Relaxed);
+        stats.blocks_decoded.fetch_add(self.blocks_decoded, Relaxed);
+        stats.candidates.fetch_add(self.candidates, Relaxed);
+        stats.scored.fetch_add(self.scored, Relaxed);
+        stats
+            .windows_skipped
+            .fetch_add(self.windows_skipped, Relaxed);
+        stats.tree_pruned.fetch_add(self.tree_pruned, Relaxed);
+    }
+}
+
+/// Work counters of the `match`-shaped disjunction walk, summed over every
+/// search of the searchers they are attached to
+/// ([`FtsSearcher::with_walk_stats`]); for benchmarks and diagnostics.
+#[derive(Debug, Default)]
+pub struct WalkStats {
+    /// walks that published into these counters
+    pub searches: std::sync::atomic::AtomicU64,
+    /// postings decoded by the page pass (whole 128-posting blocks)
+    pub postings_decoded: std::sync::atomic::AtomicU64,
+    /// postings decoded by the counting pass (exact totals only)
+    pub postings_counted: std::sync::atomic::AtomicU64,
+    /// blocks decoded by the page pass
+    pub blocks_decoded: std::sync::atomic::AtomicU64,
+    /// documents the page pass considered once the page was full
+    pub candidates: std::sync::atomic::AtomicU64,
+    /// documents scored exactly (pushed to the page)
+    pub scored: std::sync::atomic::AtomicU64,
+    /// windows skipped whole on block bounds
+    pub windows_skipped: std::sync::atomic::AtomicU64,
+    /// candidates the tree walk dropped on its constraint-aware bound
+    /// (a `must` child or the minimum of `should` children cannot be met)
+    pub tree_pruned: std::sync::atomic::AtomicU64,
+}
+
+/// A score floor the concurrent walks of one search's segments share while
+/// they run ([`FtsSearcher::with_shared_floor`]; the engine's opt-in
+/// `XERJ_FTS_LIVE_FLOOR`). Every walk prunes against it as against the
+/// caller's floor of [`FtsSearcher::search_bounded_counting_floor`], and a
+/// walk whose page is full raises it to that page's worst score.
+///
+/// The caller vouches for it: the walks sharing one floor must have the same
+/// `cap`, and their documents must be distinct live candidates for the one
+/// merged page of `cap` hits the caller builds from their pages (no deleted
+/// or overwritten documents). Then every value it ever holds is the worst of
+/// `cap` such documents, so it never exceeds the merged page's worst score,
+/// and pruning below it cannot cost that page a document (ties at the floor
+/// are kept). Starts unset; only positive finite scores raise it.
+#[derive(Debug, Default)]
+pub struct SharedFloor(std::sync::atomic::AtomicU32);
+
+impl SharedFloor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The floor, once a positive score raised it.
+    #[inline]
+    pub fn get(&self) -> Option<f32> {
+        let bits = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        (bits != 0).then(|| f32::from_bits(bits))
+    }
+
+    /// Raise the floor to `score` if that is higher. Positive finite `f32`s
+    /// order like their bit patterns, so the maximum of the bits is the
+    /// maximum of the scores; anything else is ignored.
+    #[inline]
+    pub fn raise(&self, score: f32) {
+        if !(score.is_finite() && score > 0.0) {
+            return;
+        }
+        let bits = score.to_bits();
+        // read first: most offers are not higher, and a read keeps the
+        // cache line shared between the walks
+        if self.0.load(std::sync::atomic::Ordering::Relaxed) < bits {
+            self.0.fetch_max(bits, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -543,6 +809,15 @@ pub struct FtsSearcher {
     /// uses when the index has at most one live scoring arm (where the union
     /// is the identity).
     collection: Option<Arc<CollectionStats>>,
+    /// Work counters of the match walk (`None` = not collected).
+    walk_stats: Option<Arc<WalkStats>>,
+    /// Route the query trees the tree walk takes (the `tree` module: nested
+    /// `bool`s of terms and phrases, e.g. `multi_match` over several fields)
+    /// through it. Off unless `XERJ_FTS_TREE_WALK` is set.
+    tree_walk_on: bool,
+    /// The floor this searcher's page passes share with the walks of the
+    /// other segments of the same search (`None` = none, the default).
+    shared_floor: Option<Arc<SharedFloor>>,
 }
 
 impl FtsSearcher {
@@ -553,7 +828,24 @@ impl FtsSearcher {
             deadline: None,
             deadline_tripped: std::sync::atomic::AtomicBool::new(false),
             collection: None,
+            walk_stats: None,
+            tree_walk_on: tree::tree_walk_enabled(),
+            shared_floor: None,
         }
+    }
+
+    /// Builder: route the supported query trees through the tree walk (or
+    /// not), whatever `XERJ_FTS_TREE_WALK` says.
+    pub fn with_tree_walk(mut self, on: bool) -> Self {
+        self.tree_walk_on = on;
+        self
+    }
+
+    /// Builder: add the work of every `match`-shaped walk of this searcher
+    /// to `stats` (benchmarks, diagnostics).
+    pub fn with_walk_stats(mut self, stats: Option<Arc<WalkStats>>) -> Self {
+        self.walk_stats = stats;
+        self
     }
 
     /// Builder: arm the cooperative deadline. `None` disables (default).
@@ -567,6 +859,42 @@ impl FtsSearcher {
     pub fn with_collection_stats(mut self, stats: Option<Arc<CollectionStats>>) -> Self {
         self.collection = stats;
         self
+    }
+
+    /// Builder: share `floor` with the walks of the search's other segments
+    /// (see [`SharedFloor`] for what the caller vouches for). The `match`-
+    /// shaped and tree walks prune against it while they run and raise it to
+    /// their full page's worst score; every other path ignores it. `None`
+    /// (default) = no shared floor.
+    pub fn with_shared_floor(mut self, floor: Option<Arc<SharedFloor>>) -> Self {
+        self.shared_floor = floor;
+        self
+    }
+
+    /// The floor a page pass prunes against now: the caller's `floor` or the
+    /// shared one, whichever is higher.
+    #[inline]
+    fn floor_now(&self, floor: Option<f32>) -> Option<f32> {
+        match (
+            floor,
+            self.shared_floor.as_deref().and_then(SharedFloor::get),
+        ) {
+            (Some(own), Some(shared)) => Some(own.max(shared)),
+            (own, shared) => own.or(shared),
+        }
+    }
+
+    /// Offer a full page's worst score to the shared floor (a no-op without
+    /// one, while the page is not full, or when it has not risen since the
+    /// last offer).
+    #[inline]
+    fn share_floor(&self, top: &TopN, offered: &mut f32) {
+        if let (Some(shared), Some(worst)) = (self.shared_floor.as_deref(), top.worst()) {
+            if worst.score > *offered {
+                *offered = worst.score;
+                shared.raise(worst.score);
+            }
+        }
     }
 
     /// True when any expansion loop stopped early because the deadline
@@ -619,14 +947,72 @@ impl FtsSearcher {
         cap: usize,
         explain: bool,
     ) -> Result<(Vec<ScoredHit>, u64)> {
+        self.search_bounded_counting(query, cap, explain, u64::MAX)
+    }
+
+    /// [`Self::search_bounded`] for a caller that needs the match total only
+    /// up to `count_limit` — `hits.total` under `track_total_hits: N` (the
+    /// ES default is 10,000) is exact below `N` and `gte` above it.
+    ///
+    /// The top-`cap` hits are the same as `search_bounded`'s, scores bit for
+    /// bit. The returned total is exact when it is below `count_limit`;
+    /// otherwise it is at least `count_limit` (a lower bound): once that many
+    /// matches are counted, a `match`-shaped disjunction stops counting and
+    /// visits only documents that can still enter the page (see
+    /// `wand_should_bool`). Every other query shape counts exactly.
+    pub fn search_bounded_counting(
+        &self,
+        query: &Query,
+        cap: usize,
+        explain: bool,
+        count_limit: u64,
+    ) -> Result<(Vec<ScoredHit>, u64)> {
+        // WAND fast path for the shape a `match`/`multi_match` query becomes
+        // after planning (`bool{should: [Term..]}`, nothing else).  Only when
+        // nothing downstream needs the generic walk: `explain` needs every
+        // retained hit's breakdown, and `cap == usize::MAX` callers want the
+        // complete match set.
+        self.search_bounded_counting_floor(query, cap, explain, count_limit, None)
+    }
+
+    /// [`Self::search_bounded_counting`] for a caller that merges this
+    /// segment's page with the pages of other segments and already holds
+    /// `cap` hits whose worst score is `floor`.
+    ///
+    /// A document of this segment scoring below `floor` cannot enter that
+    /// merged page, so the `match`-shaped walk starts pruning at `floor`
+    /// instead of rebuilding its bar from an empty page: the returned hits
+    /// are exactly this segment's top `cap` among its documents scoring at
+    /// least `floor` (scores bit for bit, ties at `floor` included), and the
+    /// total keeps the [`Self::search_bounded_counting`] contract. Merging
+    /// those hits into the caller's page by (score desc, then the caller's
+    /// tie order) gives the same page as merging the unfloored ones.
+    /// `None`, a non-finite floor, and every other query shape behave
+    /// exactly like [`Self::search_bounded_counting`].
+    pub fn search_bounded_counting_floor(
+        &self,
+        query: &Query,
+        cap: usize,
+        explain: bool,
+        count_limit: u64,
+        floor: Option<f32>,
+    ) -> Result<(Vec<ScoredHit>, u64)> {
         // WAND fast path for the shape a `match`/`multi_match` query becomes
         // after planning (`bool{should: [Term..]}`, nothing else).  Only when
         // nothing downstream needs the generic walk: `explain` needs every
         // retained hit's breakdown, and `cap == usize::MAX` callers want the
         // complete match set.
         if !explain && cap != usize::MAX {
-            if let Some(res) = self.wand_should_bool(query, cap)? {
+            let floor = floor.filter(|f| f.is_finite());
+            if let Some(res) = self.wand_should_bool(query, cap, count_limit, floor)? {
                 return Ok(res);
+            }
+            // Opt-in: nested trees (several fields, minimum should match,
+            // `operator: and`, phrase legs) under the same bounds.
+            if self.tree_walk_on {
+                if let Some(res) = self.tree_walk(query, cap, count_limit, floor)? {
+                    return Ok(res);
+                }
             }
         }
         // The no-op observer monomorphises away, so this stays byte-identical to
@@ -634,54 +1020,164 @@ impl FtsSearcher {
         self.search_bounded_observed(query, cap, explain, |_| {})
     }
 
-    /// Doc-at-a-time top-`cap` evaluation for the exact shape a `match` /
-    /// `multi_match` query becomes after planning: a `bool` with ONLY
-    /// `should` clauses, every clause a plain [`TermQuery`], effective
-    /// `min_should_match == 1`.  Returns `None` for any other shape so the
-    /// caller falls back to the generic path unchanged.
+    /// Every document of this segment that `query` matches, as a bitset over
+    /// the segment's doc ids (bit `d % 64` of word `d / 64`; words past the
+    /// last match may be absent) — the documents the hits of
+    /// [`Self::search_bounded`]`(query, usize::MAX, false)` hold.
+    ///
+    /// For the shape a `match` / `multi_match` projects to (a single term, or
+    /// a `bool` of `should` term clauses, one required) the
+    /// distinct lists' doc ids are OR-ed without decoding frequencies or
+    /// scoring anything; every other shape runs the generic path and its
+    /// hits are collected.
+    ///
+    /// `Ok(None)` when the deadline cut the evaluation short: the set would be
+    /// a subset, and the caller must not take it for the match set.
+    pub fn matching_docs(&self, query: &Query) -> Result<Option<Vec<u64>>> {
+        let terms: Option<Vec<&TermQuery>> = match query {
+            Query::Term(tq) => Some(vec![tq]),
+            Query::Bool(bq)
+                if bq.must.is_empty()
+                    && bq.filter.is_empty()
+                    && bq.must_not.is_empty()
+                    && !bq.should.is_empty()
+                    && bq.min_should_match.unwrap_or(1) == 1 =>
+            {
+                bq.should
+                    .iter()
+                    .map(|q| match q {
+                        Query::Term(tq) => Some(tq),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            _ => None,
+        };
+        let mut bits: Vec<u64> = Vec::new();
+        let set = |bits: &mut Vec<u64>, d: u32| {
+            let w = (d / 64) as usize;
+            if bits.len() <= w {
+                bits.resize(w + 1, 0);
+            }
+            bits[w] |= 1u64 << (d % 64);
+        };
+        let Some(terms) = terms else {
+            if self.tree_walk_on {
+                if let Some(bits) = self.tree_matching_docs(query)? {
+                    return Ok(bits);
+                }
+            }
+            let (hits, _) = self.search_bounded(query, usize::MAX, false)?;
+            if self.deadline_tripped() {
+                return Ok(None);
+            }
+            for h in &hits {
+                set(&mut bits, h.doc_id);
+            }
+            return Ok(Some(bits));
+        };
+        let mut seen: Vec<(&str, &str)> = Vec::with_capacity(terms.len());
+        let mut steps = 0u32;
+        for tq in terms {
+            let key = (tq.field.as_str(), tq.term.as_str());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let Some(tp) = self.reader.lookup_term(&tq.field, &tq.term) else {
+                continue;
+            };
+            let Some(mut cur) = self.reader.block_cursor_with(&tq.field, &tp, false) else {
+                continue;
+            };
+            while cur.doc != u32::MAX {
+                let (docs, _) = cur.block_postings();
+                let last = *docs.last().unwrap_or(&0);
+                for &d in docs {
+                    set(&mut bits, d);
+                }
+                cur.advance(last.saturating_add(1));
+                steps += 1;
+                if steps & 4095 == 0 && self.deadline_hit() {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(bits))
+    }
+
+    /// Top-`cap` evaluation for the exact shape a `match` / `multi_match`
+    /// query becomes after planning: a `bool` with ONLY `should` clauses,
+    /// every clause a plain [`TermQuery`], effective `min_should_match == 1`.
+    /// Returns `None` for any other shape so the caller falls back to the
+    /// generic path unchanged.
     ///
     /// Why this exists: the generic path materialises a `Vec<ScoredHit>` per
     /// clause, folds them through a `HashMap<u32, u32>` match counter plus a
     /// `HashMap<u32, f32>` score map, collects the union, and sorts it — fine
-    /// for rare terms, quadratic-feeling for stopwords.  A three-stopword
-    /// `match` over a 120k-doc index (~180k postings, ~100k distinct docs)
-    /// spent ~28 ms there, almost all of it per-posting work that could not
-    /// change the answer: BM25 evaluation + a `field_length` lookup for docs
-    /// that never had a chance of entering a size-10 page.
+    /// for rare terms, quadratic-feeling for stopwords.
     ///
-    /// Design: WAND-style upper-bound pruning (Broder et al., *Faster Top-k
-    /// Document Retrieval Using Block-Max Indexes*; the same dynamic-pruning
-    /// idea as tantivy's `block_wand`, MIT — quickwit-oss/tantivy
-    /// `src/query/boolean_query/block_wand_union.rs`, whose block-max half
-    /// needs impact-ordered postings and skip tables this postings format
-    /// does not carry).  The walk still visits EVERY matching doc — postings
-    /// have no skip lists, and the caller needs an EXACT total — but a doc
-    /// is scored only when the sum of its matched terms' score upper bounds
-    /// (`idf × (k1+1) × boost`, the supremum of `score_term` over any tf/dl)
-    /// can still enter the heap.  For stopword-only docs that bound sum sits
-    //    below the 10th-best score almost immediately, so the entire scoring
-    ///   cost for them disappears; what remains per skipped doc is one
-    ///   cursor compare and one `next()`.
+    /// Two independent passes:
+    ///
+    /// 1. **Total.** The union of the clauses' lists holds at least as many
+    ///    documents as its longest list, so when that list alone reaches
+    ///    `count_limit` the answer is `count_limit` (a lower bound, which is
+    ///    all `track_total_hits: N` asks for past N) without decoding
+    ///    anything.  Otherwise — `track_total_hits: true` (`u64::MAX`) or a
+    ///    union that may stay below the limit — every distinct list's doc ids
+    ///    are OR-ed into a bitset and counted exactly.
+    /// 2. **Page.** Block-max MaxScore over [`crate::postings::BlockCursor`]s
+    ///    (Turtle & Flood 1995; Ding & Suel 2011; the shape of Lucene's
+    ///    `MaxScoreBulkScorer`, Apache-2.0, re-derived, no code taken).  Each
+    ///    clause has an upper bound of its contribution — over the whole list
+    ///    (`ub`) and per 128-posting block — from the competitive
+    ///    `(tf, norm)` pairs of the segment's block index
+    ///    (`postings::BlockIndex`), or, for a segment written before it, the
+    ///    exact maximum of a one-block list or the supremum
+    ///    `idf * (k1 + 1) * boost`.  While the page is not full every document
+    ///    of every list is scored.  Once it is, with `theta` its worst score:
+    ///    * clauses whose bounds, smallest first, sum below `theta` are
+    ///      non-essential: a document matching only those cannot enter, so
+    ///      candidates come from the essential clauses only;
+    ///    * a window up to the first end of an essential clause's current
+    ///      block is skipped whole when the essential block bounds plus the
+    ///      non-essential term bounds stay below `theta` (blocks are jumped
+    ///      over through the index without decoding);
+    ///    * a candidate whose essential block bounds plus the non-essential
+    ///      clauses' block bounds at that document stay below `theta` is
+    ///      skipped without touching the non-essential lists; otherwise the
+    ///      non-essential clauses are probed, largest bound first, stopping
+    ///      as soon as the remaining bounds cannot lift it to `theta`.
     ///
     /// Output identity with the generic path, by construction:
-    /// - **Scores are bit-identical**: the matched terms are summed in
-    ///   CLAUSE order — the same order `execute_bool`'s `score_map`
-    ///   accumulates in — then multiplied by `bq.boost`, so every f32
-    ///   addition happens in the same sequence.
-    /// - **Ordering is identical**: hits pass through the same [`TopN`] /
-    ///   [`ScoredHit`] `Ord`.  A doc is skipped only when its upper bound is
-    ///   STRICTLY below the worst retained score, so a tie-score doc with a
-    ///   smaller `doc_id` (which `Ord` ranks better and `TopN` would admit)
-    ///   is never pruned.
-    /// - **The total is identical**: every matching doc is visited and
-    ///   counted, `[TopN::total]` or not.
+    /// - **Scores are bit-identical**: each matched clause contributes
+    ///   `score_term(df, tf, dl) * boost` (f32), summed in CLAUSE order — the
+    ///   order `execute_bool`'s `score_map` accumulates in — then multiplied
+    ///   by `bq.boost`.
+    /// - **The page is identical**: hits pass through the same [`TopN`] /
+    ///   [`ScoredHit`] `Ord`.  A document is skipped only when an upper bound
+    ///   of its f32 score is STRICTLY below `theta` (bounds are computed in
+    ///   f64 and inflated by a relative 1e-4, far above f32 rounding), so it
+    ///   could not enter the page; a tie at `theta` is always scored, because
+    ///   `TopN` admits an equal score with a smaller doc id.  `theta` only
+    ///   grows, so a document below it at any point is below the final page.
+    /// - **The total** is exact below `count_limit` and a lower bound of at
+    ///   least `count_limit` (never above the exact total) otherwise.
     ///
-    /// Deadline: the walk polls every 4 096 docs; stopping early yields a
-    /// subset of the true hits and an undercount — the same partial-implies-
-    /// narrower contract `execute_bool`'s `run_clauses` already upholds for
-    /// abandoned `should` clauses, surfaced as `timed_out: true` by
-    /// [`Self::deadline_tripped`].
-    fn wand_should_bool(&self, query: &Query, cap: usize) -> Result<Option<(Vec<ScoredHit>, u64)>> {
+    /// Negative or non-finite boosts turn a supremum into an infimum: then
+    /// nothing is pruned and every document is scored.
+    ///
+    /// Deadline: both passes poll every 4 096 steps; stopping early yields a
+    /// subset of the true hits and an undercount — the partial-implies-
+    /// narrower contract `execute_bool`'s `run_clauses` upholds — surfaced
+    /// as `timed_out: true` by [`Self::deadline_tripped`].
+    fn wand_should_bool(
+        &self,
+        query: &Query,
+        cap: usize,
+        count_limit: u64,
+        floor: Option<f32>,
+    ) -> Result<Option<(Vec<ScoredHit>, u64)>> {
         let Query::Bool(bq) = query else {
             return Ok(None);
         };
@@ -703,34 +1199,15 @@ impl FtsSearcher {
             return Ok(None);
         }
 
-        // One cursor per clause, mirroring `scan_term`'s term-lookup and
-        // reader construction (positions decoded per the field's real
-        // layout and simply never read — the format is positions-dependent,
-        // so a docs-only reader would misparse the stream).
-        struct WandTerm<'a, 'b> {
-            /// Clause index — the f32 summation order (see above) and the
-            /// cursor-order tiebreak.
-            ord: usize,
-            tq: &'b TermQuery,
-            bm25: crate::bm25::Bm25Scorer,
-            /// The `doc_freq` the generic path would score with
-            /// (`scoring_df`, i.e. index-wide when collection stats are on).
-            score_df: u64,
-            reader: PostingsReader<'a>,
-            doc: u32,
-            tf: u32,
-            /// Supremum of this term's contribution over any (tf, dl):
-            /// `idf × (k1+1) × boost`.  `tf_norm < k1+1` always, so this
-            /// never underestimates `score_term`.
-            ubound: f32,
-        }
-        let mut scorers: Vec<WandTerm> = Vec::with_capacity(bq.should.len());
+        let mut walk = WalkCounters::default();
+        let mut clauses: Vec<Clause<'_, '_>> = Vec::with_capacity(bq.should.len());
+        // per-field `k1 * (1 - b + b * dl(norm) / avgdl)` for every norm byte
+        let mut norm_tables: Vec<(&str, Box<[f64; 256]>)> = Vec::new();
         for (ord, q) in bq.should.iter().enumerate() {
             // Cooperative deadline on the clause fan-out axis, mirroring
             // `run_clauses` (poll every 64 clauses): a projected disjunction
             // can carry tens of thousands of clauses, and dropping a should
-            // clause only narrows the answer — the partial-implies-narrower
-            // contract `execute_bool` already upholds.
+            // clause only narrows the answer.
             if ord & 63 == 0 && self.deadline_hit() {
                 break;
             }
@@ -743,118 +1220,347 @@ impl FtsSearcher {
                 // empty per-clause `Vec`.
                 continue;
             };
-            // The factory reads the field's real positions layout and the
-            // envelope's block codec — a docs-only reader must synthesise
-            // tf=1 rather than misparse a positions-bearing stream, exactly
-            // like `scan_term`; the decoded positions are simply never read.
-            let Some(mut reader) = self.reader.postings_reader(&tq.field, &tp) else {
+            // Positions are never read: the cursor jumps over them through
+            // the block index, or steps over them in segments without one.
+            let Some(cur) = self.reader.block_cursor(&tq.field, &tp) else {
                 continue;
             };
-            let Some(first) = reader.next() else { continue };
+            if cur.doc == u32::MAX {
+                continue;
+            }
             let bm25 = self.make_scorer(&tq.field);
             let score_df = self.scoring_df(&tq.field, &tq.term, tp.doc_frequency as u64);
-            let ubound = bm25.idf(score_df) * (bm25.k1 + 1.0) * tq.boost;
-            scorers.push(WandTerm {
+            let lengths = self.reader.field_lengths(&tq.field);
+            let table = match norm_tables
+                .iter()
+                .position(|(f, _)| *f == tq.field.as_str())
+            {
+                Some(i) => i,
+                None => {
+                    norm_tables.push((tq.field.as_str(), norm_c_table(&bm25)));
+                    norm_tables.len() - 1
+                }
+            };
+            let idf_boost = f64::from(bm25.idf(score_df)) * f64::from(tq.boost);
+            let k1p1 = f64::from(bm25.k1 + 1.0);
+            let ub = if let Some(blocks) = cur.blocks() {
+                impact_bound(blocks.term_impacts, &norm_tables[table].1, k1p1, idf_boost)
+            } else if cur.num_blocks() == 1 {
+                // The whole list is decoded already: its exact maximum.
+                let (docs, tfs) = cur.block_postings();
+                let mut best = 0.0f32;
+                for (&d, &tf) in docs.iter().zip(tfs) {
+                    let dl = lengths.and_then(|l| l.get(d)).unwrap_or(1) as u32;
+                    best = best.max(bm25.score_term(score_df, tf, dl) * tq.boost);
+                }
+                inflate(f64::from(best))
+            } else {
+                // Segment without a block index: the supremum over any (tf, dl).
+                inflate(f64::from(bm25.idf(score_df) * (bm25.k1 + 1.0) * tq.boost))
+            };
+            clauses.push(Clause {
                 ord,
                 tq,
                 bm25,
                 score_df,
-                reader,
-                doc: first.doc_id,
-                tf: first.term_freq,
-                ubound,
+                cur,
+                lengths,
+                table,
+                idf_boost,
+                k1p1,
+                ub,
+                bb_blk: usize::MAX,
+                bb_val: 0.0,
+                sh: 0,
+                contrib: 0.0,
+                at_d: 0.0,
             });
         }
-        // Cursor order: (doc, ord).  Deterministic, and keeps the scorers
-        // sitting on the same doc contiguous.
-        scorers.sort_by_key(|s| (s.doc, s.ord));
-        if scorers.is_empty() {
+        if clauses.is_empty() {
             return Ok(Some((Vec::new(), 0)));
         }
 
+        // ── 1. total ────────────────────────────────────────────────────
+        let longest = clauses
+            .iter()
+            .map(|c| u64::from(c.cur.doc_frequency()))
+            .max()
+            .unwrap_or(0);
+        let total = if longest >= count_limit {
+            count_limit
+        } else {
+            self.union_count(&clauses, &mut walk)
+        };
+
+        // ── 2. page ─────────────────────────────────────────────────────
         let mut top = TopN::new(cap);
-        let mut total: u64 = 0;
-        let mut since_poll: u32 = 0;
-        loop {
-            let d = scorers[0].doc;
-            let k = scorers.iter().take_while(|s| s.doc == d).count();
+        if cap > 0 {
+            let pruning = bq.boost.is_finite()
+                && bq.boost >= 0.0
+                && clauses.iter().all(|c| c.ub.is_finite() && c.ub >= 0.0);
+            self.block_max_walk(
+                &mut clauses,
+                &norm_tables,
+                bq.boost,
+                pruning,
+                floor,
+                &mut top,
+                &mut walk,
+            );
+        }
+        for c in &clauses {
+            walk.postings_decoded += c.cur.postings_decoded;
+            walk.blocks_decoded += c.cur.blocks_decoded;
+        }
+        if let Some(stats) = &self.walk_stats {
+            walk.publish(stats);
+        }
+        let (hits, _) = top.finish();
+        Ok(Some((hits, total)))
+    }
 
-            // Skip-or-score.  While the heap is below `cap` there is no bar
-            // to clear (and `cap == 0` retains nothing, so never score).
-            // Once full, prune only STRICTLY below the worst retained score:
-            // at equality the candidate could tie the worst score and win
-            // the `doc_id` tiebreak, which `TopN` would admit — so equality
-            // must still be scored.
-            let score_it = match top.worst() {
-                None => cap > 0,
-                Some(worst) => {
-                    let bound: f32 = scorers[..k].iter().map(|s| s.ubound).sum();
-                    bound >= worst.score
-                }
+    /// Exact size of the union of the clauses' lists (each distinct
+    /// `(field, term)` list once), through a bitset over the segment's doc
+    /// ids.  Polls the deadline; a trip yields an undercount.
+    fn union_count(&self, clauses: &[Clause<'_, '_>], walk: &mut WalkCounters) -> u64 {
+        let mut seen: Vec<(&str, &str)> = Vec::with_capacity(clauses.len());
+        let mut lists: Vec<&Clause<'_, '_>> = Vec::with_capacity(clauses.len());
+        for c in clauses {
+            let key = (c.tq.field.as_str(), c.tq.term.as_str());
+            if !seen.contains(&key) {
+                seen.push(key);
+                lists.push(c);
+            }
+        }
+        if let [only] = lists.as_slice() {
+            return u64::from(only.cur.doc_frequency());
+        }
+        let mut bits: Vec<u64> = Vec::new();
+        let mut steps = 0u32;
+        for c in lists {
+            let Some(tp) = self.reader.lookup_term(&c.tq.field, &c.tq.term) else {
+                continue;
             };
-            if score_it {
-                // Sum the matched terms in CLAUSE order (bit-identical to
-                // `execute_bool`'s `score_map` accumulation), then apply the
-                // bool boost exactly where the generic path applies it.
-                // `scorers[..k]` is reordered by `ord` IN PLACE — ords are
-                // unique, so the unstable sort is deterministic, and no
-                // per-doc buffer is allocated (a heap alloc per scored doc
-                // was measurable at 120k-doc disjunctions).
-                scorers[..k].sort_unstable_by_key(|s| s.ord);
-                let first_field = scorers[0].tq.field.as_str();
-                let first_len = self.reader.field_length(first_field, d).unwrap_or(1) as u32;
-                let mut sum = 0.0f32;
-                for s in &scorers[..k] {
-                    // Clauses usually share one field (`match`) — look the
-                    // length up once; only multi-field queries pay per field.
-                    let doc_len = if s.tq.field == first_field {
-                        first_len
-                    } else {
-                        self.reader.field_length(&s.tq.field, d).unwrap_or(1) as u32
-                    };
-                    sum += s.bm25.score_term(s.score_df, s.tf, doc_len) * s.tq.boost;
+            let Some(mut cur) = self.reader.block_cursor_with(&c.tq.field, &tp, false) else {
+                continue;
+            };
+            while cur.doc != u32::MAX {
+                let (docs, _) = cur.block_postings();
+                let last = *docs.last().unwrap_or(&0) as usize;
+                if bits.len() <= last / 64 {
+                    bits.resize(last / 64 + 1, 0);
                 }
-                top.push(ScoredHit {
-                    doc_id: d,
-                    score: sum * bq.boost,
-                    explanation: None,
-                });
-            }
-
-            total += 1;
-
-            // Advance every scorer sitting on `d` — exactly `scorers[..k]`
-            // (the sort invariant makes the at-d cursors a prefix).
-            // Exhausted cursors are marked `u32::MAX`, which sorts last, and
-            // pop off after the re-sort.  `sort_unstable` never allocates the
-            // scratch buffer a stable sort spills to on >20-element slices —
-            // this re-sort runs once per DOC, so that alloc was per-doc too.
-            for s in scorers.iter_mut().take(k) {
-                match s.reader.next() {
-                    Some(next) => {
-                        s.doc = next.doc_id;
-                        s.tf = next.term_freq;
-                    }
-                    None => s.doc = u32::MAX,
+                for &d in docs {
+                    bits[(d / 64) as usize] |= 1u64 << (d % 64);
+                }
+                walk.postings_counted += docs.len() as u64;
+                // jump to the next block
+                cur.advance(last as u32 + 1);
+                steps += 1;
+                if steps & 4095 == 0 && self.deadline_hit() {
+                    return bits.iter().map(|w| u64::from(w.count_ones())).sum();
                 }
             }
-            scorers.sort_unstable_by_key(|s| (s.doc, s.ord));
-            while scorers.last().is_some_and(|s| s.doc == u32::MAX) {
-                scorers.pop();
-            }
-            if scorers.is_empty() {
-                break;
-            }
+        }
+        bits.iter().map(|w| u64::from(w.count_ones())).sum()
+    }
 
-            // Cooperative deadline, polled like the expansion loops: partial
-            // = subset of hits + undercount, latched for `timed_out: true`.
+    /// The page pass of [`Self::wand_should_bool`] (block-max MaxScore, see
+    /// there).  Every clause cursor starts on its first posting.
+    #[allow(clippy::too_many_arguments)]
+    fn block_max_walk(
+        &self,
+        clauses: &mut [Clause<'_, '_>],
+        norm_tables: &[(&str, Box<[f64; 256]>)],
+        bool_boost: f32,
+        pruning: bool,
+        floor: Option<f32>,
+        top: &mut TopN,
+        walk: &mut WalkCounters,
+    ) {
+        let n = clauses.len();
+        let bboost = f64::from(bool_boost);
+        // clauses by term bound ascending (ties: clause order) for the partition
+        let mut by_ub: Vec<usize> = (0..n).collect();
+        by_ub.sort_by(|&a, &b| {
+            clauses[a]
+                .ub
+                .total_cmp(&clauses[b].ub)
+                .then_with(|| clauses[a].ord.cmp(&clauses[b].ord))
+        });
+        // clause indexes in clause order, for the f32 sum
+        let mut by_ord: Vec<usize> = (0..n).collect();
+        by_ord.sort_by_key(|&i| clauses[i].ord);
+        let mut essential = vec![true; n];
+        let mut ne_sum = 0.0f64; // sum of the non-essential clauses' term bounds
+        let mut ne_order: Vec<usize> = Vec::with_capacity(n); // non-essential, probed largest bound first
+        let mut partitioned_at = f64::NEG_INFINITY;
+        let mut matched: Vec<usize> = Vec::with_capacity(n);
+        let mut is_matched = vec![false; n];
+        let mut since_poll = 0u32;
+        let mut offered = 0.0f32;
+        loop {
             since_poll += 1;
             if since_poll & 4095 == 0 && self.deadline_hit() {
                 break;
             }
+            // the caller's floor, raised by the walks beside this one
+            let floor = self.floor_now(floor);
+            // `theta`: the page's worst score once it is full, never below
+            // the caller's floor
+            let theta = if pruning {
+                match (top.worst(), floor) {
+                    (Some(w), Some(f)) => Some(f64::from(w.score.max(f))),
+                    (Some(w), None) => Some(f64::from(w.score)),
+                    (None, Some(f)) => Some(f64::from(f)),
+                    (None, None) => None,
+                }
+            } else {
+                None
+            };
+            if let Some(theta) = theta {
+                if theta > partitioned_at {
+                    partitioned_at = theta;
+                    let mut sum = 0.0f64;
+                    ne_sum = 0.0;
+                    ne_order.clear();
+                    for &i in &by_ub {
+                        sum += clauses[i].ub;
+                        essential[i] = sum * bboost >= theta;
+                        if !essential[i] {
+                            ne_sum = sum;
+                            ne_order.push(i);
+                        }
+                    }
+                    ne_order.reverse();
+                }
+            }
+            // candidate: the smallest current doc of the essential clauses
+            let mut d = u32::MAX;
+            for i in 0..n {
+                if essential[i] && clauses[i].cur.doc < d {
+                    d = clauses[i].cur.doc;
+                }
+            }
+            if d == u32::MAX {
+                break;
+            }
+            if let Some(theta) = theta {
+                walk.candidates += 1;
+                #[cfg(test)]
+                MAX_SCORE_CANDIDATES.with(|c| c.set(c.get() + 1));
+                // (a) window: up to the first end of an essential current block
+                let mut window = ne_sum;
+                let mut at_d = ne_sum;
+                let mut wend = u32::MAX;
+                for i in 0..n {
+                    if !essential[i] || clauses[i].cur.doc == u32::MAX {
+                        continue;
+                    }
+                    let c = &mut clauses[i];
+                    let bb = c.current_block_bound(&norm_tables[c.table].1);
+                    window += bb;
+                    if c.cur.doc == d {
+                        at_d += bb;
+                    }
+                    let end = c.current_block_last_doc();
+                    if end < wend {
+                        wend = end;
+                    }
+                }
+                if window * bboost < theta {
+                    walk.windows_skipped += 1;
+                    if wend == u32::MAX {
+                        break;
+                    }
+                    for i in 0..n {
+                        if essential[i] {
+                            clauses[i].cur.advance(wend + 1);
+                        }
+                    }
+                    continue;
+                }
+                // (b) candidate filter, essential block bounds first
+                if at_d * bboost < theta {
+                    advance_matching(clauses, &essential, d);
+                    continue;
+                }
+                // ... then the non-essential clauses' block bounds at `d`
+                if !ne_order.is_empty() {
+                    let mut ub_d = at_d - ne_sum;
+                    for &j in &ne_order {
+                        let c = &mut clauses[j];
+                        c.at_d = c.bound_at(d, &norm_tables[c.table].1);
+                        ub_d += c.at_d;
+                    }
+                    if ub_d * bboost < theta {
+                        advance_matching(clauses, &essential, d);
+                        continue;
+                    }
+                }
+            }
+            // (c) exact evaluation of `d`
+            matched.clear();
+            let mut partial = 0.0f64;
+            for i in 0..n {
+                if essential[i] && clauses[i].cur.doc == d {
+                    let c = &mut clauses[i];
+                    let dl = c.doc_len(d);
+                    c.contrib = c.bm25.score_term(c.score_df, c.cur.tf(), dl) * c.tq.boost;
+                    partial += f64::from(c.contrib);
+                    matched.push(i);
+                }
+            }
+            let mut skip = false;
+            if let Some(theta) = theta {
+                let mut rem: f64 = ne_order.iter().map(|&j| clauses[j].at_d).sum();
+                for &j in &ne_order {
+                    if (inflate(partial) + rem) * bboost < theta {
+                        skip = true;
+                        break;
+                    }
+                    rem -= clauses[j].at_d;
+                    if clauses[j].at_d <= 0.0 {
+                        continue;
+                    }
+                    let c = &mut clauses[j];
+                    c.cur.advance(d);
+                    if c.cur.doc == d {
+                        let dl = c.doc_len(d);
+                        c.contrib = c.bm25.score_term(c.score_df, c.cur.tf(), dl) * c.tq.boost;
+                        partial += f64::from(c.contrib);
+                        matched.push(j);
+                    }
+                }
+            }
+            if !skip {
+                // f32 sum in CLAUSE order, then the bool boost
+                for &i in &matched {
+                    is_matched[i] = true;
+                }
+                let mut sum = 0.0f32;
+                for &i in &by_ord {
+                    if is_matched[i] {
+                        sum += clauses[i].contrib;
+                    }
+                }
+                for &i in &matched {
+                    is_matched[i] = false;
+                }
+                let score = sum * bool_boost;
+                // below the caller's floor: cannot enter the merged page
+                if floor.is_none_or(|f| score >= f) {
+                    walk.scored += 1;
+                    top.push(ScoredHit {
+                        doc_id: d,
+                        score,
+                        explanation: None,
+                    });
+                    self.share_floor(top, &mut offered);
+                }
+            }
+            advance_matching(clauses, &essential, d);
         }
-        let (hits, _) = top.finish();
-        Ok(Some((hits, total)))
     }
 
     /// Like [`Self::search_bounded`], but invokes `observe(doc_id)` once for
@@ -977,29 +1683,28 @@ impl FtsSearcher {
         // length for this segment's list, a different quantity that happens to
         // share a name.
         let score_df = self.scoring_df(&tq.field, &tq.term, tp.doc_frequency as u64);
+        // Term scoring reads `(doc_id, term_freq)` only; the positions are
+        // stepped over rather than built into a `Vec` per posting.
         let mut reader = match self.reader.postings_reader(&tq.field, &tp) {
-            Some(r) => r,
+            Some(r) => r.without_positions(),
             None => return Ok(()),
         };
 
-        while let Some(posting) = reader.next() {
-            let doc_len = self
-                .reader
-                .field_length(&tq.field, posting.doc_id)
-                .unwrap_or(1) as u32;
+        while let Some((doc_id, term_freq)) = reader.next_doc() {
+            let doc_len = self.reader.field_length(&tq.field, doc_id).unwrap_or(1) as u32;
 
             let (score, explanation) = if explain {
-                let bd = scorer.score_term_explain(&tq.term, score_df, posting.term_freq, doc_len);
+                let bd = scorer.score_term_explain(&tq.term, score_df, term_freq, doc_len);
                 let s = bd.score * tq.boost;
                 let boosted_bd = ScoreBreakdown { score: s, ..bd };
                 (s, Some(QueryExplanation::new(vec![boosted_bd])))
             } else {
-                let s = scorer.score_term(score_df, posting.term_freq, doc_len) * tq.boost;
+                let s = scorer.score_term(score_df, term_freq, doc_len) * tq.boost;
                 (s, None)
             };
 
             emit(ScoredHit {
-                doc_id: posting.doc_id,
+                doc_id,
                 score,
                 explanation,
             });
@@ -1028,6 +1733,139 @@ impl FtsSearcher {
             return Ok(Vec::new());
         }
 
+        if let Some(hits) = self.execute_phrase_leapfrog(pq, explain)? {
+            return Ok(hits);
+        }
+        self.execute_phrase_materialised(pq, explain)
+    }
+
+    /// A phrase as a conjunction first: the term cursors leapfrog to the
+    /// documents that hold EVERY term (anchored on the rarest; with a block
+    /// index, blocks that end before the target are jumped over without
+    /// being read), and only those documents' position groups are decoded
+    /// and matched. The materialising path decodes every posting of every
+    /// term with its positions — a question pasted as a phrase holds
+    /// stop words whose lists cover most of the corpus.
+    ///
+    /// Same hits as [`Self::execute_phrase_materialised`]: the same
+    /// documents (those holding every term with `phrase_positions_match`
+    /// true) and bit-identical scores (each term's `score_term(df, tf,
+    /// dl)` summed in TERM order, times the boost); the order is by doc id
+    /// instead of hash order, which no caller reads.
+    ///
+    /// `Ok(None)` when a cursor cannot read positions (legacy ZPS1 framing):
+    /// the caller takes the materialising path.
+    fn execute_phrase_leapfrog(
+        &self,
+        pq: &PhraseQuery,
+        explain: bool,
+    ) -> Result<Option<Vec<ScoredHit>>> {
+        // One cursor per DISTINCT term; `slot[t]` maps phrase term `t` to it.
+        let mut distinct: Vec<&str> = Vec::with_capacity(pq.terms.len());
+        let mut slot: Vec<usize> = Vec::with_capacity(pq.terms.len());
+        for term in &pq.terms {
+            match distinct.iter().position(|d| *d == term.as_str()) {
+                Some(i) => slot.push(i),
+                None => {
+                    slot.push(distinct.len());
+                    distinct.push(term.as_str());
+                }
+            }
+        }
+        let mut cursors = Vec::with_capacity(distinct.len());
+        let mut local_df: Vec<u32> = Vec::with_capacity(distinct.len());
+        for term in &distinct {
+            let Some(tp) = self.reader.lookup_term(&pq.field, term) else {
+                return Ok(Some(Vec::new())); // a missing term: no phrase matches
+            };
+            let Some(cursor) = self.reader.block_cursor(&pq.field, &tp) else {
+                return Ok(Some(Vec::new()));
+            };
+            local_df.push(tp.doc_frequency);
+            cursors.push(cursor);
+        }
+        // Leapfrog order: rarest first, so the anchor list is the shortest.
+        let mut order: Vec<usize> = (0..cursors.len()).collect();
+        order.sort_by_key(|&i| local_df[i]);
+
+        let scorer = self.make_scorer(&pq.field);
+        let score_dfs: Vec<u64> = pq
+            .terms
+            .iter()
+            .zip(&slot)
+            .map(|(term, &s)| self.scoring_df(&pq.field, term, u64::from(local_df[s])))
+            .collect();
+        let mut positions: Vec<Vec<u32>> = vec![Vec::new(); cursors.len()];
+        let mut hits = Vec::new();
+        let mut steps = 0u32;
+        let mut target = cursors[order[0]].doc;
+        'walk: while target != u32::MAX {
+            steps = steps.wrapping_add(1);
+            if steps.is_multiple_of(4096) && self.deadline_hit() {
+                break;
+            }
+            // Bring every cursor to `target`; the first one past it names the
+            // next candidate and the walk starts over from the anchor.
+            for &c in &order {
+                cursors[c].advance(target);
+                let d = cursors[c].doc;
+                if d == u32::MAX {
+                    break 'walk;
+                }
+                if d > target {
+                    target = d;
+                    continue 'walk;
+                }
+            }
+            // Every term occurs in `target`: read their positions.
+            for c in 0..cursors.len() {
+                if !cursors[c].positions(&mut positions[c])? {
+                    return Ok(None);
+                }
+            }
+            let all_positions: Vec<&[u32]> =
+                slot.iter().map(|&s| positions[s].as_slice()).collect();
+            if phrase_positions_match(&all_positions, pq.slop) {
+                let doc_id = target;
+                let doc_len = self.reader.field_length(&pq.field, doc_id).unwrap_or(1) as u32;
+                let mut total_score = 0.0f32;
+                let mut breakdowns = Vec::new();
+                for (term_idx, term) in pq.terms.iter().enumerate() {
+                    let df = score_dfs[term_idx];
+                    let tf = cursors[slot[term_idx]].tf();
+                    if explain {
+                        let bd = scorer.score_term_explain(term, df, tf, doc_len);
+                        total_score += bd.score;
+                        breakdowns.push(bd);
+                    } else {
+                        total_score += scorer.score_term(df, tf, doc_len);
+                    }
+                }
+                total_score *= pq.boost;
+                hits.push(ScoredHit {
+                    doc_id,
+                    score: total_score,
+                    explanation: if explain {
+                        Some(QueryExplanation::new(breakdowns))
+                    } else {
+                        None
+                    },
+                });
+            }
+            cursors[order[0]].next();
+            target = cursors[order[0]].doc;
+        }
+        Ok(Some(hits))
+    }
+
+    /// The phrase evaluation that decodes every term's whole posting list,
+    /// positions included. Kept for the legacy ZPS1 framing, whose cursors
+    /// cannot read positions.
+    fn execute_phrase_materialised(
+        &self,
+        pq: &PhraseQuery,
+        explain: bool,
+    ) -> Result<Vec<ScoredHit>> {
         // Load postings for every term into a per-term
         // `doc_id → (term_freq, positions)` map.  This is O(Σ df) once and
         // turns the per-anchor-doc term lookup into O(1) — the previous
@@ -2468,6 +3306,229 @@ mod tests {
         assert!(!doc_ids.contains(&2), "doc2 should not match (lazy only)");
     }
 
+    /// A whitespace-analysed `body` segment of `docs` in `dir`; with `strip` its
+    /// `.post` loses the block-index frame (a segment written before it), so the
+    /// phrase cursors walk their blocks in order.
+    fn phrase_segment(dir: &std::path::Path, docs: &[String], strip: bool) -> FtsSearcher {
+        let registry = Arc::new(AnalyzerRegistry::default());
+        let mut writer = FtsIndexWriter::new(dir, "seg0", Arc::clone(&registry));
+        writer.configure_field(
+            "body",
+            FieldIndexConfig {
+                analyzer: "whitespace".to_owned(),
+                ..Default::default()
+            },
+        );
+        for (i, text) in docs.iter().enumerate() {
+            let fields: HashMap<String, FieldValues> =
+                [("body".to_owned(), FieldValues::from(text.clone()))].into();
+            writer.add_document(i as u32, &fields);
+        }
+        writer.finish().unwrap();
+        if strip {
+            let path = dir.join("seg0.body.post");
+            let bytes = std::fs::read(&path).unwrap();
+            let (_, rest) = crate::postings::split_block_index_frame(&bytes[8..]).unwrap();
+            let mut stripped = bytes[..8].to_vec();
+            stripped.extend_from_slice(rest);
+            std::fs::write(&path, stripped).unwrap();
+        }
+        let reader = Arc::new(FtsIndexReader::open(dir, "seg0", &["body"]).unwrap());
+        if strip {
+            assert!(reader.block_index("body").is_none());
+        }
+        FtsSearcher::new(reader, registry)
+    }
+
+    /// A deterministic corpus: `w0` in nearly every document (lists of many
+    /// full blocks), `w1`..`w3` common, `w4`..`w19` rarer, repeated tokens
+    /// (tf > 1) and varying lengths.
+    fn phrase_corpus(n: usize) -> Vec<String> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..n)
+            .map(|_| {
+                let len = 4 + (next() % 24) as usize;
+                (0..len)
+                    .map(|_| {
+                        let r = next() % 100;
+                        let w = match r {
+                            0..=34 => 0,
+                            35..=54 => 1,
+                            55..=69 => 2,
+                            70..=79 => 3,
+                            _ => 4 + (next() % 16) as usize,
+                        };
+                        format!("w{w}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    /// The conjunction-first phrase walk returns what the materialising path
+    /// returns: the same documents, f32 score bits and (through the bounded
+    /// search) the same top-k order, with and without the block index, for
+    /// phrases cut from documents (so they match), random phrases, repeated
+    /// terms, a term no document holds, and slops 0, 1 and 3.
+    #[test]
+    fn phrase_leapfrog_matches_the_materialising_path() {
+        let docs = phrase_corpus(3_000);
+        for strip in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let searcher = phrase_segment(dir.path(), &docs, strip);
+            let mut phrases: Vec<Vec<String>> = Vec::new();
+            for (k, doc) in docs.iter().enumerate().step_by(37) {
+                let toks: Vec<&str> = doc.split(' ').collect();
+                let n = 2 + k % 4;
+                if toks.len() > n {
+                    let at = k % (toks.len() - n);
+                    phrases.push(toks[at..at + n].iter().map(|t| t.to_string()).collect());
+                }
+            }
+            for (a, b, c) in [
+                (0, 1, 2),
+                (0, 0, 1),
+                (3, 0, 3),
+                (5, 6, 7),
+                (1, 9, 1),
+                (0, 1, 0),
+            ] {
+                phrases.push(vec![format!("w{a}"), format!("w{b}"), format!("w{c}")]);
+            }
+            phrases.push(vec!["w0".into(), "absent".into()]);
+            let mut compared = 0usize;
+            let mut matched = 0usize;
+            for terms in &phrases {
+                for slop in [0u32, 1, 3] {
+                    let mut pq = PhraseQuery::new("body", terms.clone());
+                    pq.slop = slop;
+                    let mut fast = searcher
+                        .execute_phrase_leapfrog(&pq, false)
+                        .unwrap()
+                        .expect("ZPS2 cursors read positions");
+                    let mut slow = searcher.execute_phrase_materialised(&pq, false).unwrap();
+                    fast.sort_by_key(|h| h.doc_id);
+                    slow.sort_by_key(|h| h.doc_id);
+                    let key = |hs: &[ScoredHit]| -> Vec<(u32, u32)> {
+                        hs.iter().map(|h| (h.doc_id, h.score.to_bits())).collect()
+                    };
+                    assert_eq!(
+                        key(&fast),
+                        key(&slow),
+                        "{terms:?} slop {slop} strip {strip}"
+                    );
+                    // The public bounded path: identical top-k, order included.
+                    for cap in [1usize, 7, 50] {
+                        let (page, total) = searcher
+                            .search_bounded(&Query::Phrase(pq.clone()), cap, false)
+                            .unwrap();
+                        let mut want = slow.clone();
+                        want.sort_by(|x, y| {
+                            y.score.total_cmp(&x.score).then(x.doc_id.cmp(&y.doc_id))
+                        });
+                        want.truncate(cap);
+                        assert_eq!(key(&page), key(&want), "{terms:?} slop {slop} cap {cap}");
+                        assert_eq!(total, slow.len() as u64);
+                    }
+                    compared += 1;
+                    matched += usize::from(!slow.is_empty());
+                }
+            }
+            assert!(
+                compared > 200 && matched > 100,
+                "{compared} phrases, {matched} with hits"
+            );
+        }
+    }
+
+    /// `matching_docs` is the document set the full generic answer holds: for
+    /// the docs-only union of a `match`-shaped bool or a term, and for shapes
+    /// it evaluates generically (two required clauses, a `must`, a phrase).
+    #[test]
+    fn matching_docs_is_the_match_set_of_the_generic_answer() {
+        let docs = phrase_corpus(3_000);
+        let dir = TempDir::new().unwrap();
+        let searcher = phrase_segment(dir.path(), &docs, false);
+        let term = |t: &str| Query::Term(TermQuery::new("body", t));
+        let should = |ts: &[&str], msm: Option<u32>| {
+            let mut b = BoolQuery::new();
+            for t in ts {
+                b = b.should(term(t));
+            }
+            if let Some(m) = msm {
+                b = b.min_should_match(m);
+            }
+            Query::Bool(Box::new(b))
+        };
+        let queries = vec![
+            term("w0"),
+            term("w7"),
+            term("absent"),
+            should(&["w1", "w9", "w0", "w9"], None),
+            should(&["w5", "w6", "absent"], None),
+            should(&["w1", "w5", "w6"], Some(2)),
+            Query::Bool(Box::new(
+                BoolQuery::new().must(term("w2")).should(term("w8")),
+            )),
+            Query::Phrase(PhraseQuery::new("body", vec!["w0".into(), "w1".into()])),
+        ];
+        for q in &queries {
+            let bits = searcher.matching_docs(q).unwrap().expect("no deadline");
+            let mut from_bits: Vec<u32> = Vec::new();
+            for (w, word) in bits.iter().enumerate() {
+                for b in 0..64 {
+                    if word & (1u64 << b) != 0 {
+                        from_bits.push((w * 64 + b) as u32);
+                    }
+                }
+            }
+            let (hits, total) = searcher.search_bounded(q, usize::MAX, false).unwrap();
+            let mut want: Vec<u32> = hits.iter().map(|h| h.doc_id).collect();
+            want.sort_unstable();
+            assert_eq!(from_bits, want, "{q:?}");
+            assert_eq!(total, want.len() as u64);
+        }
+    }
+
+    /// A phrase reads position groups only for the documents that hold every
+    /// one of its terms. The materialising path decoded one group per posting
+    /// of every term: here 2,000 for `common` plus 40 for `rare`, for five
+    /// documents that hold the phrase.
+    #[test]
+    fn phrase_reads_positions_only_for_documents_holding_every_term() {
+        let docs: Vec<String> = (0..2_000)
+            .map(|i| match i % 400 {
+                0 => "rare common filler".to_owned(),
+                7 => "common filler rare".to_owned(),
+                _ => format!("common filler{} common", i % 13),
+            })
+            .collect();
+        let dir = TempDir::new().unwrap();
+        let searcher = phrase_segment(dir.path(), &docs, false);
+        let q = Query::Phrase(PhraseQuery::new(
+            "body",
+            vec!["rare".to_owned(), "common".to_owned()],
+        ));
+        crate::postings::POSITION_GROUPS_MATERIALISED.with(|c| c.set(0));
+        let hits = searcher.search(&q, 100, false).unwrap();
+        let groups = crate::postings::POSITION_GROUPS_MATERIALISED.with(|c| c.get());
+        let mut ids: Vec<u32> = hits.iter().map(|h| h.doc_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 400, 800, 1200, 1600], "the phrase's documents");
+        // 10 documents hold both terms; two groups each.
+        assert!(
+            groups <= 2 * 10,
+            "position groups decoded: {groups} (documents holding every term: 10)"
+        );
+    }
+
     #[test]
     fn phrase_query_matches_adjacent_terms() {
         let dir = TempDir::new().unwrap();
@@ -3432,6 +4493,215 @@ mod tests {
                 got, expected,
                 "WAND top-{cap} must be byte-identical to the generic path"
             );
+        }
+    }
+
+    /// BM25 over a `match`-shaped disjunction (the WAND walk) and over one
+    /// term (the streaming scan) reads `(doc_id, term_freq)` only, so neither
+    /// may decode a position group into a `Vec`. Before, every posting of
+    /// every term allocated, cloned and freed its positions: on a question
+    /// `match` over 1 M Wikipedia passages that was a third of the query CPU
+    /// (perf), and a stopword visits nearly every passage.
+    #[test]
+    fn bm25_term_scoring_does_not_materialise_positions() {
+        let dir = TempDir::new().unwrap();
+        let searcher = wand_fixture(dir.path());
+        let disjunction = Query::Bool(Box::new(
+            BoolQuery::new()
+                .should(Query::Term(TermQuery::new("body", "the")))
+                .should(Query::Term(TermQuery::new("body", "needle"))),
+        ));
+        let single = Query::Term(TermQuery::new("body", "the"));
+
+        crate::postings::POSITION_GROUPS_MATERIALISED.with(|c| c.set(0));
+        let (hits, total) = searcher.search_bounded(&disjunction, 3, false).unwrap();
+        assert_eq!(total, 300);
+        assert_eq!(
+            hits.iter().map(|h| h.doc_id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        let (_, total) = searcher.search_bounded(&single, 3, false).unwrap();
+        assert_eq!(total, 300);
+        assert_eq!(
+            crate::postings::POSITION_GROUPS_MATERIALISED.with(|c| c.get()),
+            0,
+            "BM25 term scoring must step over positions, not decode them"
+        );
+    }
+
+    /// A searcher over `docs` (whitespace-analysed `body`), one segment.
+    fn searcher_over(dir: &std::path::Path, docs: &[String]) -> FtsSearcher {
+        let registry = Arc::new(AnalyzerRegistry::default());
+        let mut writer = FtsIndexWriter::new(dir, "seg0", Arc::clone(&registry));
+        writer.configure_field(
+            "body",
+            FieldIndexConfig {
+                analyzer: "whitespace".to_owned(),
+                ..Default::default()
+            },
+        );
+        for (i, text) in docs.iter().enumerate() {
+            let fields: HashMap<String, FieldValues> =
+                [("body".to_owned(), FieldValues::from(text.clone()))]
+                    .into_iter()
+                    .collect();
+            writer.add_document(i as u32, &fields);
+        }
+        writer.finish().unwrap();
+        let reader = Arc::new(FtsIndexReader::open(dir, "seg0", &["body"]).unwrap());
+        FtsSearcher::new(reader, registry)
+    }
+
+    fn page_of(hits: &[ScoredHit]) -> Vec<(u32, u32)> {
+        hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect()
+    }
+
+    /// The WAND bound must carry the bool boost. A multi-term `match` with
+    /// `boost: N` projects to a bool with boost N, whose hits are scored
+    /// `sum × N`; the bound was compared unboosted against that boosted page
+    /// bar, so with N > 1 a document that scores into the page was pruned.
+    ///
+    /// FAIL-BEFORE: doc 7 (`the` three times, shortest field) is in the
+    /// generic path's top 4 under bool boost 3 and missing from the WAND page.
+    #[test]
+    fn wand_bound_carries_the_bool_boost() {
+        let dir = TempDir::new().unwrap();
+        let mut docs: Vec<String> = (0..8)
+            .map(|i| format!("the filler{i} pad{i} more{i}"))
+            .collect();
+        docs[0] = "the needle a1 b1".into();
+        docs[1] = "the needle a2 b2".into();
+        docs[7] = "the the the".into();
+        let searcher = searcher_over(dir.path(), &docs);
+        let q = Query::Bool(Box::new(
+            BoolQuery::new()
+                .should(Query::Term(TermQuery::new("body", "the")))
+                .should(Query::Term(TermQuery::new("body", "needle")))
+                .boost(3.0),
+        ));
+        let full = searcher.search(&q, usize::MAX, false).unwrap();
+        assert!(
+            full[..4].iter().any(|h| h.doc_id == 7),
+            "precondition: the triple-`the` doc ranks in the top 4: {full:?}"
+        );
+        for cap in [1usize, 2, 3, 4, 5, 8] {
+            let (bounded, total) = searcher.search_bounded(&q, cap, false).unwrap();
+            assert_eq!(total, 8);
+            assert_eq!(
+                page_of(&bounded),
+                page_of(&full[..cap.min(full.len())]),
+                "bool-boosted WAND top-{cap} must equal the generic path"
+            );
+        }
+    }
+
+    /// `track_total_hits: N` needs the total only up to N. Once N matches are
+    /// counted the disjunction stops visiting documents that cannot reach the
+    /// page: in this fixture `the` is in all 300 documents and its score
+    /// supremum is below the three `needle` documents, so after the page holds
+    /// them no candidate is left. The page must be the exact one, scores bit
+    /// for bit, and the total exact below N and a lower bound at N or more.
+    ///
+    /// FAIL-BEFORE (count limit plumbed but ignored): the walk visits all 300
+    /// documents and reports total 300 for a limit of 10.
+    #[test]
+    fn count_limit_stops_counting_and_keeps_the_page() {
+        let dir = TempDir::new().unwrap();
+        let searcher = wand_fixture(dir.path());
+        let q = Query::Bool(Box::new(
+            BoolQuery::new()
+                .should(Query::Term(TermQuery::new("body", "the")))
+                .should(Query::Term(TermQuery::new("body", "needle"))),
+        ));
+        let (exact, exact_total) = searcher.search_bounded(&q, 3, false).unwrap();
+        assert_eq!(exact_total, 300);
+
+        MAX_SCORE_CANDIDATES.with(|c| c.set(0));
+        let (limited, total) = searcher.search_bounded_counting(&q, 3, false, 10).unwrap();
+        assert_eq!(page_of(&limited), page_of(&exact), "same page, bit for bit");
+        assert!(
+            (10..300).contains(&total),
+            "a count limit of 10 must stop counting well before 300: {total}"
+        );
+        assert_eq!(
+            MAX_SCORE_CANDIDATES.with(|c| c.get()),
+            0,
+            "no `needle` document is left after the first ten, and `the` alone \
+             cannot reach the page: nothing must be visited"
+        );
+    }
+
+    /// The count-limited walk against the exact one over many shapes: a
+    /// Zipf-ish vocabulary, varying lengths and term frequencies, duplicate
+    /// and boosted clauses, bool boosts, page sizes and count limits. The page
+    /// must be identical bit for bit; the total exact below the limit and at
+    /// least the limit otherwise.
+    #[test]
+    fn count_limited_walk_matches_the_exact_walk() {
+        let vocab: Vec<String> = (0..40).map(|i| format!("w{i}")).collect();
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let docs: Vec<String> = (0..2000)
+            .map(|_| {
+                let len = 3 + (next() % 30) as usize;
+                (0..len)
+                    .map(|_| {
+                        // Zipf-ish: low ids (stopword-like) are far more common.
+                        let r = (next() % 1000) as f64 / 1000.0;
+                        let id = ((r * r * r) * vocab.len() as f64) as usize;
+                        vocab[id.min(vocab.len() - 1)].clone()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let dir = TempDir::new().unwrap();
+        let searcher = searcher_over(dir.path(), &docs);
+
+        let mut queries: Vec<Query> = Vec::new();
+        for q in 0..60 {
+            let n_terms = 2 + (next() % 6) as usize;
+            let mut bq = BoolQuery::new();
+            for t in 0..n_terms {
+                let id = (next() % vocab.len() as u64) as usize;
+                let mut tq = TermQuery::new("body", &vocab[id]);
+                if (q + t) % 7 == 0 {
+                    tq.boost = 2.5;
+                }
+                bq = bq.should(Query::Term(tq));
+            }
+            if q % 5 == 0 {
+                bq = bq.boost(1.75);
+            }
+            queries.push(Query::Bool(Box::new(bq)));
+        }
+        for (qi, q) in queries.iter().enumerate() {
+            for cap in [1usize, 3, 10, 40] {
+                let (exact, exact_total) = searcher.search_bounded(q, cap, false).unwrap();
+                for limit in [0u64, 1, 5, 50, 400, 5000, u64::MAX] {
+                    let (got, total) = searcher
+                        .search_bounded_counting(q, cap, false, limit)
+                        .unwrap();
+                    assert_eq!(
+                        page_of(&got),
+                        page_of(&exact),
+                        "query {qi} cap {cap} limit {limit}: page"
+                    );
+                    if exact_total < limit {
+                        assert_eq!(total, exact_total, "query {qi} cap {cap} limit {limit}");
+                    } else {
+                        assert!(
+                            total >= limit && total <= exact_total,
+                            "query {qi} cap {cap} limit {limit}: {total} vs {exact_total}"
+                        );
+                    }
+                }
+            }
         }
     }
 

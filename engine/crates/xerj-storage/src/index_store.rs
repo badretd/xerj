@@ -4573,7 +4573,19 @@ impl IndexStore {
         let segments_dir = self.data_dir.join("segments");
         let mut total = 0usize;
 
-        for meta in &snap.segments {
+        // Opt-in (`XERJ_VERSION_MAP_THREADS` > 1): the segment pass below on
+        // several threads (`rebuild_version_map_parallel`, the same `set`
+        // calls); the loop then has nothing left to do.
+        let threads = version_map_rebuild_threads();
+        let sequential: &[SegmentMeta] = if threads > 1 && snap.segments.len() > 1 {
+            total = self.rebuild_version_map_parallel(&snap.segments, &segments_dir, threads);
+            #[cfg(test)]
+            PARALLEL_VERSION_REBUILDS.with(|c| c.set(c.get() + 1));
+            &[]
+        } else {
+            &snap.segments
+        };
+        for meta in sequential {
             // Hoist segment-id Arc once per segment — the per-doc loops
             // below would otherwise do `Arc::from(&meta.id)` per doc, which
             // allocates a fresh shared buffer every time.
@@ -4726,6 +4738,181 @@ impl IndexStore {
             );
         }
         Ok(())
+    }
+
+    /// The segment pass of [`Self::rebuild_version_map_from_segments`] on
+    /// `threads` threads (`XERJ_VERSION_MAP_THREADS`); returns how many ids it
+    /// set (the sequential pass's `total`).
+    ///
+    /// Same map as the sequential pass: every segment's `(seq_no, id)` pairs
+    /// are decoded exactly as that pass decodes them
+    /// ([`Self::segment_version_ids`]), and the ids are split by
+    /// [`VersionMap::partition_of`], one thread per partition, each thread
+    /// visiting the segments in snapshot order and their ids in order. So
+    /// every key's `set` calls happen in the sequential order, on one
+    /// thread. The map is keyed by id, an entry's `seq_no`, segment,
+    /// `deleted` and `_version` depend only on the calls for its key, and
+    /// the live and ghost counters are sums of per-call deltas.
+    ///
+    /// At 10 GB (11.3 M ids in 35 segments) the sequential pass is the whole
+    /// open: 11.2 s of one core, nearly all of it in the 11.3 M `set`s (a
+    /// key allocation and a shard-locked insert each). Segments are decoded
+    /// and set `threads` at a time, so at most that many segments' ids are
+    /// held in memory at once.
+    fn rebuild_version_map_parallel(
+        &self,
+        segments: &[SegmentMeta],
+        segments_dir: &Path,
+        threads: usize,
+    ) -> usize {
+        // a worker panic propagates, as it would from the sequential pass
+        fn resume<T>(panic: Box<dyn std::any::Any + Send>) -> T {
+            std::panic::resume_unwind(panic)
+        }
+        let mut total = 0usize;
+        for chunk in segments.chunks(threads) {
+            // decode: one thread per segment of the chunk
+            let decoded: Vec<Vec<VersionIds>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = chunk
+                    .iter()
+                    .map(|meta| {
+                        scope.spawn(move || self.segment_version_ids(meta, segments_dir, threads))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(resume))
+                    .collect()
+            });
+            // set: one thread per partition, segments in snapshot order
+            let mut by_part: Vec<Vec<(Arc<str>, VersionIds)>> = (0..threads)
+                .map(|_| Vec::with_capacity(chunk.len()))
+                .collect();
+            for (meta, parts) in chunk.iter().zip(decoded) {
+                let seg_id_arc: Arc<str> = Arc::from(meta.id.as_str());
+                for (part, ids) in parts.into_iter().enumerate() {
+                    by_part[part].push((Arc::clone(&seg_id_arc), ids));
+                }
+            }
+            total += std::thread::scope(|scope| {
+                let handles: Vec<_> = by_part
+                    .into_iter()
+                    .map(|segs| {
+                        scope.spawn(move || {
+                            let mut loaded = 0usize;
+                            for (seg_id_arc, ids) in segs {
+                                for (seq_no, id) in ids {
+                                    self.version_map.set(
+                                        id,
+                                        seq_no,
+                                        Arc::clone(&seg_id_arc),
+                                        false,
+                                    );
+                                    loaded += 1;
+                                }
+                            }
+                            loaded
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(resume))
+                    .sum::<usize>()
+            });
+        }
+        total
+    }
+
+    /// One segment's `(seq_no, id)` pairs in the order the sequential pass of
+    /// [`Self::rebuild_version_map_from_segments`] sets them (the `.ids`
+    /// sidecar, or the stored section of a segment without one, with the
+    /// same fallbacks and the same warnings), split into `parts` lists by
+    /// [`VersionMap::partition_of`].
+    fn segment_version_ids(
+        &self,
+        meta: &SegmentMeta,
+        segments_dir: &Path,
+        parts: usize,
+    ) -> Vec<VersionIds> {
+        let mut out: Vec<VersionIds> = (0..parts).map(|_| Vec::new()).collect();
+        let ids_path = segments_dir.join(format!("{}.ids", meta.id.as_str()));
+        if let Ok(bytes) = std::fs::read(&ids_path) {
+            if bytes.len() >= 8
+                && (&bytes[..4] == b"ZID1" || &bytes[..4] == b"ZID2" || &bytes[..4] == b"ZID3")
+            {
+                let num = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+                let body: Vec<u8> = if &bytes[..4] == b"ZID2" || &bytes[..4] == b"ZID3" {
+                    match lz4_flex::decompress_size_prepended(&bytes[8..]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(segment = %meta.id, error = %e, "ZID2 decompress failed, falling back");
+                            return out;
+                        }
+                    }
+                } else {
+                    bytes[8..].to_vec()
+                };
+                let mut pos = 0usize;
+                for _ in 0..num {
+                    if pos + 8 + 2 > body.len() {
+                        break;
+                    }
+                    let seq_no = u64::from_le_bytes(body[pos..pos + 8].try_into().unwrap());
+                    pos += 8;
+                    let id_len =
+                        u16::from_le_bytes(body[pos..pos + 2].try_into().unwrap()) as usize;
+                    pos += 2;
+                    if pos + id_len > body.len() {
+                        break;
+                    }
+                    let id_bytes = &body[pos..pos + id_len];
+                    pos += id_len;
+                    if let Ok(id) = std::str::from_utf8(id_bytes) {
+                        out[self.version_map.partition_of(id, parts)].push((seq_no, id.to_owned()));
+                    }
+                }
+                return out;
+            }
+        }
+
+        // Legacy path: decode stored section to extract (id, seq_no).
+        let seg_path = segments_dir.join(&meta.seg_path);
+        let reader = match SegmentReader::open(&seg_path) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(segment = %meta.id, error = %e, "cannot open segment for version map rebuild");
+                return out;
+            }
+        };
+        let stored_bytes_raw = match reader.section(SectionType::Stored) {
+            Ok(Some(b)) => b,
+            _ => return out,
+        };
+        let stored_bytes = match crate::stored_codec::decode_stored(stored_bytes_raw) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(segment = %meta.id, error = %e, "cannot decode stored section");
+                return out;
+            }
+        };
+        let docs: Vec<serde_json::Value> = match serde_json::from_slice(&stored_bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(segment = %meta.id, error = %e, "cannot decode stored docs for version map rebuild");
+                return out;
+            }
+        };
+        for (ordinal, doc) in docs.iter().enumerate() {
+            let doc_id = match doc.get("_id").and_then(serde_json::Value::as_str) {
+                Some(id) => id,
+                None => continue,
+            };
+            let seq_no =
+                (meta.max_seq_no.saturating_sub(docs.len() as u64)).saturating_add(ordinal as u64);
+            out[self.version_map.partition_of(doc_id, parts)].push((seq_no, doc_id.to_owned()));
+        }
+        out
     }
 
     // ── WAL replay ────────────────────────────────────────────────────────────
@@ -5471,6 +5658,40 @@ impl IndexStore {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// One segment's `(seq_no, id)` pairs of one partition, in the order a
+/// version-map rebuild sets them (`IndexStore::rebuild_version_map_parallel`).
+type VersionIds = Vec<(u64, String)>;
+
+/// `XERJ_VERSION_MAP_THREADS`: how many threads rebuild an index's version
+/// map from its segments when it opens
+/// (`IndexStore::rebuild_version_map_parallel`). Unset, `0` or `1` = off: one
+/// segment after the other, as before. Read once (tests:
+/// `VERSION_MAP_THREADS_TEST`).
+fn version_map_rebuild_threads() -> usize {
+    #[cfg(test)]
+    if let Some(n) = VERSION_MAP_THREADS_TEST.with(|c| c.get()) {
+        return n;
+    }
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("XERJ_VERSION_MAP_THREADS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A thread count that overrides `XERJ_VERSION_MAP_THREADS` for this test
+    /// thread, and how many opens on it took the parallel segment pass.
+    static VERSION_MAP_THREADS_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static PARALLEL_VERSION_REBUILDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 mod tests {
@@ -7031,6 +7252,86 @@ mod tests {
         );
         assert!(again.version_map.get("kept").is_some());
         assert!(again.version_map.get("fresh").is_some());
+    }
+
+    /// `XERJ_VERSION_MAP_THREADS` > 1: the open's version-map rebuild from
+    /// the segments runs on several threads and leaves the map the
+    /// sequential pass leaves: every entry (seq_no, segment, deleted,
+    /// `_version`), the entry, live and ghost counts. The fixture has ids
+    /// overwritten across segments, deletes (segment tombstones) and a
+    /// segment whose `.ids` sidecar was moved away (the stored-section
+    /// path), with the WAL pruned so that the map comes from the segments.
+    /// Opens alternate between the two passes. FAIL-BEFORE: with one thread
+    /// the parallel pass does not run (`PARALLEL_VERSION_REBUILDS` stays 0).
+    #[test]
+    fn parallel_version_map_rebuild_leaves_the_sequential_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ids: Vec<String> = Vec::new();
+        let mut moved_sidecar = None;
+        {
+            let store = open_test_store(dir.path());
+            for round in 0..7u32 {
+                for i in 0..300u32 {
+                    let id = format!("d{}", (i * 7 + round * 53) % 1_000);
+                    store
+                        .index(&id, serde_json::json!({ "round": round, "i": i }))
+                        .unwrap();
+                    ids.push(id);
+                }
+                if round == 3 {
+                    for i in 0..40u32 {
+                        let _ = store.delete(format!("d{}", i * 11)).unwrap();
+                    }
+                }
+                let meta = store.flush().unwrap().unwrap();
+                if round == 2 {
+                    moved_sidecar = Some(meta.id.clone());
+                }
+            }
+            store.force_wal_maintenance().unwrap();
+        }
+        let moved = moved_sidecar.unwrap();
+        let sidecar = dir.path().join("segments").join(format!("{moved}.ids"));
+        std::fs::rename(&sidecar, sidecar.with_extension("ids.moved")).unwrap();
+        ids.sort();
+        ids.dedup();
+        type Dump = (
+            Vec<Option<crate::version_map::VersionEntry>>,
+            usize,
+            usize,
+            u64,
+        );
+        let dump = |store: &IndexStore| -> Dump {
+            (
+                ids.iter().map(|id| store.version_map.get(id)).collect(),
+                store.version_map.len(),
+                store.version_map.live_count(),
+                store.version_map.ghost_events(),
+            )
+        };
+        let open_with = |threads: usize| -> (Dump, usize) {
+            VERSION_MAP_THREADS_TEST.with(|c| c.set(Some(threads)));
+            PARALLEL_VERSION_REBUILDS.with(|c| c.set(0));
+            let store = open_test_store(dir.path());
+            let d = dump(store.as_ref());
+            drop(store);
+            (d, PARALLEL_VERSION_REBUILDS.with(|c| c.get()))
+        };
+        let (reference, runs) = open_with(1);
+        assert_eq!(runs, 0, "one thread keeps the sequential pass");
+        assert!(reference.2 > 0, "fixture: live documents");
+        assert!(reference.3 > 0, "fixture: overwrites and deletes");
+        for threads in [2usize, 3, 8] {
+            let (parallel, runs) = open_with(threads);
+            assert!(runs > 0, "the parallel pass ran ({threads} threads)");
+            assert_eq!(parallel, reference, "{threads} threads");
+            let (again, _) = open_with(1);
+            assert_eq!(
+                again, reference,
+                "the sequential pass again after {threads}"
+            );
+        }
+        VERSION_MAP_THREADS_TEST.with(|c| c.set(None));
     }
 
     #[test]

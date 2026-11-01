@@ -1,0 +1,31 @@
+[package]
+name = "xerj-facts"
+description = "SPIKE (local branch spike/facts-68m, never pushed): XERJ-R facts store, exact executor and compiler inside the engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+# Test-only crash points at the commit and recovery steps (`src/failpoint.rs`, gate E4). Off by default and in no shipped
+# feature set: without it every point is a no-op.
+failpoints = []
+
+# The XERJ-R crates are linked by path from the research checkout (xerj_mem, branch verify-bindings = engine-spike +
+# verify_bound + answer_observed), relative to this checkout: a xerj_mem checkout next to the product checkout
+# (<dir>/product + <dir>/xerj_mem). They are NOT vendored: the spike is local only, and vendoring waits for the owner's
+# license decision (design §7, question 1).
+[dependencies]
+xerj-store = { path = "../../../../xerj_mem/crates/xerj-store" }
+xerj-index = { path = "../../../../xerj_mem/crates/xerj-index" }
+xerj-exec = { path = "../../../../xerj_mem/crates/xerj-exec" }
+xerj-infer = { path = "../../../../xerj_mem/crates/xerj-infer", default-features = false }
+xerj-serve = { path = "../../../../xerj_mem/crates/xerj-serve", default-features = false }
+# the engine's own tokenizer build (the same version and features as xerj-ai): no tokenizers 0.22 / onig in the product
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+# the WriteSink signatures (the same spec as xerj-store: no new version or feature in Cargo.lock)
+smallvec = { version = "1.15", features = ["const_generics", "union"] }

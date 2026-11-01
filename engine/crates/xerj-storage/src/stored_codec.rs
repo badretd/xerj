@@ -63,6 +63,11 @@
 //!   (e.g. `_id` and a `_source` field echoing it).  Payload = `u32
 //!   src_col_ix`.  The writer only ever references an earlier column that
 //!   was itself encoded with a pass-1 codec, so decode is a clone.
+//! * 7 — `RAW_JSON_BLOCKS` (ZBS4, opt-in `XERJ_STORED_ROW_BLOCKS=1`): a
+//!   large JSON fallback column cut at row boundaries into independent
+//!   zstd frames of ~64 KiB of JSON, behind a block table, so one row
+//!   decodes one block instead of the whole column (see
+//!   [`stored_v2_has_row_blocks`] and the row-block section below).
 //!
 //! `RAW_JSON` payloads come in two forms, told apart by their first byte
 //! (zstd frames start `0x28`, so the form byte is unambiguous):
@@ -87,10 +92,11 @@ use std::io::{Cursor, Read, Write};
 pub mod derived_vectors;
 mod row_hydration;
 pub use row_hydration::{
-    decode_stored_v2_ids, decode_stored_v2_rows, decode_stored_v2_rows_controlled,
-    decode_stored_v2_rows_projected, decode_stored_v2_rows_projected_controlled,
-    decode_stored_v2_rows_projected_parallel, StoredV2HydratedRow, StoredV2RowHydrationResult,
-    StoredV2RowHydrationStats,
+    decode_stored_v2_ids, decode_stored_v2_row_for_get, decode_stored_v2_rows,
+    decode_stored_v2_rows_controlled, decode_stored_v2_rows_projected,
+    decode_stored_v2_rows_projected_controlled, decode_stored_v2_rows_projected_no_seq,
+    decode_stored_v2_rows_projected_parallel, decode_stored_v2_rows_projected_parallel_no_seq,
+    StoredV2HydratedRow, StoredV2RowHydrationResult, StoredV2RowHydrationStats,
 };
 
 pub const STORED_DECODE_CHECK_INTERVAL: usize = 128;
@@ -258,6 +264,8 @@ enum ColCodec {
     TypedInt = 5,
     /// ZBS4: byte-identical twin of an earlier pass-1 column (#1038).
     CopyOf = 6,
+    /// ZBS4: a JSON fallback column as independent zstd row blocks.
+    RawJsonBlocks = 7,
 }
 
 impl ColCodec {
@@ -270,6 +278,7 @@ impl ColCodec {
             4 => Some(Self::Constant),
             5 => Some(Self::TypedInt),
             6 => Some(Self::CopyOf),
+            7 => Some(Self::RawJsonBlocks),
             _ => None,
         }
     }
@@ -792,6 +801,16 @@ fn encode_v2_columns(
         // (plus, on the merge path, the long-effort form) vs LZ4 over the
         // same bytes.
         let col_json = serde_json::to_vec(col).unwrap_or_default();
+        // Large non-integer JSON columns (passage text, packed vectors) as
+        // row blocks when the operator opted in: a page's rows then read one
+        // block each instead of the whole column.
+        if row_blocks_for_column(col_json.len()) && !col_is_all_integer(col) {
+            if let Some(payload) = encode_raw_json_blocks(col, level) {
+                col_payloads.push((cname.clone(), ColCodec::RawJsonBlocks as u8, payload));
+                used_v4_feature = true;
+                continue;
+            }
+        }
         let zstd_payload =
             zstd::encode_all(Cursor::new(&col_json), level).unwrap_or_else(|_| col_json.clone());
         let (zstd_payload, zstd_form) = if let Some(long_level) = long_effort_level {
@@ -1087,6 +1106,9 @@ pub fn stored_slices_retained_upper_bound(bytes: &[u8], expected_docs: u64) -> R
                     size
                 }
                 ColCodec::Lz4Json => lz4_uncompressed_size(column.payload, "lz4 json")?,
+                ColCodec::RawJsonBlocks => {
+                    RawBlocks::parse(column.payload, directory.num_docs)?.raw_len_sum()
+                }
                 ColCodec::Constant => {
                     (column.payload.len() as u64)
                         .checked_mul(rows)
@@ -1618,6 +1640,7 @@ fn decode_projected_column<'a>(
     let values = match column.codec {
         ColCodec::RawJson => decode_raw_json(column.payload)?,
         ColCodec::Lz4Json => decode_lz4_json(column.payload)?,
+        ColCodec::RawJsonBlocks => decode_raw_json_blocks(column.payload, directory.num_docs)?,
         ColCodec::Constant => decode_constant(column.payload, directory.num_docs)?,
         ColCodec::DictBitpack => decode_dict_bitpack(column.payload, directory.num_docs)?,
         ColCodec::TypedInt => decode_typed_int(column.payload, directory.num_docs)?,
@@ -1796,6 +1819,10 @@ fn decode_typed_vector_rows_controlled(
                 .map_err(|error| StorageError::Other(anyhow::anyhow!("lz4 decode: {error}")))?;
             parse_typed_vector_reader(raw.as_slice(), num_docs, column_index, checkpoint)
         }
+        ColCodec::RawJsonBlocks => {
+            let text = raw_json_blocks_text(column.payload, num_docs)?;
+            parse_typed_vector_reader(text.as_slice(), num_docs, column_index, checkpoint)
+        }
         _ => Ok(Ok(None)),
     }
 }
@@ -1875,6 +1902,10 @@ fn decode_typed_vector_chunk_rows_controlled(
             let raw = lz4_flex::decompress_size_prepended(column.payload)
                 .map_err(|error| StorageError::Other(anyhow::anyhow!("lz4 decode: {error}")))?;
             parse_typed_chunk_reader(raw.as_slice(), num_docs, column_index, checkpoint)
+        }
+        ColCodec::RawJsonBlocks => {
+            let text = raw_json_blocks_text(column.payload, num_docs)?;
+            parse_typed_chunk_reader(text.as_slice(), num_docs, column_index, checkpoint)
         }
         _ => Ok(Ok(None)),
     }
@@ -2417,6 +2448,7 @@ fn decode_stored_v2_filtered(
                 Ok(match codec {
                     ColCodec::RawJson => decode_raw_json(payload)?,
                     ColCodec::Lz4Json => decode_lz4_json(payload)?,
+                    ColCodec::RawJsonBlocks => decode_raw_json_blocks(payload, num_docs)?,
                     ColCodec::Constant => decode_constant(payload, num_docs)?,
                     ColCodec::DictBitpack => decode_dict_bitpack(payload, num_docs)?,
                     ColCodec::TypedInt => decode_typed_int(payload, num_docs)?,
@@ -3119,6 +3151,200 @@ fn decode_typed_int(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json::V
     Ok(rows)
 }
 
+/// Row-selective [`decode_typed_int`]: the values of `rows` (any order,
+/// repeats allowed), each identical to `decode_typed_int(payload,
+/// num_docs)[row]`, without materialising the column. A requested row's value
+/// index is its rank among the non-null rows (presence bitmap); a 128-value
+/// frame is unpacked only when it holds a requested value, every other frame is
+/// stepped over by its header (`[width][zigzag-varint min]`, then
+/// `128 * width / 8` payload bytes); the residual is the same zigzag delta
+/// chain from 0, read only up to the last requested value.
+///
+/// Why: the row-selective stored paths (`decode_stored_v2_rows*`, which the
+/// engine's cold top-k identity read and its deferred page hydration call)
+/// decoded a TYPED_INT column (`__seq_no` on every segment) whole, as one
+/// `serde_json::Value` per row: on the 10 GB benchmark index 70 ms for one row
+/// of a 1.17 M-row segment and 140 ms on a 2.2 M-row one, paid per segment per
+/// query. Taken when [`stored_row_select_enabled`].
+fn decode_typed_int_rows(
+    payload: &[u8],
+    num_docs: usize,
+    rows: &[usize],
+) -> Result<Vec<serde_json::Value>> {
+    use bitpacking::BitPacker;
+    if let Some(&row) = rows.iter().find(|&&row| row >= num_docs) {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "typed_int row {row} outside {num_docs} rows"
+        )));
+    }
+    let mut cur = Cursor::new(payload);
+    let has_nulls = cur
+        .read_u8()
+        .map_err(|e| StorageError::Other(anyhow::anyhow!("typed_int flags: {e}")))?
+        != 0;
+    let bitmap_len = if has_nulls { num_docs.div_ceil(8) } else { 0 };
+    let pos = cur.position() as usize;
+    let bitmap = payload
+        .get(pos..pos + bitmap_len)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("typed_int bitmap truncated")))?;
+    cur.set_position((pos + bitmap_len) as u64);
+    let is_set = |row: usize| -> bool { !has_nulls || (bitmap[row / 8] >> (row % 8) & 1) == 1 };
+    // non-null rows strictly before `row` (whole bytes, then the remaining bits)
+    let rank_before = |row: usize| -> usize {
+        if !has_nulls {
+            return row;
+        }
+        let whole = row / 8;
+        let mut n: usize = bitmap[..whole]
+            .iter()
+            .map(|b| b.count_ones() as usize)
+            .sum();
+        for r in whole * 8..row {
+            n += usize::from(is_set(r));
+        }
+        n
+    };
+    let value_count = rank_before(num_docs);
+
+    // (value index, output slot) of every requested non-null row, ascending
+    let mut wanted: Vec<(usize, usize)> = Vec::with_capacity(rows.len());
+    {
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_unstable_by_key(|&slot| rows[slot]);
+        let (mut at_row, mut rank) = (0usize, 0usize);
+        for slot in order {
+            let row = rows[slot];
+            if has_nulls {
+                // advance the running rank from `at_row` to `row`
+                while at_row < row && at_row % 8 != 0 {
+                    rank += usize::from(is_set(at_row));
+                    at_row += 1;
+                }
+                while at_row + 8 <= row {
+                    rank += bitmap[at_row / 8].count_ones() as usize;
+                    at_row += 8;
+                }
+                while at_row < row {
+                    rank += usize::from(is_set(at_row));
+                    at_row += 1;
+                }
+            } else {
+                rank = row;
+                at_row = row;
+            }
+            if is_set(row) {
+                wanted.push((rank, slot));
+            }
+        }
+    }
+    wanted.sort_unstable();
+    let mut out: Vec<serde_json::Value> = vec![serde_json::Value::Null; rows.len()];
+    let mut w = 0usize;
+    let full_blocks = value_count / TYPED_INT_BLOCK;
+    let mut block = 0usize;
+    while block < full_blocks && w < wanted.len() {
+        let width = cur
+            .read_u8()
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("typed_int width: {e}")))?;
+        if width > 32 {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "typed_int invalid width {width}"
+            )));
+        }
+        let min = zigzag_varint_decode(&mut cur)?;
+        let byte_len = TYPED_INT_BLOCK * width as usize / 8;
+        let start = cur.position() as usize;
+        let end = start
+            .checked_add(byte_len)
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| StorageError::Other(anyhow::anyhow!("typed_int block truncated")))?;
+        let first = block * TYPED_INT_BLOCK;
+        if wanted[w].0 < first + TYPED_INT_BLOCK {
+            let mut lanes = [0u32; TYPED_INT_BLOCK];
+            if width > 0 {
+                bitpacking::BitPacker4x::new().decompress(&payload[start..end], &mut lanes, width);
+            }
+            while w < wanted.len() && wanted[w].0 < first + TYPED_INT_BLOCK {
+                let (value_index, slot) = wanted[w];
+                let value = if width > 0 {
+                    min.wrapping_add(lanes[value_index - first] as i64)
+                } else {
+                    min
+                };
+                out[slot] = serde_json::Value::Number(value.into());
+                w += 1;
+            }
+        }
+        cur.set_position(end as u64);
+        block += 1;
+    }
+    if w < wanted.len() {
+        // step over the frames before the residual that hold no requested value
+        while block < full_blocks {
+            let width = cur
+                .read_u8()
+                .map_err(|e| StorageError::Other(anyhow::anyhow!("typed_int width: {e}")))?;
+            if width > 32 {
+                return Err(StorageError::Other(anyhow::anyhow!(
+                    "typed_int invalid width {width}"
+                )));
+            }
+            let _ = zigzag_varint_decode(&mut cur)?;
+            let end = (cur.position() as usize)
+                .checked_add(TYPED_INT_BLOCK * width as usize / 8)
+                .filter(|end| *end <= payload.len())
+                .ok_or_else(|| StorageError::Other(anyhow::anyhow!("typed_int block truncated")))?;
+            cur.set_position(end as u64);
+            block += 1;
+        }
+        let mut prev = 0i64;
+        let mut value_index = full_blocks * TYPED_INT_BLOCK;
+        while value_index < value_count && w < wanted.len() {
+            let delta = zigzag_varint_decode(&mut cur)?;
+            prev = prev.wrapping_add(delta);
+            while w < wanted.len() && wanted[w].0 == value_index {
+                out[wanted[w].1] = serde_json::Value::Number(prev.into());
+                w += 1;
+            }
+            value_index += 1;
+        }
+    }
+    if w < wanted.len() {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "typed_int ran out of values"
+        )));
+    }
+    Ok(out)
+}
+
+/// Whether the row-selective stored reads are cut to the selected rows
+/// (`XERJ_STORED_ROW_SELECT` = `1` / `true` / `on` / `yes`, read once): the
+/// row-selective decoders unpack a TYPED_INT column row by row
+/// ([`decode_typed_int_rows`]) instead of whole, and the engine's cold top-k
+/// reads, which never look at `_seq_no`, call the `*_no_seq` decoders. Off by
+/// default; every value read is the same either way.
+pub fn stored_row_select_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TYPED_INT_ROWS_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XERJ_STORED_ROW_SELECT").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TYPED_INT_ROWS_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Zigzag-encode a signed value as a LEB128 varint (shared by TYPED_INT's
 /// frame minimums and residual deltas).
 fn zigzag_varint_encode(v: i64, out: &mut Vec<u8>) {
@@ -3559,6 +3785,294 @@ fn decode_raw_payload(payload: &[u8]) -> Result<&[u8]> {
     } else {
         Ok(payload)
     }
+}
+
+// ── Row blocks (codec 7, `RAW_JSON_BLOCKS`, ZBS4) ─────────────────────────────
+//
+// A `RAW_JSON` column is one zstd frame over the whole JSON array, so reading
+// one row of it decompresses (and brace-walks) the entire column. On a merged
+// 10 GB autoindex segment that is hundreds of MB of passage text and packed
+// vectors per segment a page touches: the cold row hydration of a 25-hit page
+// spent tens of seconds there. A `RAW_JSON_BLOCKS` column is the same JSON
+// text cut at row boundaries into independent zstd frames of about
+// `RAW_BLOCK_TARGET_BYTES` each, so a row costs one block (the shape of
+// Lucene's compressed stored-fields blocks):
+//
+// ```text
+// u32 num_blocks
+// num_blocks × (u32 first_row, u32 frame_len, u32 raw_len)
+// the frames, in block order; frame i decodes to exactly raw_len bytes: the
+// JSON array of rows [first_row_i, first_row_{i+1}) (the last block ends at
+// the section's num_docs)
+// ```
+//
+// Opt-in: the writer emits it only with `XERJ_STORED_ROW_BLOCKS=1` (an older
+// build refuses a segment holding codec 7 with "v2 unknown codec 7", so the
+// on-disk change waits for the owner's call on the default). Every reader of
+// this build decodes it.
+
+/// JSON text per block before compression.
+const RAW_BLOCK_TARGET_BYTES: usize = 64 * 1024;
+/// A column below this stays one `RAW_JSON` frame: whole, it costs about what
+/// a few blocks cost.
+const RAW_BLOCK_MIN_COLUMN_BYTES: usize = 4 * RAW_BLOCK_TARGET_BYTES;
+const RAW_BLOCK_ENTRY_BYTES: usize = 12;
+
+/// Whether this process writes `RAW_JSON_BLOCKS` columns
+/// (`XERJ_STORED_ROW_BLOCKS` = `1` / `true` / `on` / `yes`, read once).
+pub fn stored_row_blocks_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XERJ_STORED_ROW_BLOCKS").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROW_BLOCKS_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn row_blocks_for_column(json_len: usize) -> bool {
+    if json_len < RAW_BLOCK_MIN_COLUMN_BYTES {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(on) = ROW_BLOCKS_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return on;
+    }
+    stored_row_blocks_enabled()
+}
+
+type RawBlockOut = (u32, Vec<u8>, u32);
+
+fn close_raw_block(
+    text: &mut Vec<u8>,
+    first_row: usize,
+    level: i32,
+    blocks: &mut Vec<RawBlockOut>,
+) -> Option<()> {
+    text.push(b']');
+    let raw_len = u32::try_from(text.len()).ok()?;
+    let frame = zstd::bulk::compress(text, level).ok()?;
+    blocks.push((u32::try_from(first_row).ok()?, frame, raw_len));
+    text.clear();
+    Some(())
+}
+
+/// Encode a JSON fallback column as `RAW_JSON_BLOCKS`. Block `i` holds the
+/// compact JSON array of its rows, byte-identical to that slice of
+/// `serde_json::to_vec(col)`. `None` (empty column, a value that does not
+/// serialise, an over-long block) keeps the caller on `RAW_JSON`.
+fn encode_raw_json_blocks<B: std::borrow::Borrow<serde_json::Value>>(
+    col: &[B],
+    level: i32,
+) -> Option<Vec<u8>> {
+    if col.is_empty() || u32::try_from(col.len()).is_err() {
+        return None;
+    }
+    let mut blocks: Vec<RawBlockOut> = Vec::new();
+    let mut text: Vec<u8> = Vec::with_capacity(RAW_BLOCK_TARGET_BYTES * 2);
+    let mut first_row = 0usize;
+    for (row, value) in col.iter().enumerate() {
+        text.push(if row == first_row { b'[' } else { b',' });
+        serde_json::to_writer(&mut text, value.borrow()).ok()?;
+        if text.len() >= RAW_BLOCK_TARGET_BYTES {
+            close_raw_block(&mut text, first_row, level, &mut blocks)?;
+            first_row = row + 1;
+        }
+    }
+    if first_row < col.len() {
+        close_raw_block(&mut text, first_row, level, &mut blocks)?;
+    }
+    let frames_len: usize = blocks.iter().map(|(_, frame, _)| frame.len()).sum();
+    let mut out = Vec::with_capacity(4 + blocks.len() * RAW_BLOCK_ENTRY_BYTES + frames_len);
+    out.write_u32::<LittleEndian>(u32::try_from(blocks.len()).ok()?)
+        .ok()?;
+    for (first, frame, raw_len) in &blocks {
+        out.write_u32::<LittleEndian>(*first).ok()?;
+        out.write_u32::<LittleEndian>(u32::try_from(frame.len()).ok()?)
+            .ok()?;
+        out.write_u32::<LittleEndian>(*raw_len).ok()?;
+    }
+    for (_, frame, _) in &blocks {
+        out.extend_from_slice(frame);
+    }
+    Some(out)
+}
+
+/// A validated `RAW_JSON_BLOCKS` block table over a column payload.
+pub(crate) struct RawBlocks<'a> {
+    num_docs: usize,
+    first_rows: Vec<usize>,
+    frames: Vec<(&'a [u8], usize)>,
+}
+
+impl<'a> RawBlocks<'a> {
+    /// Validate the table: blocks start at row 0, strictly increase, stay
+    /// inside `num_docs`, and their frames tile the payload exactly.
+    pub(crate) fn parse(payload: &'a [u8], num_docs: usize) -> Result<Self> {
+        let invalid = |what: &str| StorageError::Other(anyhow::anyhow!("raw json blocks: {what}"));
+        let count = payload
+            .get(..4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+            .ok_or_else(|| invalid("truncated block count"))?;
+        let table_end = count
+            .checked_mul(RAW_BLOCK_ENTRY_BYTES)
+            .and_then(|bytes| bytes.checked_add(4))
+            .filter(|end| *end <= payload.len())
+            .ok_or_else(|| invalid("block table exceeds the payload"))?;
+        if (count == 0) != (num_docs == 0) {
+            return Err(invalid("block count does not match the row count"));
+        }
+        let mut first_rows = Vec::with_capacity(count);
+        let mut frames = Vec::with_capacity(count);
+        let mut offset = table_end;
+        for block in 0..count {
+            let at = 4 + block * RAW_BLOCK_ENTRY_BYTES;
+            let field = |i: usize| {
+                u32::from_le_bytes(payload[at + 4 * i..at + 4 * i + 4].try_into().unwrap()) as usize
+            };
+            let (first_row, frame_len, raw_len) = (field(0), field(1), field(2));
+            let ordered = match block {
+                0 => first_row == 0,
+                _ => first_row > first_rows[block - 1],
+            };
+            if !ordered || first_row >= num_docs {
+                return Err(invalid("block first rows must start at 0 and increase"));
+            }
+            let end = offset
+                .checked_add(frame_len)
+                .filter(|end| *end <= payload.len())
+                .ok_or_else(|| invalid("frame exceeds the payload"))?;
+            first_rows.push(first_row);
+            frames.push((&payload[offset..end], raw_len));
+            offset = end;
+        }
+        if offset != payload.len() {
+            return Err(invalid("trailing bytes after the frames"));
+        }
+        Ok(Self {
+            num_docs,
+            first_rows,
+            frames,
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.first_rows.len()
+    }
+
+    /// Rows of block `block`.
+    pub(crate) fn rows(&self, block: usize) -> std::ops::Range<usize> {
+        let end = self
+            .first_rows
+            .get(block + 1)
+            .copied()
+            .unwrap_or(self.num_docs);
+        self.first_rows[block]..end
+    }
+
+    /// Upper bound of the column's JSON text (each block's own brackets
+    /// included).
+    pub(crate) fn raw_len_sum(&self) -> u64 {
+        self.frames.iter().map(|(_, raw_len)| *raw_len as u64).sum()
+    }
+
+    /// One block's JSON array text, size-checked against the table.
+    pub(crate) fn decode(&self, block: usize) -> Result<Vec<u8>> {
+        let (frame, raw_len) = self.frames[block];
+        let raw = decode_zstd_exact(frame, raw_len, "raw json block")?;
+        if raw.len() < 2 || raw[0] != b'[' || raw[raw.len() - 1] != b']' {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "raw json block {block} is not a JSON array"
+            )));
+        }
+        Ok(raw)
+    }
+
+    fn values(&self, block: usize) -> Result<Vec<serde_json::Value>> {
+        let raw = self.decode(block)?;
+        let values: Vec<serde_json::Value> = serde_json::from_slice(&raw).map_err(|error| {
+            StorageError::Other(anyhow::anyhow!("raw json block {block}: {error}"))
+        })?;
+        let rows = self.rows(block).len();
+        if values.len() != rows {
+            return Err(StorageError::Other(anyhow::anyhow!(
+                "raw json block {block} holds {} rows, its table entry {rows}",
+                values.len()
+            )));
+        }
+        Ok(values)
+    }
+}
+
+/// Every value of a `RAW_JSON_BLOCKS` column, in row order.
+fn decode_raw_json_blocks(payload: &[u8], num_docs: usize) -> Result<Vec<serde_json::Value>> {
+    let blocks = RawBlocks::parse(payload, num_docs)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(num_docs).map_err(|error| {
+        StorageError::Other(anyhow::anyhow!(
+            "cannot reserve {num_docs} block rows: {error}"
+        ))
+    })?;
+    for block in 0..blocks.len() {
+        out.extend(blocks.values(block)?);
+    }
+    Ok(out)
+}
+
+/// The JSON array text one `RAW_JSON` frame of the same column decodes to,
+/// for the streaming parsers that read a whole column.
+fn raw_json_blocks_text(payload: &[u8], num_docs: usize) -> Result<Vec<u8>> {
+    let blocks = RawBlocks::parse(payload, num_docs)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(
+        usize::try_from(blocks.raw_len_sum())
+            .unwrap_or(0)
+            .min(ZSTD_PRESIZE_CAP as usize),
+    )
+    .map_err(|error| StorageError::Other(anyhow::anyhow!("raw json blocks text: {error}")))?;
+    out.push(b'[');
+    for block in 0..blocks.len() {
+        let raw = blocks.decode(block)?;
+        let inner = &raw[1..raw.len() - 1];
+        if inner.is_empty() {
+            continue;
+        }
+        if out.len() > 1 {
+            out.push(b',');
+        }
+        out.extend_from_slice(inner);
+    }
+    out.push(b']');
+    Ok(out)
+}
+
+/// Whether a stored section holds a `RAW_JSON_BLOCKS` column, i.e. reads a
+/// row without decompressing whole columns. `false` for anything that does
+/// not parse as a columnar section.
+pub fn stored_v2_has_row_blocks(bytes: &[u8]) -> bool {
+    let bytes = if bytes.len() >= 4 && &bytes[..4] == STORED_V3_MAGIC {
+        match split_stored_v3(bytes) {
+            Ok(parts) => parts.1,
+            Err(_) => return false,
+        }
+    } else {
+        bytes
+    };
+    is_columnar_stored_magic(bytes)
+        && parse_v2_directory(&bytes[4..]).is_ok_and(|directory| {
+            directory
+                .columns
+                .iter()
+                .any(|column| column.codec == ColCodec::RawJsonBlocks)
+        })
 }
 
 fn decode_lz4_json(payload: &[u8]) -> Result<Vec<serde_json::Value>> {
@@ -5347,6 +5861,177 @@ mod tests {
         }
     }
 
+    /// `decode_typed_int_rows` (`XERJ_STORED_ROW_SELECT`): for any rows,
+    /// in any order and with repeats, exactly the full decode's values - columns
+    /// with and without nulls, shorter than / exactly / longer than whole
+    /// 128-value frames, monotone (`__seq_no`-like), spread and constant
+    /// (width-0) frames, i64-extreme clusters; a row past the column is an
+    /// error, not a panic.
+    #[test]
+    fn typed_int_rows_equal_the_full_decode() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut columns: Vec<Vec<serde_json::Value>> = Vec::new();
+        for &n in &[
+            1usize, 5, 127, 128, 129, 255, 256, 300, 1_000, 4_096, 10_007,
+        ] {
+            for nulls in [0u64, 3, 50] {
+                for kind in 0..3 {
+                    columns.push(
+                        (0..n)
+                            .map(|i| {
+                                if nulls > 0 && next() % 100 < nulls {
+                                    return serde_json::Value::Null;
+                                }
+                                let v: i64 = match kind {
+                                    0 => (i as i64) * 7 - 1_000,
+                                    1 => (next() % 2_000_000_000) as i64 - 1_000_000_000,
+                                    _ => 42,
+                                };
+                                serde_json::Value::Number(v.into())
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+        for cluster in [
+            (i64::MAX - 300..=i64::MAX).collect::<Vec<_>>(),
+            (i64::MIN..=i64::MIN + 300).collect::<Vec<_>>(),
+        ] {
+            columns.push(
+                cluster
+                    .into_iter()
+                    .map(|n| serde_json::Value::Number(n.into()))
+                    .collect(),
+            );
+        }
+        let mut checked = 0usize;
+        for values in &columns {
+            let n = values.len();
+            let borrowed: Vec<&serde_json::Value> = values.iter().collect();
+            let Some(payload) = encode_typed_int(&borrowed) else {
+                continue;
+            };
+            let full = decode_typed_int(&payload, n).unwrap();
+            assert_eq!(&full, values);
+            for _ in 0..16 {
+                let k = 1 + (next() % 12) as usize;
+                let rows: Vec<usize> = (0..k).map(|_| (next() % n as u64) as usize).collect();
+                let want: Vec<serde_json::Value> = rows.iter().map(|&r| full[r].clone()).collect();
+                assert_eq!(
+                    decode_typed_int_rows(&payload, n, &rows).unwrap(),
+                    want,
+                    "{n} rows: {rows:?}"
+                );
+                checked += 1;
+            }
+            let all: Vec<usize> = (0..n).rev().collect();
+            let want: Vec<serde_json::Value> = all.iter().map(|&r| full[r].clone()).collect();
+            assert_eq!(decode_typed_int_rows(&payload, n, &all).unwrap(), want);
+            assert!(decode_typed_int_rows(&payload, n, &[n]).is_err());
+        }
+        assert!(checked > 1_000, "{checked} selections checked");
+    }
+
+    /// Through the row-selective entry points: with the switch, identity-only
+    /// and full row hydration of a stored section whose `__seq_no` and an
+    /// integer `_source` field are TYPED_INT return the same rows as without
+    /// it, and visit only the selected rows of those columns (fail-before:
+    /// without the switch every row of each TYPED_INT column is visited).
+    #[test]
+    fn typed_int_row_select_keeps_the_hydrated_rows() {
+        let docs: Vec<serde_json::Value> = (0..3_000u64)
+            .map(|i| {
+                json!({
+                    "_id": format!("t-{i}"),
+                    "_seq_no": i * 3 + 7,
+                    "_source": { "n": (i as i64) * 5 - 999, "s": format!("v{i}") }
+                })
+            })
+            .collect();
+        let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
+        let rows = [2_999usize, 0, 1, 127, 128, 129, 1_500, 1_500];
+        let run = |on: bool| {
+            TYPED_INT_ROWS_TEST_OVERRIDE.with(|c| c.set(Some(on)));
+            let ids = decode_stored_v2_rows_projected(&encoded, &rows, &[]).unwrap();
+            let full = decode_stored_v2_rows(&encoded, &rows).unwrap();
+            TYPED_INT_ROWS_TEST_OVERRIDE.with(|c| c.set(None));
+            (ids, full)
+        };
+        let unpack = |r: StoredV2RowHydrationResult| match r {
+            StoredV2RowHydrationResult::Hydrated { rows, stats } => (rows, stats),
+            other => panic!("rows must hydrate: {other:?}"),
+        };
+        let (off_ids, off_full) = run(false);
+        let (on_ids, on_full) = run(true);
+        let (off_ids, off_ids_stats) = unpack(off_ids);
+        let (on_ids, on_ids_stats) = unpack(on_ids);
+        let (off_full, _) = unpack(off_full);
+        let (on_full, _) = unpack(on_full);
+        assert_eq!(on_ids, off_ids);
+        assert_eq!(on_full, off_full);
+        assert_eq!(on_full.len(), 7, "deduplicated, ascending");
+        assert_eq!(on_full[0].seq_no.as_u64(), Some(7));
+        assert_eq!(on_full[6].seq_no.as_u64(), Some(2_999 * 3 + 7));
+        assert_eq!(on_full[6].source["n"].as_i64(), Some(2_999 * 5 - 999));
+        assert!(
+            on_ids_stats.encoded_rows_visited < off_ids_stats.encoded_rows_visited,
+            "the switch visits only the selected rows of the TYPED_INT columns \
+             ({} vs {})",
+            on_ids_stats.encoded_rows_visited,
+            off_ids_stats.encoded_rows_visited
+        );
+    }
+
+    /// The `*_no_seq` row readers (the engine's cold identity and page reads
+    /// under `XERJ_STORED_ROW_SELECT`) over a section the writer encoded: the
+    /// same ordinals, `_id`s and sources as the regular readers, `seq_no` left
+    /// null (the visited-row count is checked on a RAW_JSON `__seq_no` in
+    /// `row_hydration`'s tests).
+    #[test]
+    fn row_reads_without_seq_keep_ids_and_sources() {
+        let docs: Vec<serde_json::Value> = (0..2_000u64)
+            .map(|i| {
+                json!({
+                    "_id": format!("q-{i}"),
+                    "_seq_no": i * 2 + 1,
+                    "_source": { "s": format!("text {i}"), "k": (i % 7) as i64 }
+                })
+            })
+            .collect();
+        let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
+        let rows = [1_999usize, 3, 640, 640, 0];
+        let unpack = |r: StoredV2RowHydrationResult| match r {
+            StoredV2RowHydrationResult::Hydrated { rows, stats } => (rows, stats),
+            other => panic!("rows must hydrate: {other:?}"),
+        };
+        for fields in [None, Some(&[][..]), Some(&["s"][..])] {
+            let (with, with_stats) = unpack(match fields {
+                Some(f) => decode_stored_v2_rows_projected(&encoded, &rows, f).unwrap(),
+                None => decode_stored_v2_rows(&encoded, &rows).unwrap(),
+            });
+            let (without, without_stats) = unpack(match fields {
+                Some(f) => decode_stored_v2_rows_projected_no_seq(&encoded, &rows, f).unwrap(),
+                None => {
+                    decode_stored_v2_rows_projected_parallel_no_seq(&encoded, &rows, None).unwrap()
+                }
+            });
+            assert_eq!(with.len(), without.len());
+            for (a, b) in with.iter().zip(&without) {
+                assert_eq!((a.ordinal, &a.id, &a.source), (b.ordinal, &b.id, &b.source));
+                assert!(b.seq_no.is_null(), "no seq_no read");
+                assert_eq!(a.seq_no.as_u64(), Some(a.ordinal as u64 * 2 + 1));
+            }
+            assert!(without_stats.encoded_rows_visited <= with_stats.encoded_rows_visited);
+        }
+    }
+
     /// A spread wider than the u32 lanes must refuse to encode (the JSON
     /// fallback keeps the column lossless).
     #[test]
@@ -5967,5 +6652,192 @@ mod tests {
         let mid = corrupt.len() / 2;
         corrupt.truncate(mid);
         assert!(zstd_decode_presized(&corrupt).is_err());
+    }
+}
+
+/// `RAW_JSON_BLOCKS` (codec 7): a blocked section decodes exactly like the
+/// single-frame section of the same documents, on every read path, and a
+/// row read decompresses only its blocks.
+#[cfg(test)]
+mod row_block_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn with_row_blocks<T>(on: bool, f: impl FnOnce() -> T) -> T {
+        ROW_BLOCKS_TEST_OVERRIDE.with(|cell| cell.set(Some(on)));
+        let out = f();
+        ROW_BLOCKS_TEST_OVERRIDE.with(|cell| cell.set(None));
+        out
+    }
+
+    /// Passage-shaped documents: unique ids and texts (past the dictionary
+    /// cardinality), a short keyword, an optional field, and a small vector.
+    fn passages(n: usize) -> Vec<u8> {
+        let docs: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                let text = format!(
+                    "Passage {i} about topic {} with words alpha beta gamma {} and the year {}",
+                    i % 97,
+                    (i * 31) % 1009,
+                    1900 + i % 120
+                );
+                let mut source = json!({
+                    "id": format!("{}#{}", i / 3, i % 3),
+                    "text": text,
+                    "kind": if i % 2 == 0 { "a" } else { "b" },
+                    "embedding": [(i % 13) as f32 * 0.25, 1.5, -(i as f32) / 7.0, 0.125],
+                });
+                if i % 5 == 0 {
+                    source["note"] = json!({ "nested": [i, "x"] });
+                }
+                json!({ "_id": format!("doc-{i}"), "_seq_no": i as u64, "_source": source })
+            })
+            .collect();
+        serde_json::to_vec(&docs).unwrap()
+    }
+
+    fn hydrated(
+        result: StoredV2RowHydrationResult,
+    ) -> (Vec<StoredV2HydratedRow>, StoredV2RowHydrationStats) {
+        match result {
+            StoredV2RowHydrationResult::Hydrated { rows, stats } => (rows, stats),
+            other => panic!("expected hydrated rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocked_sections_read_like_single_frame_sections() {
+        const N: usize = 20_000;
+        let json = passages(N);
+        let plain = with_row_blocks(false, || encode_stored_v2(&json));
+        let blocked = with_row_blocks(true, || encode_stored_v2(&json));
+        assert!(!stored_v2_has_row_blocks(&plain));
+        assert!(
+            stored_v2_has_row_blocks(&blocked),
+            "large JSON columns are row-blocked"
+        );
+        assert_eq!(&blocked[..4], STORED_V4_MAGIC);
+
+        // Whole-section decode: byte-identical canonical JSON.
+        assert_eq!(
+            decode_stored(&blocked).unwrap(),
+            decode_stored(&plain).unwrap()
+        );
+        assert_eq!(
+            decode_stored_v2_ids(&blocked).unwrap(),
+            decode_stored_v2_ids(&plain).unwrap()
+        );
+        // The cache-admission estimate accepts the blocked layout (a plain
+        // RAW_JSON frame written by `encode_all` carries no content size, so
+        // both sections may answer `None`; the blocked columns add their
+        // table's raw sizes).
+        assert_eq!(
+            stored_slices_retained_upper_bound(&blocked, N as u64)
+                .unwrap()
+                .is_some(),
+            stored_slices_retained_upper_bound(&plain, N as u64)
+                .unwrap()
+                .is_some()
+        );
+
+        // Row-selective decode, unordered and repeated ordinals included.
+        let rows = [19_999usize, 0, 1, 147, 148, 149, 10_000, 1, 19_998];
+        assert_eq!(
+            hydrated(decode_stored_v2_rows(&blocked, &rows).unwrap()).0,
+            hydrated(decode_stored_v2_rows(&plain, &rows).unwrap()).0
+        );
+        // The in-memory (parallel) path counts the bytes it decompresses: a
+        // single-frame column decompresses whole, a blocked one only the
+        // blocks holding a selected row.
+        let (plain_rows, plain_stats) =
+            hydrated(decode_stored_v2_rows_projected_parallel(&plain, &rows, None).unwrap());
+        let (blocked_rows, blocked_stats) =
+            hydrated(decode_stored_v2_rows_projected_parallel(&blocked, &rows, None).unwrap());
+        assert_eq!(blocked_rows, plain_rows);
+        assert!(
+            blocked_stats.decompressed_buffer_bytes * 2 < plain_stats.decompressed_buffer_bytes,
+            "blocked {} vs whole columns {}",
+            blocked_stats.decompressed_buffer_bytes,
+            plain_stats.decompressed_buffer_bytes
+        );
+        for include in [
+            vec!["text"],
+            vec![],
+            vec!["kind", "id"],
+            vec!["note", "embedding"],
+        ] {
+            assert_eq!(
+                hydrated(decode_stored_v2_rows_projected(&blocked, &rows, &include).unwrap()).0,
+                hydrated(decode_stored_v2_rows_projected(&plain, &rows, &include).unwrap()).0,
+                "projection {include:?}"
+            );
+        }
+
+        // Column projection and the typed kNN projection read whole blocked columns.
+        match (
+            decode_stored_v2_projection(&blocked, &["text", "embedding"]).unwrap(),
+            decode_stored_v2_projection(&plain, &["text", "embedding"]).unwrap(),
+        ) {
+            (StoredV2ProjectionResult::Projected(b), StoredV2ProjectionResult::Projected(p)) => {
+                assert_eq!(b.num_docs, p.num_docs);
+                assert_eq!(b.columns, p.columns);
+            }
+            other => panic!("expected projections, got {other:?}"),
+        }
+        assert_eq!(
+            decode_stored_v2_knn_projection(&blocked, "embedding", None).unwrap(),
+            decode_stored_v2_knn_projection(&plain, "embedding", None).unwrap()
+        );
+    }
+
+    #[test]
+    fn small_columns_and_the_default_stay_single_frame() {
+        let json = passages(300);
+        let blocked = with_row_blocks(true, || encode_stored_v2(&json));
+        assert!(
+            !stored_v2_has_row_blocks(&blocked),
+            "columns under the size floor stay RAW_JSON"
+        );
+        // The process default (no XERJ_STORED_ROW_BLOCKS in the test env) writes no blocks.
+        if std::env::var_os("XERJ_STORED_ROW_BLOCKS").is_none() {
+            assert!(!stored_v2_has_row_blocks(&encode_stored_v2(&passages(
+                20_000
+            ))));
+        }
+    }
+
+    #[test]
+    fn block_tables_are_validated() {
+        let values: Vec<serde_json::Value> =
+            (0..1_000).map(|i| json!(format!("value {i}"))).collect();
+        let payload = encode_raw_json_blocks(&values, STORED_ZSTD_LEVEL).unwrap();
+        assert_eq!(decode_raw_json_blocks(&payload, 1_000).unwrap(), values);
+        let text = raw_json_blocks_text(&payload, 1_000).unwrap();
+        assert_eq!(text, serde_json::to_vec(&values).unwrap());
+        // Wrong row count, truncation, trailing bytes, a first row that is not 0.
+        assert!(decode_raw_json_blocks(&payload, 999).is_err());
+        assert!(decode_raw_json_blocks(&payload, 1_001).is_err());
+        assert!(RawBlocks::parse(&payload[..payload.len() - 1], 1_000).is_err());
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert!(RawBlocks::parse(&trailing, 1_000).is_err());
+        let mut shifted = payload.clone();
+        shifted[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert!(RawBlocks::parse(&shifted, 1_000).is_err());
+        assert!(RawBlocks::parse(&[], 1_000).is_err());
+        // A section naming codec 7 with a corrupt table fails closed.
+        let section = {
+            let mut out = Vec::new();
+            out.extend_from_slice(STORED_V4_MAGIC);
+            out.write_u32::<LittleEndian>(1_000).unwrap();
+            out.write_u32::<LittleEndian>(1).unwrap();
+            out.write_u16::<LittleEndian>(4).unwrap();
+            out.extend_from_slice(b"__id");
+            out.push(ColCodec::RawJsonBlocks as u8);
+            out.write_u32::<LittleEndian>(shifted.len() as u32).unwrap();
+            out.extend_from_slice(&shifted);
+            out
+        };
+        assert!(decode_stored(&section).is_err());
     }
 }

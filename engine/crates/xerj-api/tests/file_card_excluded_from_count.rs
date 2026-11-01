@@ -115,3 +115,67 @@ async fn bare_count_skips_file_cards_and_a_term_query_still_sees_them() {
         "the card stays in the index: {search}"
     );
 }
+
+/// `_stats.search.query_total` of one index: every `Index::search` call, a
+/// result-cache hit included, adds one.
+async fn query_total(app: &axum::Router, index: &str) -> u64 {
+    let (status, stats) = json_req(app, "GET", &format!("/{index}/_stats"), Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{stats}");
+    stats
+        .pointer("/_all/primaries/search/query_total")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("no query_total in {stats}"))
+}
+
+/// An index whose mapping has no `ax_locator` field cannot hold a file card,
+/// so a bare `_count` and `_cat/indices` answer from the stat count without
+/// running a search. On an unmapped field the card query is answered by the
+/// stored-document scan, which decodes every document of every segment, and
+/// the result cache is invalidated by every write: a monitor polling
+/// `_cat/indices` during a bulk load paid one whole-corpus scan per poll.
+#[tokio::test]
+async fn an_index_without_ax_locator_counts_without_a_search() {
+    let (app, _dir) = app().await;
+    let (status, body) = json_req(
+        &app,
+        "PUT",
+        "/plain",
+        json!({
+            "mappings": { "properties": {
+                "id": { "type": "keyword" },
+                "text": { "type": "text" }
+            }}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create index: {body}");
+    for i in 0..3 {
+        let (status, body) = json_req(
+            &app,
+            "PUT",
+            &format!("/plain/_doc/p{i}"),
+            json!({"id": format!("p{i}"), "text": "a passage"}),
+        )
+        .await;
+        assert!(status.is_success(), "index p{i}: {status} {body}");
+    }
+    let (status, body) = json_req(&app, "POST", "/plain/_refresh", json!({})).await;
+    assert!(status.is_success(), "refresh: {status} {body}");
+
+    let before = query_total(&app, "plain").await;
+    let (status, count) = json_req(&app, "GET", "/plain/_count", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{count}");
+    assert_eq!(count["count"].as_u64(), Some(3), "{count}");
+    let (status, cat) = json_req(&app, "GET", "/_cat/indices/plain?format=json", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{cat}");
+    assert_eq!(
+        cat.pointer("/0/docs.count").and_then(Value::as_str),
+        Some("3"),
+        "{cat}"
+    );
+    assert_eq!(
+        query_total(&app, "plain").await,
+        before,
+        "a bare _count and _cat/indices on an index without ax_locator must not run a search"
+    );
+}

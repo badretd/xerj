@@ -44,6 +44,7 @@
 //! | `xerj_corpus_feedback` | `POST /api/corpus-feedback` (hub.xerj.org) | rate a hub corpus after using it (its Agent score); sends by default; `xerj_hub_ask` / `xerj_hub_def` also send an automatic review |
 //! | `xerj_map`             | `POST /autoindex-catalog/_search`     | per-index field map from the autoindex catalog (#1055) |
 //! | `xerj_hub_find` / `xerj_hub_def` / `xerj_hub_ask` | the `xerj ask` flow (`src/hub.rs`) | which hub corpus answers; one definition; one question — from local packs, never downloading |
+//! | `xerj_facts_ask` (feature `facts`, off by default) | `POST /_facts/{ns}/_ask` | read-only question over a facts namespace: exact executor over stored facts, cited evidence |
 //!
 //! ## Honesty notes (must match the engine, never oversell)
 //!
@@ -923,6 +924,20 @@ pub fn tool_specs() -> Value {
 /// [`tool_specs`] with the hub tools forced in or out. Tests use this so they
 /// do not have to mutate `XERJ_HUB_PUBKEY`, which is process-global.
 pub fn tool_specs_with(include_hub: bool) -> Value {
+    tool_specs_full(include_hub, facts_tools_served())
+}
+
+/// Whether this build serves `xerj_facts_ask`: only with the cargo feature
+/// `facts`, which the engine's own `facts` feature (the `/_facts` routes) turns
+/// on. Off in the default build, whose tool list is the published schema.
+fn facts_tools_served() -> bool {
+    cfg!(feature = "facts")
+}
+
+/// [`tool_specs_with`] with the facts tool forced in or out as well. The
+/// published schema (`landing/docs/agents/schemas/mcp-tools.json`) is the
+/// default build's list, `tool_specs_full(true, false)`.
+pub fn tool_specs_full(include_hub: bool, include_facts: bool) -> Value {
     let mut specs = json!([
         def::spec(),
         batch::spec(),
@@ -1633,12 +1648,82 @@ pub fn tool_specs_with(include_hub: bool) -> Value {
             }
         }
     ]);
+    if include_facts {
+        if let Value::Array(tools) = &mut specs {
+            tools.push(facts_ask_spec());
+        }
+    }
     if include_hub {
         if let Value::Array(tools) = &mut specs {
             tools.extend(hub::specs());
         }
     }
     specs
+}
+
+/// `xerj_facts_ask`: a thin, read-only proxy of `POST /_facts/{namespace}/_ask`
+/// (design §5.5). The description states what the answer is built from and
+/// what an UNKNOWN does and does not mean, and promises nothing about accuracy.
+fn facts_ask_spec() -> Value {
+    json!({
+        "name": "xerj_facts_ask",
+        "description":
+            "Ask a question of a facts namespace and get an answer computed only from \
+             the facts stored in it. Proxies POST /_facts/{namespace}/_ask, which is \
+             read-only. A small learned compiler (the model the node was started with) \
+             turns the question into a short program (LOOKUP, CHAIN, comparisons); an \
+             exact executor runs it over the namespace's records at one revision, and a \
+             deterministic rule checks the cited records. The result carries `status` \
+             (ANSWER, CONFLICT or UNKNOWN), `answer`, the cited `evidence` (fact id, \
+             subject, relation, value, quote and source document), the `program` and \
+             the `snapshot` revision. UNKNOWN means no active fact answered the question \
+             in this namespace at this revision: it is not proof that the fact is false. \
+             Operational problems are HTTP errors, never an UNKNOWN, and come back \
+             verbatim: 503 ENRICHMENT_PENDING (the namespace is being rebuilt; retry), \
+             503 MODEL_UNAVAILABLE (the node has no usable model; retrying will not \
+             help), 504 ASK_DEADLINE, 429 ASK_QUEUE_FULL (the node is answering as many \
+             questions as it allows; retry after a moment), 409 REVISION_NOT_COMMITTED, \
+             403 (this key cannot read the namespace). Needs a node built with the facts \
+             store and started with a model directory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "The facts namespace: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit."
+                },
+                "question": {
+                    "type": "string",
+                    "description": "The question in plain words, naming the subject the way the stored facts do, e.g. 'Who is the head of government of Liberia?'."
+                },
+                "revision": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Answer as of this committed revision of the namespace (default: the latest)."
+                },
+                "explain": {
+                    "type": "boolean",
+                    "description": "Also return the candidate records and the hop reads the compiler saw."
+                },
+                "linker": {
+                    "type": "string",
+                    "enum": ["exact", "tolerant", "tolerant_words"],
+                    "description": "How names in the question are matched to stored subjects: `exact` (default), or the typo-tolerant `tolerant` / `tolerant_words`, which report the rewrite they made."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Give up after this many milliseconds (504 ASK_DEADLINE). It can only shorten the node's own deadline."
+                },
+                "wait_for_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "How long to wait for a namespace that is being rebuilt before the node answers 503 ENRICHMENT_PENDING (default: as long as it takes)."
+                }
+            },
+            "required": ["namespace", "question"]
+        }
+    })
 }
 
 /// `xerj_field_report`. With `confirm: false` this returns the draft and
@@ -2137,6 +2222,18 @@ async fn call_tool(ctx: &Ctx, msg: &Value) -> Value {
         "xerj_brain_overview" => build_brain_overview(&args),
         // #1056: prompt in, validated DSL out — a plain engine proxy.
         "xerj_plan" => build_plan(&args),
+        // Feature `facts`: a read-only question over a facts namespace. Hidden from
+        // tools/list otherwise; a client calling it anyway hears why.
+        "xerj_facts_ask" => {
+            if !facts_tools_served() {
+                return tool_text(
+                    "xerj_facts_ask is not served by this build: it needs the facts store \
+                     (an engine built with the `facts` feature)",
+                    true,
+                );
+            }
+            build_facts_ask(&args)
+        }
         // Posts to the web endpoint, not the node. `ctx` is unused on purpose:
         // the node's Authorization header must not leave the machine.
         "xerj_field_report" => return call_field_report(&args).await,
@@ -2292,6 +2389,7 @@ fn string_field_hint(key: &str) -> &'static str {
         "namespace" => "Pass the memory namespace, for example {\"namespace\": \"agent\"}.",
         "brain" => "Pass the brain name printed by `xerj brain <folder>`.",
         "prompt" => "Pass the question, for example {\"prompt\": \"where is the parser?\"}.",
+        "question" => "Pass the question, for example {\"question\": \"Who leads Liberia?\"}.",
         "node" => "Pass a document id, for example {\"node\": \"src/lib.rs\"}.",
         "src" | "dst" => "Pass a document id from xerj_brain_ego.",
         "type" => "Pass the edge type, for example {\"type\": \"calls\"}.",
@@ -2824,6 +2922,70 @@ fn build_plan(args: &Value) -> Result<BuiltRequest, String> {
         Method::Post,
         "/_ask".to_string(),
         Some(json!({ "index": index, "prompt": prompt })),
+    ))
+}
+
+// ── xerj_facts_ask: a question over a facts namespace (feature `facts`) ───────
+
+/// The shape of a facts namespace (the engine's `memory_api::validate_namespace`):
+/// checked here so that a namespace can never steer the request path to a
+/// different route (`a/../..`, `a?x=`, `a/_bulk`).
+fn valid_facts_namespace(ns: &str) -> bool {
+    let mut chars = ns.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    first_ok
+        && ns.len() <= 200
+        && !ns.contains("..")
+        && ns
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
+}
+
+/// `xerj_facts_ask` → `POST /_facts/{namespace}/_ask`. Carries the question and
+/// the optional arguments the engine accepts, nothing else.
+fn build_facts_ask(args: &Value) -> Result<BuiltRequest, String> {
+    let namespace = req_str(args, "namespace")?;
+    if !valid_facts_namespace(namespace) {
+        return Err(format!(
+            "`namespace` [{namespace}] is not a facts namespace: use lowercase letters, digits, \
+             `.`, `_` and `-`, starting with a letter or digit"
+        ));
+    }
+    let question = match args.get("question") {
+        None | Some(Value::Null) => return Err(missing_string("question", false)),
+        Some(Value::String(s)) if s.trim().is_empty() => {
+            return Err(missing_string("question", true));
+        }
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => {
+            return Err(format!(
+                "`question` must be a non-empty string. {}",
+                string_field_hint("question")
+            ));
+        }
+    };
+    let mut body = serde_json::Map::new();
+    body.insert("question".into(), json!(question));
+    if let Some(r) = opt_u64(args, "revision")? {
+        body.insert("revision".into(), json!(r));
+    }
+    if let Some(e) = opt_typed(args, "explain", "a boolean", Value::as_bool)? {
+        body.insert("explain".into(), json!(e));
+    }
+    if let Some(l) = opt_typed(args, "linker", "a string", Value::as_str)? {
+        body.insert("linker".into(), json!(l));
+    }
+    for k in ["timeout_ms", "wait_for_ms"] {
+        if let Some(ms) = opt_u64(args, k)? {
+            body.insert(k.into(), json!(ms));
+        }
+    }
+    Ok((
+        Method::Post,
+        format!("/_facts/{namespace}/_ask"),
+        Some(Value::Object(body)),
     ))
 }
 
@@ -4762,6 +4924,121 @@ mod tests {
         assert_eq!(body["index"], "ax-quakes");
     }
 
+    /// `xerj_facts_ask` (design §5.5): served only by a build with the `facts`
+    /// feature, never part of the default list (the published schema), read-only.
+    #[test]
+    fn facts_ask_is_served_only_with_the_facts_feature() {
+        let names = |specs: Value| -> Vec<String> {
+            specs
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(!names(tool_specs_full(true, false)).contains(&"xerj_facts_ask".to_string()));
+        let with = names(tool_specs_full(true, true));
+        assert_eq!(with.len(), 24);
+        // after the node tools, before the hub tools
+        let at = |n: &str| with.iter().position(|x| x == n).unwrap();
+        assert!(at("xerj_corpus_feedback") < at("xerj_facts_ask"));
+        assert!(at("xerj_facts_ask") < at("xerj_hub_find"));
+        assert_eq!(
+            names(tool_specs_with(true)).contains(&"xerj_facts_ask".to_string()),
+            cfg!(feature = "facts")
+        );
+        let spec = facts_ask_spec();
+        assert_eq!(
+            spec["inputSchema"]["required"],
+            json!(["namespace", "question"])
+        );
+        let desc = spec["description"].as_str().unwrap();
+        for must in [
+            "read-only",
+            "it is not proof that the fact is false",
+            "ENRICHMENT_PENDING",
+            "MODEL_UNAVAILABLE",
+            "ASK_QUEUE_FULL",
+            "verbatim",
+        ] {
+            assert!(desc.contains(must), "missing {must:?}: {desc}");
+        }
+    }
+
+    #[test]
+    fn facts_ask_posts_the_question_and_only_known_options() {
+        let (method, path, body) = built(build_facts_ask(&json!({
+            "namespace": "alpha", "question": "Which country is governed by George Weah?",
+            "revision": 12, "explain": true, "linker": "tolerant", "timeout_ms": 5000,
+            "wait_for_ms": 100, "index": "ignored", "item_id": "ignored"
+        })));
+        assert_eq!(method, Method::Post);
+        assert_eq!(path, "/_facts/alpha/_ask");
+        assert_eq!(
+            body,
+            json!({"question": "Which country is governed by George Weah?", "revision": 12,
+                   "explain": true, "linker": "tolerant", "timeout_ms": 5000, "wait_for_ms": 100})
+        );
+        let (_, _, body) = built(build_facts_ask(
+            &json!({"namespace": "a.b_c-1", "question": "q"}),
+        ));
+        assert_eq!(body, json!({"question": "q"}));
+    }
+
+    #[test]
+    fn facts_ask_refuses_what_the_engine_would_refuse() {
+        for ns in [
+            "",
+            "Alpha",
+            "a/../_security",
+            "a?x=1",
+            "a/_bulk",
+            "-a",
+            "a..b",
+            "a b",
+        ] {
+            let err = build_facts_ask(&json!({"namespace": ns, "question": "q"})).unwrap_err();
+            assert!(err.contains("`namespace`"), "{ns:?}: {err}");
+        }
+        let err = build_facts_ask(&json!({"namespace": "alpha"})).unwrap_err();
+        assert!(err.contains("`question`"), "{err}");
+        let err = build_facts_ask(&json!({"namespace": "alpha", "question": "  "})).unwrap_err();
+        assert!(err.contains("`question`"), "{err}");
+        for (k, v) in [
+            ("revision", json!("12")),
+            ("explain", json!("yes")),
+            ("linker", json!(1)),
+            ("timeout_ms", json!(-1)),
+        ] {
+            let mut args = json!({"namespace": "alpha", "question": "q"});
+            args[k] = v;
+            let err = build_facts_ask(&args).unwrap_err();
+            assert!(err.contains(&format!("`{k}`")), "{k}: {err}");
+        }
+    }
+
+    /// A client that cached a tool list from a facts build and calls the tool
+    /// on a default build hears why, without a request to the node.
+    #[tokio::test]
+    async fn facts_ask_on_a_build_without_the_feature_says_why() {
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            auth: None,
+        };
+        let msg = json!({"params": {"name": "xerj_facts_ask",
+                                    "arguments": {"namespace": "alpha", "question": "q"}}});
+        let res = call_tool(&ctx, &msg).await;
+        assert_eq!(res["isError"], true, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        if cfg!(feature = "facts") {
+            // served: the request goes to the (closed) node
+            assert!(text.contains("no XERJ node is listening"), "{text}");
+        } else {
+            assert!(text.contains("not served by this build"), "{text}");
+        }
+    }
+
     #[test]
     fn plan_requires_a_prompt() {
         let err = build_plan(&json!({ "index": "ax-quakes" })).unwrap_err();
@@ -6193,7 +6470,8 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 23);
+        // + `xerj_facts_ask` in a build with the `facts` feature
+        assert_eq!(names.len(), 23 + usize::from(facts_tools_served()));
         for n in [
             "xerj_def",
             "xerj_search",
@@ -6348,24 +6626,32 @@ mod tests {
                 .map(|t| t["name"].as_str().unwrap().to_string())
                 .collect()
         };
+        // + `xerj_facts_ask` in a build with the `facts` feature
+        let facts = usize::from(facts_tools_served());
         let without = names(false);
-        assert_eq!(without.len(), 20, "{without:?}");
+        assert_eq!(without.len(), 20 + facts, "{without:?}");
         assert!(
             without.iter().all(|n| !n.starts_with("xerj_hub_")),
             "{without:?}"
         );
         let with = names(true);
-        assert_eq!(with.len(), 23, "{with:?}");
+        assert_eq!(with.len(), 23 + facts, "{with:?}");
         for n in ["xerj_hub_find", "xerj_hub_def", "xerj_hub_ask"] {
             assert!(with.iter().any(|name| name == n), "missing {n}");
         }
 
         let help = tools_paragraph(false);
-        assert!(help.contains("proxies 20 tools"), "{help}");
+        assert!(
+            help.contains(&format!("proxies {} tools", 20 + facts)),
+            "{help}"
+        );
         assert!(!help.contains("xerj_hub_"), "{help}");
         assert!(help.contains("~/xerj-data"), "{help}");
         let help = tools_paragraph(true);
-        assert!(help.contains("proxies 23 tools"), "{help}");
+        assert!(
+            help.contains(&format!("proxies {} tools", 23 + facts)),
+            "{help}"
+        );
         assert!(help.contains("xerj_hub_ask"), "{help}");
         assert!(help.contains("serves 3 Corpus Hub tools"), "{help}");
     }

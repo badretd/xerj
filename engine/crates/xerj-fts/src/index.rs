@@ -650,6 +650,55 @@ const POST_MAGIC_ZSTD: &[u8; 4] = b"ZPS1";
 /// decode-time codec choice differs.  See `xerj_fts::postings`'s module
 /// docs for the framing and the peer citations.
 const POST_MAGIC_ZSTD_V2: &[u8; 4] = b"ZPS2";
+
+/// `u32` length value that announces the wide header form.
+const POST_LEN_WIDE: u32 = u32::MAX;
+/// Marker after [`POST_LEN_WIDE`] in the wide header form. It is neither a
+/// zstd frame magic nor a skippable-frame magic, which is what an old
+/// writer's header is always followed by, so the two forms never collide.
+const POST_WIDE_MARKER: &[u8; 4] = b"ZPW8";
+
+/// The header of a zstd-enveloped `.post` (ZPS1 / ZPS2 framing).
+///
+/// * `len < u32::MAX`: `magic | u32 len` — 8 bytes, the header every reader
+///   knows, byte for byte what was always written.
+/// * `len >= u32::MAX` (4 GiB - 1 and more): `magic | u32::MAX | "ZPW8" |
+///   u64 len` — 20 bytes. A merge of four segments the size-tiered policy
+///   admits past its 512 MiB batch cap can hold that much postings in one
+///   field; the 8-byte form wrapped the length, and the reader's
+///   `zstd::bulk::decompress` then rejected the frame, so the field could
+///   not be opened. A reader older than this form hands the bytes after
+///   the 8th to zstd, which begin with "ZPW8", and gets a frame error: the
+///   open fails as it did with the wrapped length; it never misreads.
+///
+/// Frames (the optional block-index skippable frame, then the postings
+/// frame) follow the header in both forms.
+fn post_envelope_header(magic: &[u8; 4], uncompressed_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20);
+    out.extend_from_slice(magic);
+    match u32::try_from(uncompressed_len) {
+        Ok(len) if len != POST_LEN_WIDE => out.extend_from_slice(&len.to_le_bytes()),
+        _ => {
+            out.extend_from_slice(&POST_LEN_WIDE.to_le_bytes());
+            out.extend_from_slice(POST_WIDE_MARKER);
+            out.extend_from_slice(&(uncompressed_len as u64).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// `(decompressed postings length, offset of the first frame)` of a
+/// zstd-enveloped `.post` in either header form, or `None` when `raw` is
+/// too short for its header (or the length does not fit this platform).
+fn post_envelope_split(raw: &[u8]) -> Option<(usize, usize)> {
+    let len = u32::from_le_bytes(raw.get(4..8)?.try_into().ok()?);
+    if len == POST_LEN_WIDE && raw.get(8..12) == Some(POST_WIDE_MARKER.as_slice()) {
+        let wide = u64::from_le_bytes(raw.get(12..20)?.try_into().ok()?);
+        return Some((usize::try_from(wide).ok()?, 20));
+    }
+    Some((len as usize, 8))
+}
+
 /// Zstd compression level used for the durable segment artifacts
 /// (`.meta` ZFM4, `.post` ZPS1).  Reverted from 19 to 3: this constant
 /// is invoked at **flush** time, not just merge, so the ~25 MB/s/core
@@ -1862,9 +1911,24 @@ impl FtsIndexWriter {
         let meta_path = filename("meta");
         let norms_path = filename("norms");
 
+        // 0. Dense norm bytes (doc id -> stored norm byte, 0 = none): written
+        //    as the `.norms` side-car in step 5, and read here by the block
+        //    index, whose per-block impacts pair each frequency with its
+        //    document's norm.
+        let mut norms = field_data.norms;
+        norms.sort_unstable_by_key(|(doc_id, _)| *doc_id);
+        let max_doc_id: u32 = norms.last().map(|(d, _)| *d).unwrap_or(0);
+        let dense_len = (max_doc_id as usize).saturating_add(1);
+        let mut dense: Vec<u8> = vec![0u8; dense_len];
+        for (doc_id, norm_byte) in &norms {
+            dense[*doc_id as usize] = *norm_byte;
+        }
+
         // 1. Build posting data and collect (term → TermPostings) in sorted order
         let mut post_data: Vec<u8> = Vec::new();
         let mut term_postings: HashMap<String, TermPostings> = HashMap::new();
+        let mut block_index = crate::postings::BlockIndexBuilder::default();
+        let norm_of = |doc: u32| dense.get(doc as usize).copied().unwrap_or(0);
 
         // Collect sorted terms (FST requires lexicographic order)
         let mut sorted_terms: Vec<String> =
@@ -1884,7 +1948,14 @@ impl FtsIndexWriter {
             .collect();
 
         for term in &sorted_terms {
-            if let Some((offset, _skip)) = field_data.postings.encode_term(term, &mut post_data) {
+            if let Some((offset, blocks)) =
+                field_data
+                    .postings
+                    .encode_term_indexed(term, &mut post_data, &norm_of)
+            {
+                if let Some(blocks) = &blocks {
+                    block_index.add(offset, blocks);
+                }
                 // Calculate doc_freq and ttf from the writer's internal stats
                 let (doc_freq, ttf) = stats_by_term.get(term.as_str()).copied().unwrap_or((0, 0));
 
@@ -1916,17 +1987,25 @@ impl FtsIndexWriter {
         //
         // Layout:
         //   "ZPS2"             4 bytes magic (also the inner-framing version)
-        //   uncompressed_len   u32 little-endian
+        //   uncompressed_len   u32 little-endian (the postings frame's content)
+        //   [block index]      optional zstd SKIPPABLE frame (magic
+        //                      0x184D2A5B, u32 size, "ZBM1" payload): per-block
+        //                      skip offsets + competitive impacts of every term
+        //                      with a full block (see `postings::BlockIndex`).
+        //                      zstd skips it, so readers that predate it
+        //                      decompress the same postings as before.
         //   payload            compressed_len bytes (zstd)
         let post_bytes_wrapped: Vec<u8> = if post_data.is_empty() {
             Vec::new()
         } else {
-            let uncompressed_len = post_data.len() as u32;
+            let frame = block_index
+                .finish(zstd_level)
+                .with_context(|| "ZBM1 block index")?;
             let compressed = zstd::bulk::compress(&post_data, zstd_level)
                 .with_context(|| "ZPS2 zstd compress")?;
-            let mut out = Vec::with_capacity(4 + 4 + compressed.len());
-            out.extend_from_slice(POST_MAGIC_ZSTD_V2);
-            out.write_u32::<LittleEndian>(uncompressed_len).unwrap();
+            let mut out = post_envelope_header(POST_MAGIC_ZSTD_V2, post_data.len());
+            out.reserve(frame.len() + compressed.len());
+            out.extend_from_slice(&frame);
             out.extend_from_slice(&compressed);
             out
         };
@@ -2024,14 +2103,7 @@ impl FtsIndexWriter {
         //   u32        max_doc_id + 1   (size of implicit array)
         //   u32        payload_len
         //   payload    dense array (u8 × max_doc_id+1) or LZ4(dense)
-        let mut norms = field_data.norms;
-        norms.sort_unstable_by_key(|(doc_id, _)| *doc_id);
-        let max_doc_id: u32 = norms.last().map(|(d, _)| *d).unwrap_or(0);
-        let dense_len = (max_doc_id as usize).saturating_add(1);
-        let mut dense: Vec<u8> = vec![0u8; dense_len];
-        for (doc_id, norm_byte) in &norms {
-            dense[*doc_id as usize] = *norm_byte;
-        }
+        // (`dense` was built in step 0.)
 
         // Try LZ4 when the dense array is big enough for compression
         // to pay off (long runs of identical norms on low-entropy fields
@@ -2423,6 +2495,11 @@ pub struct FtsIndexReader {
     stats_only: bool,
 }
 
+/// Below this size a field's decompressed postings stay on the heap when
+/// [`FtsIndexReader::spill_postings_to`] runs: a file and a mapping per tiny
+/// field would cost more than the bytes they move.
+pub const SPILL_MIN_POSTINGS_BYTES: u64 = 64 * 1024;
+
 /// Backing storage for a field's postings bytes.
 ///
 /// We prefer `Mmap` so `FtsIndexReader::open` allocates almost nothing per
@@ -2475,15 +2552,78 @@ struct LoadedField {
     post_block_v2: bool,
     /// Pre-parsed metadata (term postings, field stats) — small, stays owned.
     meta: FieldMeta,
-    /// `(doc_id, field_length, quantised norm byte)`, sorted by doc_id.
-    ///
-    /// The raw byte rides along beside the dequantised length because the
-    /// merge path must reproduce the source segment's norms file byte for
-    /// byte: `norm_u16_to_u8(norm_u8_to_u16(b)) != b` for most `b`, so
-    /// re-quantising the length would move BM25's length normalisation on
-    /// every merged document.  `(u32, u16, u8)` still occupies 8 bytes
-    /// after padding, so this costs no memory over the old `(u32, u16)`.
-    norms: Vec<(u32, u16, u8)>,
+    /// Per-document field lengths (see [`Norms`]).
+    norms: Norms,
+    /// The `.post` envelope's block index (skip offsets + per-block impacts),
+    /// when the segment was written with one.
+    block_index: Option<crate::postings::BlockIndex>,
+}
+
+/// A field's per-document lengths as the reader serves them.
+///
+/// The stored norm byte is kept beside the length it decodes to because the
+/// merge path must reproduce the source segment's norms file byte for byte:
+/// `norm_u16_to_u8(norm_u8_to_u16(b)) != b` for most `b`, so re-quantising
+/// the length would move BM25's length normalisation on every merged
+/// document.
+enum Norms {
+    /// ZNM1: one byte per document id (0 = no length recorded), decoded
+    /// through a 256-entry table — O(1) per lookup, 1 byte per document.
+    Dense(Vec<u8>),
+    /// Pre-ZNM1 `(doc_id, unquantised length, norm byte)` sorted by doc id:
+    /// those segments stored exact lengths, which BM25 keeps reading.
+    Legacy(Vec<(u32, u16, u8)>),
+}
+
+/// One field's per-document lengths ([`FtsIndexReader::field_lengths`]).
+#[derive(Clone, Copy)]
+pub struct FieldLengths<'a>(&'a Norms);
+
+impl FieldLengths<'_> {
+    /// Same answer as [`FtsIndexReader::field_length`] for this field.
+    #[inline]
+    pub fn get(&self, doc_id: u32) -> Option<u16> {
+        self.0.length(doc_id)
+    }
+
+    /// The length a stored norm byte decodes to (ZNM1 quantisation).
+    #[inline]
+    pub fn length_of_norm(byte: u8) -> u16 {
+        NORM_LENGTHS[byte as usize]
+    }
+}
+
+/// `norm_u8_to_u16` for every byte, so a ZNM1 lookup is one table read.
+static NORM_LENGTHS: std::sync::LazyLock<[u16; 256]> = std::sync::LazyLock::new(|| {
+    let mut table = [0u16; 256];
+    for (b, slot) in table.iter_mut().enumerate() {
+        *slot = norm_u8_to_u16(b as u8);
+    }
+    table
+});
+
+impl Norms {
+    #[inline]
+    fn length(&self, doc_id: u32) -> Option<u16> {
+        match self {
+            Norms::Dense(bytes) => match bytes.get(doc_id as usize) {
+                Some(&b) if b != 0 => Some(NORM_LENGTHS[b as usize]),
+                _ => None,
+            },
+            Norms::Legacy(v) => v
+                .binary_search_by_key(&doc_id, |(id, _, _)| *id)
+                .ok()
+                .map(|idx| v[idx].1),
+        }
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        match self {
+            Norms::Dense(bytes) => bytes.len() as u64,
+            // `(u32, u16, u8)` pads to 8 bytes per element.
+            Norms::Legacy(v) => v.len() as u64 * 8,
+        }
+    }
 }
 
 impl FtsIndexReader {
@@ -2711,11 +2851,32 @@ impl FtsIndexReader {
             let zstd_envelope = raw_post.len() >= 8
                 && (&raw_post[..4] == POST_MAGIC_ZSTD_V2 || &raw_post[..4] == POST_MAGIC_ZSTD);
             let post_block_v2 = raw_post.len() >= 4 && &raw_post[..4] == POST_MAGIC_ZSTD_V2;
-            let post_data = if zstd_envelope {
-                let mut len_buf = [0u8; 4];
-                len_buf.copy_from_slice(&raw_post[4..8]);
-                let uncompressed_len = u32::from_le_bytes(len_buf) as usize;
-                let decompressed = zstd::bulk::decompress(&raw_post[8..], uncompressed_len)
+            // The optional block-index frame (a zstd skippable frame right
+            // after the header).  A frame that does not parse is ignored —
+            // the walk is exact without it — rather than failing the field.
+            // Where the header ends (8 bytes, or the wide form for postings of
+            // 4 GiB and more — see `post_envelope_header`).
+            let envelope = if zstd_envelope {
+                Some(post_envelope_split(&raw_post).ok_or_else(|| {
+                    anyhow::anyhow!("ZPS postings header unreadable: {post_path:?}")
+                })?)
+            } else {
+                None
+            };
+            let frames_at = envelope.map_or(8, |(_, at)| at);
+            let block_index = if post_block_v2 {
+                raw_post.get(frames_at..).and_then(crate::postings::split_block_index_frame).and_then(|(payload, _)| {
+                    crate::postings::BlockIndex::parse(payload)
+                        .map_err(|error| {
+                            tracing::warn!(?post_path, %error, "ignoring an unreadable FTS block index");
+                        })
+                        .ok()
+                })
+            } else {
+                None
+            };
+            let post_data = if let Some((uncompressed_len, frames_at)) = envelope {
+                let decompressed = zstd::bulk::decompress(&raw_post[frames_at..], uncompressed_len)
                     .map_err(|e| anyhow::anyhow!("ZPS postings decompress failed: {e}"))?;
                 PostData::Owned(decompressed)
             } else if raw_post.len() >= 4 && &raw_post[..4] == POST_MAGIC_LZ4 {
@@ -2789,7 +2950,7 @@ impl FtsIndexReader {
             // STATS-ONLY: the norms table is a whole-file read + decode that
             // is O(docs); the statistics pre-pass never asks for a doc length.
             let norms = if stats_only {
-                Vec::new()
+                Norms::Dense(Vec::new())
             } else {
                 Self::load_norms(&norms_path)?
             };
@@ -2802,6 +2963,7 @@ impl FtsIndexReader {
                     post_block_v2,
                     meta,
                     norms,
+                    block_index,
                 },
             );
         }
@@ -2832,7 +2994,7 @@ impl FtsIndexReader {
         Ok(mmap)
     }
 
-    fn load_norms(path: &Path) -> Result<Vec<(u32, u16, u8)>> {
+    fn load_norms(path: &Path) -> Result<Norms> {
         let bytes = fs::read(path).with_context(|| format!("opening norms {:?}", path))?;
         // V4 M4.7 compact format starts with `NORMS_MAGIC`; legacy starts
         // with a raw u32 count (whose first byte almost never matches 'Z').
@@ -2857,16 +3019,9 @@ impl FtsIndexReader {
                     dense_len
                 ));
             }
-            // Materialise (doc_id, norm) pairs only for live docs so the
-            // rest of the engine (which expects `Vec<(u32, u16)>`) is
-            // unchanged.  Zero bytes → missing.
-            let mut norms = Vec::new();
-            for (doc_id, &b) in dense.iter().enumerate() {
-                if b != 0 {
-                    norms.push((doc_id as u32, norm_u8_to_u16(b), b));
-                }
-            }
-            Ok(norms)
+            // Kept dense: byte 0 reads as "no length" exactly like the old
+            // sparse pairs, which skipped zero bytes.
+            Ok(Norms::Dense(dense))
         } else {
             // Legacy path (pre-M4.7): u32 count + count × (u32 doc_id, u16 norm).
             let mut cur = std::io::Cursor::new(&bytes[..]);
@@ -2879,7 +3034,7 @@ impl FtsIndexReader {
                 // writer would emit for it is what a merge must carry forward.
                 norms.push((doc_id, norm, norm_u16_to_u8(norm)));
             }
-            Ok(norms)
+            Ok(Norms::Legacy(norms))
         }
     }
 
@@ -2905,13 +3060,86 @@ impl FtsIndexReader {
                 total += m.as_fst().as_bytes().len() as u64;
             }
             total += f.meta.flat_records.len() as u64;
-            // `norms` is Vec<(u32, u16, u8)>, which pads to 8 bytes per element.
-            total += (f.norms.len() as u64) * 8;
+            total += f.norms.heap_bytes();
+            total += f.block_index.as_ref().map_or(0, |b| b.heap_bytes());
             // Legacy ZFM1/ZFM2 keep per-term metadata in a HashMap instead of
             // the flat array; approximate it rather than walking every entry.
             total += (f.meta.terms.len() as u64) * 64;
         }
         total
+    }
+
+    /// The heap bytes [`Self::spill_postings_to`] would move out of this
+    /// reader: every field's decompressed postings of at least
+    /// [`SPILL_MIN_POSTINGS_BYTES`]. Mapped postings count zero.
+    pub fn spillable_postings_bytes(&self) -> u64 {
+        self.fields
+            .values()
+            .filter_map(|f| match &f.post_data {
+                PostData::Owned(v) if v.len() as u64 >= SPILL_MIN_POSTINGS_BYTES => {
+                    Some(v.len() as u64)
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// Whether this reader's postings live in mapped files (spilled by
+    /// [`Self::spill_postings_to`], or an uncompressed `.post` mapped at open):
+    /// no field keeps decompressed postings of [`SPILL_MIN_POSTINGS_BYTES`] or
+    /// more on the heap, and at least one field's postings are mapped. Such a
+    /// reader holds little anonymous memory beyond its dictionary, term
+    /// metadata and norms.
+    pub fn postings_mapped(&self) -> bool {
+        self.spillable_postings_bytes() == 0
+            && self
+                .fields
+                .values()
+                .any(|f| matches!(f.post_data, PostData::Mmap(_)))
+    }
+
+    /// Move this reader's decompressed postings out of the heap: write each
+    /// field's owned postings ([`Self::spillable_postings_bytes`]) to an
+    /// unlinked temporary file in `dir` and map it read-only. The bytes then
+    /// live in the page cache — file-backed and reclaimable — instead of
+    /// anonymous memory, and [`Self::retained_bytes`] drops by as much.
+    ///
+    /// A `.post` file is one zstd frame per field, so a reader the caller
+    /// cannot keep in memory has to decompress the whole frame again on every
+    /// open. The spill file has no name (`O_TMPFILE` where the filesystem has
+    /// it, else created and unlinked at once), so nothing in `dir` changes,
+    /// and its space is returned when the last mapping closes: when this
+    /// reader is dropped, or the process exits. `dir` should be on the index's
+    /// own volume — on tmpfs the pages would be shared memory again.
+    ///
+    /// A field whose spill fails (disk full, a filesystem that refuses `mmap`)
+    /// keeps its owned bytes, so the reader stays usable either way. Returns
+    /// the number of bytes moved.
+    pub fn spill_postings_to(&mut self, dir: &Path) -> u64 {
+        let mut moved = 0u64;
+        for field in self.fields.values_mut() {
+            let PostData::Owned(bytes) = &field.post_data else {
+                continue;
+            };
+            if (bytes.len() as u64) < SPILL_MIN_POSTINGS_BYTES {
+                continue;
+            }
+            let Ok(map) = Self::map_spilled(dir, bytes) else {
+                continue;
+            };
+            moved += bytes.len() as u64;
+            field.post_data = PostData::Mmap(map);
+        }
+        moved
+    }
+
+    fn map_spilled(dir: &Path, bytes: &[u8]) -> std::io::Result<Mmap> {
+        use std::io::Write as _;
+        let mut file = tempfile::tempfile_in(dir)?;
+        file.write_all(bytes)?;
+        // SAFETY: the file has no name and this is its only handle, so
+        // nothing can modify or truncate it while it is mapped.
+        unsafe { Mmap::map(&file) }
     }
 
     /// Look up a term in a field.
@@ -3052,13 +3280,69 @@ impl FtsIndexReader {
     /// every document on a [`Self::open_stats_only`] reader, whose norms
     /// table was deliberately not loaded.
     pub fn field_length(&self, field: &str, doc_id: u32) -> Option<u16> {
-        let loaded = self.fields.get(field)?;
-        // Binary search by doc_id
-        loaded
-            .norms
-            .binary_search_by_key(&doc_id, |(id, _, _)| *id)
-            .ok()
-            .map(|idx| loaded.norms[idx].1)
+        self.fields.get(field)?.norms.length(doc_id)
+    }
+
+    /// O(1) per-document field lengths of `field` (what [`Self::field_length`]
+    /// returns), resolved once instead of per lookup.
+    pub fn field_lengths(&self, field: &str) -> Option<FieldLengths<'_>> {
+        if self.stats_only {
+            return None;
+        }
+        self.fields.get(field).map(|f| FieldLengths(&f.norms))
+    }
+
+    /// The field's block index (skip offsets + per-block impacts) when this
+    /// segment was written with one; `None` for older segments, a field
+    /// without a list of 128 or more postings, or a stats-only reader.
+    pub fn block_index(&self, field: &str) -> Option<&crate::postings::BlockIndex> {
+        if self.stats_only {
+            return None;
+        }
+        self.fields.get(field)?.block_index.as_ref()
+    }
+
+    /// A positions-free, block-skipping cursor over one term's postings
+    /// (see [`crate::postings::BlockCursor`]); it uses the block index when
+    /// the segment has one and walks the blocks in order otherwise.
+    pub fn block_cursor<'a>(
+        &'a self,
+        field: &str,
+        tp: &TermPostings,
+    ) -> Option<crate::postings::BlockCursor<'a>> {
+        self.block_cursor_with(field, tp, true)
+    }
+
+    /// [`Self::block_cursor`]; `want_tf == false` skips unpacking frequencies
+    /// (document ids only, for counting).
+    pub fn block_cursor_with<'a>(
+        &'a self,
+        field: &str,
+        tp: &TermPostings,
+        want_tf: bool,
+    ) -> Option<crate::postings::BlockCursor<'a>> {
+        let data = self.postings_data(field, tp)?;
+        let has_positions = self.field_has_positions(field);
+        let codec = if self.field_post_block_v2(field) {
+            crate::postings::PostCodec::v2_for(
+                has_positions,
+                tp.total_term_frequency,
+                tp.doc_frequency,
+            )
+        } else {
+            crate::postings::PostCodec::V1
+        };
+        let blocks = self
+            .block_index(field)
+            .and_then(|ix| ix.term(tp.postings_offset));
+        Some(crate::postings::BlockCursor::with_frequencies(
+            data,
+            tp.doc_frequency,
+            has_positions,
+            codec,
+            blocks,
+            want_tf,
+        ))
     }
 
     /// Every `(doc_id, quantised norm byte)` this field records, ascending by
@@ -3070,12 +3354,22 @@ impl FtsIndexReader {
     /// byte the source segment holds, and [`Self::field_length`]'s
     /// dequantised `u16` cannot be re-quantised back to it.
     pub fn field_norm_bytes(&self, field: &str) -> impl Iterator<Item = (u32, u8)> + '_ {
-        self.fields.get(field).into_iter().flat_map(|loaded| {
-            loaded
-                .norms
-                .iter()
-                .map(|(doc_id, _, byte)| (*doc_id, *byte))
-        })
+        self.fields.get(field).into_iter().flat_map(
+            |loaded| -> Box<dyn Iterator<Item = (u32, u8)> + '_> {
+                match &loaded.norms {
+                    Norms::Dense(bytes) => Box::new(
+                        bytes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, &b)| b != 0)
+                            .map(|(doc_id, &b)| (doc_id as u32, b)),
+                    ),
+                    Norms::Legacy(v) => {
+                        Box::new(v.iter().map(|(doc_id, _, byte)| (*doc_id, *byte)))
+                    }
+                }
+            },
+        )
     }
 
     /// Stream every term of `field` through `f` in lexicographic order,
@@ -3163,6 +3457,57 @@ impl FtsIndexReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `.post` header must carry the decompressed postings length for
+    /// every length a segment can reach, including 4 GiB and more: a merge
+    /// of four segments the size-tiered policy admits past its 512 MiB batch
+    /// cap reaches it. A header that wraps the length makes the reader's
+    /// `zstd::bulk::decompress` reject the frame, so the field cannot be
+    /// opened. No 4 GiB buffer is needed to check the header itself.
+    #[test]
+    fn post_envelope_header_round_trips_lengths_of_four_gib_and_more() {
+        let zstd_frame_magic = 0xFD2F_B528u32.to_le_bytes();
+        for len in [
+            0usize,
+            1,
+            0xFFFF_FFFE,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0x1_0000_0001,
+            5 << 30,
+            1 << 40,
+        ] {
+            let mut raw = post_envelope_header(POST_MAGIC_ZSTD_V2, len);
+            let header_len = raw.len();
+            raw.extend_from_slice(&zstd_frame_magic);
+            assert_eq!(
+                post_envelope_split(&raw),
+                Some((len, header_len)),
+                "decompressed length {len} must survive the header"
+            );
+        }
+    }
+
+    /// Below 4 GiB - 1 the header stays the 8 bytes every reader knows, so
+    /// segments of every size written before keep their exact bytes.
+    #[test]
+    fn post_envelope_header_below_four_gib_is_the_legacy_eight_bytes() {
+        for len in [0usize, 1, 4096, 0xFFFF_FFFE] {
+            let mut legacy = POST_MAGIC_ZSTD_V2.to_vec();
+            legacy.extend_from_slice(&(len as u32).to_le_bytes());
+            assert_eq!(post_envelope_header(POST_MAGIC_ZSTD_V2, len), legacy);
+        }
+        // An old writer's header of exactly u32::MAX is followed by a frame
+        // magic (the block-index skippable frame or the zstd frame), never
+        // by the wide marker, so it still reads as itself.
+        for frame_magic in [0xFD2F_B528u32, 0x184D_2A5B] {
+            let mut raw = POST_MAGIC_ZSTD_V2.to_vec();
+            raw.extend_from_slice(&u32::MAX.to_le_bytes());
+            raw.extend_from_slice(&frame_magic.to_le_bytes());
+            assert_eq!(post_envelope_split(&raw), Some((u32::MAX as usize, 8)));
+        }
+        assert_eq!(post_envelope_split(b"ZPS2abc"), None);
+    }
     use std::collections::HashSet;
     use tempfile::TempDir;
 
@@ -4587,5 +4932,82 @@ mod tests {
         assert!(message.contains("seg.body.post"), "{message}");
         assert!(message.contains("os error"), "{message}");
         assert!(stuck.join("held").exists());
+    }
+
+    /// `spill_postings_to` moves a field's decompressed postings into a
+    /// mapped, unlinked file: the reader's heap footprint drops by exactly
+    /// those bytes, nothing appears in the directory, and every posting list
+    /// reads back byte for byte and decodes to the same postings.
+    #[test]
+    fn spilled_postings_read_back_identically() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir.path(), "seg-spill", make_registry());
+        writer.configure_field(
+            "body",
+            FieldIndexConfig {
+                analyzer: "whitespace".to_owned(),
+                store_positions: true,
+                store_term_vectors: false,
+            },
+        );
+        for i in 0u32..12000 {
+            let doc: HashMap<String, FieldValues> = [(
+                "body".to_owned(),
+                FieldValues::from(format!(
+                    "alpha beta{} gamma{} delta{} alpha {i} epsilon{}",
+                    i % 11,
+                    i % 97,
+                    i % 389,
+                    i % 1013
+                )),
+            )]
+            .into_iter()
+            .collect();
+            writer.add_document(i, &doc);
+        }
+        writer.finish().unwrap();
+
+        let terms = ["alpha", "beta3", "gamma42", "delta300", "epsilon7", "1234"];
+        // Each term's raw postings bytes and its decoded (doc, tf, positions).
+        type Lists = Vec<(Vec<u8>, Vec<(u32, u32, Vec<u32>)>)>;
+        let lists = |reader: &FtsIndexReader| -> Lists {
+            terms
+                .iter()
+                .map(|t| {
+                    let tp = reader.lookup_term("body", t).unwrap();
+                    let bytes = reader.postings_data("body", &tp).unwrap().to_vec();
+                    let mut pr = reader.postings_reader("body", &tp).unwrap();
+                    let mut postings = Vec::new();
+                    while let Some(p) = pr.next() {
+                        postings.push((p.doc_id, p.term_freq, p.positions));
+                    }
+                    (bytes, postings)
+                })
+                .collect()
+        };
+
+        let mut reader = FtsIndexReader::open(dir.path(), "seg-spill", &["body"]).unwrap();
+        let before = lists(&reader);
+        let retained = reader.retained_bytes();
+        let spillable = reader.spillable_postings_bytes();
+        assert!(
+            spillable >= SPILL_MIN_POSTINGS_BYTES,
+            "fixture: {spillable} bytes of postings"
+        );
+
+        let spill_dir = TempDir::new().unwrap();
+        assert_eq!(reader.spill_postings_to(spill_dir.path()), spillable);
+        assert_eq!(reader.retained_bytes(), retained - spillable);
+        assert_eq!(reader.spillable_postings_bytes(), 0);
+        assert_eq!(
+            reader.spill_postings_to(spill_dir.path()),
+            0,
+            "already mapped"
+        );
+        assert!(
+            fs::read_dir(spill_dir.path()).unwrap().next().is_none(),
+            "the spill file has no name"
+        );
+        assert_eq!(lists(&reader), before);
     }
 }

@@ -578,6 +578,10 @@ pub struct AppState {
     /// from the environment again. A test arms a node by replacing this
     /// field, so parallel tests never race on process-wide env state.
     pub decide: Arc<crate::systemone_api::DecideSettings>,
+    /// SPIKE `/_facts` (feature `facts`): the XERJ-R namespace projections and the lazily loaded compiler
+    /// (`XERJ_FACTS_MODEL_DIR`, `XERJ_FACTS_PRECISION`), resolved once here.
+    #[cfg(feature = "facts")]
+    pub facts: Arc<xerj_facts::FactsService>,
     /// The decide surface's calibration fits (#1063): one cached fit per
     /// decisions index, lazily computed by [`crate::systemone_api`] and
     /// refreshed by `GET /_decide/_calibration`. Held here, not in the
@@ -644,6 +648,8 @@ impl AppState {
         Self {
             rerank,
             decide,
+            #[cfg(feature = "facts")]
+            facts: Arc::new(xerj_facts::FactsService::from_env()),
             decide_calibration,
             config: Arc::new(config),
             engine: Arc::new(engine),

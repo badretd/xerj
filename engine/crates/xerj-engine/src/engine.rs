@@ -4162,12 +4162,16 @@ impl Engine {
 
     /// Flush all indices whose memtable exceeds the size threshold.
     ///
-    /// Called periodically by the background flush timer.
+    /// Called periodically by the background flush timer. Background work
+    /// that no client waits on: it drains each index's own memtable
+    /// ([`Index::flush_memtable`]) and does not wait for segment builds other
+    /// flushes have in flight, so one long build cannot hold up the sweep of
+    /// every other index.
     pub async fn flush_all_if_needed(&self) {
         for entry in self.indices.iter() {
             let idx = Arc::clone(entry.value());
             if idx.needs_flush().await {
-                if let Err(e) = idx.flush().await {
+                if let Err(e) = idx.flush_memtable().await {
                     tracing::warn!(
                         index = entry.key().as_str(),
                         error = %e,
@@ -4206,14 +4210,33 @@ impl Engine {
         for entry in self.indices.iter() {
             entry.value().abort_background_tasks();
         }
-        // 2. Final synchronous flush across every index.
+        // 2. Final synchronous flush across every index, in two passes. The
+        //    caller's budget covers every index (the server gives this 10 s
+        //    in total), so the first pass drains every index's own memtable
+        //    exactly as before; only then does the second pass wait for the
+        //    segment builds other flushes still have in flight
+        //    (`Index::flush`), so one index's long build cannot keep the
+        //    documents of the indices after it out of their segments.
         for entry in self.indices.iter() {
             let idx = Arc::clone(entry.value());
-            if let Err(e) = idx.flush().await {
+            if let Err(e) = idx.flush_memtable().await {
                 tracing::warn!(
                     index = entry.key().as_str(),
                     error = %e,
                     "shutdown flush failed"
+                );
+            }
+        }
+        for entry in self.indices.iter() {
+            let idx = Arc::clone(entry.value());
+            if !idx.has_unpublished_frozen_generations() {
+                continue;
+            }
+            if let Err(e) = idx.flush().await {
+                tracing::warn!(
+                    index = entry.key().as_str(),
+                    error = %e,
+                    "shutdown flush: segment builds still in flight were not published"
                 );
             }
         }
@@ -4619,8 +4642,10 @@ impl Engine {
         }
         let loaded = self.open_indices_largest_memtable_first();
         let mut published = 0usize;
+        // Own memtables only: the loop below already waits (at most 30 s) for
+        // the charged bytes, which builds in flight release when they publish.
         for idx in &loaded {
-            if idx.memtable_bytes() > 0 && idx.flush().await.is_ok() {
+            if idx.memtable_bytes() > 0 && idx.flush_memtable().await.is_ok() {
                 published += 1;
             }
         }
@@ -4641,15 +4666,20 @@ impl Engine {
     /// operator-facing clear and the breaker's drain cannot drift apart: same
     /// flush-first ordering as [`Self::close_index`], nothing closed, reads
     /// re-hydrate from disk. Best-effort per index. Returns how many were
-    /// released.
+    /// released. FTS readers whose postings are mapped files stay
+    /// ([`Index::release_memory_under_pressure`]): dropping them frees almost
+    /// no anonymous memory, and reopening them is the expensive read.
     pub async fn release_rebuildable_memory(&self, indices: &[Arc<Index>]) -> usize {
+        // Own memtables only (`Index::flush_one_shard_at_a_time`): a drain
+        // under memory pressure must not hold back the cache release behind
+        // another flush's segment build.
         for idx in indices {
             // Serial for the same reason as `pressure_drain` (#2427): a
             // release must not spike RSS on its way down.
             if idx.memtable_bytes() > 0 && idx.flush_one_shard_at_a_time().await.is_err() {
                 tracing::warn!("memory release: flush failed, releasing caches anyway");
             }
-            idx.release_memory();
+            idx.release_memory_under_pressure();
         }
         purge_allocator_pages();
         indices.len()
@@ -4726,7 +4756,7 @@ impl Engine {
         }
 
         // ── Thread A: memory + disk ──────────────────────────────────────
-        // Touches NO engine lock — just `/proc/self/statm` + `statvfs`. Kept
+        // Touches NO engine lock — just `/proc/self/status` + `statvfs`. Kept
         // on its own thread so a memtable-sum stall (below) can NEVER delay
         // the memory breaker: the observed OOM was exactly RSS climbing past
         // the watermark while the sampler was blocked summing memtables under

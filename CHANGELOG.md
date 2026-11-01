@@ -717,6 +717,71 @@ continues in #2427 and #1122, which stay open.
   3,072 MB `xerj autoindex` node to 8,122 MB in 18 s while writes were
   getting 429s; plain `_bulk` into one index peaked at 4,967 MB (PR #2452).
 
+- `GET /_cat/indices`, `GET /_cat/shards` and a bare `GET /{index}/_count`
+  no longer scan every stored document of an index that has no
+  `ax_locator` field (any index `xerj autoindex` did not create) after each
+  write. On 1 M passages that scan took 1.8 s per call; during a 10 GB bulk
+  load a monitor polling `_cat/indices` every 30 s timed out on every poll
+  from 6.2 M documents on.
+
+- A multi-term `match` (a `bool` of `should` terms) with `"boost"` above 1
+  could return the wrong page: WAND pruning compared the unboosted score
+  bound with boosted scores and skipped documents that belonged on the
+  page. The bound now carries the boost; a negative or non-finite boost
+  turns pruning off.
+
+- BM25 scoring of `match` and `term` queries steps over term positions
+  instead of decoding and copying them for every posting it visits; phrase
+  queries still read them.
+
+- A scored query over several segments reads the index-wide BM25
+  statistics from the segment readers it already caches instead of
+  re-decoding every segment's term metadata on every query (a third of a
+  warm `match` on 1 M passages).
+
+- `hits.total` under `track_total_hits: N` (ES's default 10,000, which the
+  ES API sends when a request has none) is counted to N + 1; past that the
+  rest of the matches is only ranked (MaxScore), no longer counted. Pages
+  and reported totals are unchanged.
+
+- The memory circuit breaker on Linux measures anonymous and shared memory
+  (`RssAnon + RssShmem`) instead of the whole resident set, which included
+  clean file-backed pages of mapped segment files that the kernel reclaims
+  on its own. With this and the `_cat/indices` fix, a 10 GB `_bulk` load
+  (11.3 M passages, one client) at `XERJ_MAX_PROCESS_MEMORY_MB=10240`
+  indexes every document without a breaker rejection; before, the breaker
+  rejected 207,736 documents of the same load at the 16 GiB default cap.
+
+- `xerj autoindex` stops a run once the server's memory breaker has held
+  its writes for 15 minutes in total (summed over workers), naming the
+  memory cap to raise, instead of retrying for hours; a rerun resumes where
+  it stopped.
+
+- An FTS segment reader keeps a field's decompressed postings of 16 MiB or
+  more in an unlinked file next to the segment, mapped read-only, instead of
+  on the heap, and so do smaller readers the segment hydration cache has no
+  room for. Readers the cache refused used to be rebuilt, the whole `.post`
+  frame decompressed, by every query: on 11.3 M Wikipedia passages under the
+  default memory configuration about half the readers on every question.
+  The same 30 questions now take 1.0 s instead of 3.9 s (p50) with half the
+  anonymous memory; the mapped files use disk (~4.2 GB there) while the
+  server runs and are gone when it stops.
+
+- The memory breaker's drain and `POST /{index}/_cache/clear` keep FTS
+  segment readers whose postings are mapped files. Such a reader holds
+  almost no heap, so dropping it freed nothing, and every search after a
+  drain reopened every reader: on 11.3 M passages, 47-55 s per search.
+
+- A segment whose stored section the segment hydration cache refused is not
+  decoded again in the background while the cache still has no room for it.
+
+- At most one background stored-section warm runs per index at a time. A
+  cold search on a large index started a whole-section decode for every
+  segment it read, all at once. On 11.3 M passages in 177 segments, 3 of 5
+  searches were then rejected with 429 at the 16 GiB memory limit. With one
+  warm at a time the same searches all answered, with no breaker
+  engagement.
+
 - `xerj autoindex` no longer aborts a long run with `Resource temporarily
   unavailable (os error 11)` when the machine refuses to start a thread. The
   sync replay used to start a new thread for every operation (hundreds of

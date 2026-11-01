@@ -74,6 +74,8 @@ pub mod embed_warning;
 pub mod error;
 pub mod es_compat;
 pub mod extract;
+#[cfg(feature = "facts")]
+pub mod facts_api;
 pub mod graph_api;
 pub mod hub_api;
 pub mod ism_api;

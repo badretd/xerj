@@ -191,6 +191,10 @@ struct SegEntry {
     /// row-exact plan must skip set bits.  `None` = provably ghost-free,
     /// the shape every executor was originally built under.
     ghosts: Option<std::sync::Arc<Vec<u64>>>,
+    /// The rows a full-text query matched in this segment (bit `row % 64` of
+    /// word `row / 64`), when the request's top filter is [`Pred::FtsRows`];
+    /// `None` otherwise.
+    rows: Option<std::sync::Arc<Vec<u64>>>,
 }
 
 /// Bit `row` of a ghost-position bitmap (bit pos set ⇔ row is deleted or
@@ -765,6 +769,61 @@ impl Index {
         bool_fields: &std::collections::HashSet<String>,
         mapped_fields: &std::collections::HashSet<String>,
     ) -> Option<(Value, Option<u64>)> {
+        self.try_fast_aggs_inner(
+            aggs_def,
+            filter,
+            None,
+            snap,
+            segments_dir,
+            bool_fields,
+            mapped_fields,
+        )
+    }
+
+    /// [`Self::try_fast_aggs`] over the documents a full-text query matched:
+    /// `rows` holds, per segment id, the segment rows the query's inverted-index
+    /// projection matched (bit `row % 64` of word `row / 64`; a segment absent
+    /// from the map matched nothing). The aggregations reduce over exactly those
+    /// rows from doc values, through the same filtered executors a columnar
+    /// query filter uses, instead of materialising every document's `_source`.
+    ///
+    /// Bails (`None`, the caller keeps the exact `_source` path) when the
+    /// memtable holds documents (their match set is not in `rows`) and on
+    /// every shape the filtered executors bail on.
+    pub(super) fn try_fast_aggs_over_fts_rows(
+        &self,
+        aggs_def: &Value,
+        rows: &std::collections::HashMap<String, std::sync::Arc<Vec<u64>>>,
+        snap: &xerj_storage::index_store::IndexSnapshot,
+        segments_dir: &std::path::Path,
+        bool_fields: &std::collections::HashSet<String>,
+        mapped_fields: &std::collections::HashSet<String>,
+    ) -> Option<(Value, Option<u64>)> {
+        if self.memtable.doc_count() > 0 {
+            return None;
+        }
+        self.try_fast_aggs_inner(
+            aggs_def,
+            None,
+            Some(rows),
+            snap,
+            segments_dir,
+            bool_fields,
+            mapped_fields,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_fast_aggs_inner(
+        &self,
+        aggs_def: &Value,
+        filter: Option<&Value>,
+        fts_rows: Option<&std::collections::HashMap<String, std::sync::Arc<Vec<u64>>>>,
+        snap: &xerj_storage::index_store::IndexSnapshot,
+        segments_dir: &std::path::Path,
+        bool_fields: &std::collections::HashSet<String>,
+        mapped_fields: &std::collections::HashSet<String>,
+    ) -> Option<(Value, Option<u64>)> {
         if fast_aggs_disabled() {
             return None;
         }
@@ -778,9 +837,10 @@ impl Index {
         // is present we MUST be able to columnarize it (term/terms/range/
         // match_all, or a pure-conjunction bool of those); anything else bails
         // to the exact brute path.
-        let top_filter: Option<Pred> = match filter {
-            None => None,
-            Some(q) => Some(compile_top_pred(q)?),
+        let top_filter: Option<Pred> = match (filter, fts_rows) {
+            (_, Some(_)) => Some(Pred::FtsRows),
+            (None, None) => None,
+            (Some(q), None) => Some(compile_top_pred(q)?),
         };
         let top_filter_query: Option<Value> = filter.cloned();
         // Columnar-predicate form of the filter for the O(matching) memtable
@@ -873,13 +933,37 @@ impl Index {
             None
         };
 
+        // Over a full-text match set, read only the columns the aggregation
+        // tree can name, per segment and in parallel, through
+        // `dv_columns_selected`: the whole sidecar also holds the text
+        // field's keyword column, nearly all of its bytes on a passage
+        // corpus, and decoding it for a facet panel cost seconds a segment
+        // and filled the hydration budget the page itself needs.
+        let selected: Option<Vec<Option<super::Resident<super::DocValueMap>>>> =
+            fts_rows.map(|_| {
+                use rayon::prelude::*;
+                let mut names = std::collections::BTreeSet::new();
+                agg_tree_strings(aggs_def, &mut names);
+                let wanted = |column: &str| agg_tree_may_read(&names, column);
+                snap.segments
+                    .par_iter()
+                    .map(|m| {
+                        if m.doc_count == 0 {
+                            None
+                        } else {
+                            self.dv_columns_selected(segments_dir, &m.id, &wanted)
+                        }
+                    })
+                    .collect()
+            });
+
         // Warm the per-segment column cache in parallel first: a cold
         // many-segment index would otherwise decode every `.dv` sidecar
         // serially inside this request (~0.2 s × segments).  The decode work
         // is CPU-bound and `dv_columns_for` is DashMap-backed, so a rayon
         // fan-out is safe; the whole search body already runs inside
         // `block_in_place`.
-        {
+        if selected.is_none() {
             use rayon::prelude::*;
             snap.segments.par_iter().for_each(|m| {
                 if m.doc_count > 0 {
@@ -891,16 +975,24 @@ impl Index {
         // Column sources.  A non-empty segment without a decodable `.dv`
         // sidecar makes the columnar view lossy → bail.
         let mut segs: Vec<SegEntry> = Vec::with_capacity(snap.segments.len());
-        for meta in &snap.segments {
+        for (at, meta) in snap.segments.iter().enumerate() {
             if meta.doc_count == 0 {
                 continue;
             }
-            let cols = self.dv_columns_for(segments_dir, &meta.id)?;
+            let cols = match &selected {
+                Some(selected) => selected[at].clone()?,
+                None => self.dv_columns_for(segments_dir, &meta.id)?,
+            };
             segs.push(SegEntry {
                 id: meta.id.clone(),
                 cols,
                 docs: meta.doc_count as u32,
                 ghosts: dirty_ghosts.get(&meta.id).cloned(),
+                rows: fts_rows.map(|rows| {
+                    rows.get(&meta.id)
+                        .cloned()
+                        .unwrap_or_else(|| std::sync::Arc::new(Vec::new()))
+                }),
             });
         }
 
@@ -947,7 +1039,7 @@ impl Index {
             Some(pred) => {
                 let mut total: u64 = 0;
                 for seg in &ctx.segs {
-                    let sp = resolve_pred(&seg.cols, pred, &ctx.segs, ctx.mapped_fields)?;
+                    let sp = resolve_top(seg, pred, &ctx.segs, ctx.mapped_fields)?;
                     total += match seg.ghosts.as_deref() {
                         None => seg_pred_count(&sp, seg.docs),
                         Some(g) => (0..seg.docs)
@@ -1503,6 +1595,7 @@ impl<'a> FastCtx<'a> {
                     | "stats"
                     | "value_count"
                     | "terms"
+                    | "date_histogram"
                     | "cardinality"
                     | "global"
                     | "extended_stats"
@@ -1823,7 +1916,7 @@ impl<'a> FastCtx<'a> {
             // `percentile_ranks` / `median_absolute_deviation` onto the O(N)
             // `_source` scan.
             let seg_pred = match &self.top_filter {
-                Some(p) => Some(resolve_pred(&s.cols, p, &self.segs, self.mapped_fields)?),
+                Some(p) => Some(resolve_top(s, p, &self.segs, self.mapped_fields)?),
                 None => None,
             };
             match s.col(field) {
@@ -1910,7 +2003,7 @@ impl<'a> FastCtx<'a> {
             // under a filter would have reported whole-index moments for a
             // filtered query (silently wrong, not merely slow).
             let seg_pred = match &self.top_filter {
-                Some(p) => Some(resolve_pred(&s.cols, p, &self.segs, self.mapped_fields)?),
+                Some(p) => Some(resolve_top(s, p, &self.segs, self.mapped_fields)?),
                 None => None,
             };
             match s.col(field) {
@@ -2443,12 +2536,7 @@ impl<'a> FastCtx<'a> {
         // every fused-pass consumer (terms, filtered metric) reduces over
         // exactly the matching doc set.
         let top_sp: Option<SegPred> = match &self.top_filter {
-            Some(pred) => Some(resolve_pred(
-                &seg.cols,
-                pred,
-                &self.segs,
-                self.mapped_fields,
-            )?),
+            Some(pred) => Some(resolve_top(seg, pred, &self.segs, self.mapped_fields)?),
             None => None,
         };
         // A terms window that names no ordinal in this segment resolves to
@@ -2946,6 +3034,9 @@ impl<'a> FastCtx<'a> {
             return None;
         }
         let field = params.get("field").and_then(Value::as_str)?;
+        if field == "_index" {
+            return self.exec_terms_index_name(params, sub, min_doc_count);
+        }
         // Boolean-mapped fields land in numeric 0/1 columns; the schema is
         // what licenses rendering them back as "false"/"true" term keys
         // (`typed_term_key` then emits key 0/1 + key_as_string, exactly
@@ -3319,6 +3410,65 @@ impl<'a> FastCtx<'a> {
         Some(json!({
             "doc_count_error_upper_bound": 0,
             "sum_other_doc_count": sum_other_doc_count,
+            "buckets": buckets
+        }))
+    }
+
+    /// `terms` on `_index`. The meta field has no doc-values column, but every
+    /// document of this index carries the index's name, so the brute
+    /// `run_terms` answers one bucket: the name, with the number of documents
+    /// aggregated (the matching ones under a top-level filter). Before this the
+    /// columnar path found no column, took `_index` for a field no document
+    /// holds, and answered no bucket at all.
+    fn exec_terms_index_name(
+        &self,
+        params: &Value,
+        sub: Option<&Value>,
+        min_doc_count: u64,
+    ) -> Option<Value> {
+        if sub.is_some() {
+            return None;
+        }
+        let orders = parse_orders(params);
+        if orders.iter().any(|(k, _)| k != "_count" && k != "_key") {
+            return None;
+        }
+        let mut count: u64 = 0;
+        for seg in &self.segs {
+            let sp = match &self.top_filter {
+                Some(pred) => Some(resolve_top(seg, pred, &self.segs, self.mapped_fields)?),
+                None => None,
+            };
+            count += match (sp, seg.ghosts.as_deref()) {
+                (None, None) => u64::from(seg.docs),
+                (Some(sp), None) => seg_pred_count(&sp, seg.docs),
+                (sp, Some(g)) => (0..seg.docs)
+                    .filter(|&row| {
+                        !ghost_bit(g, row) && sp.as_ref().is_none_or(|sp| seg_pred_matches(sp, row))
+                    })
+                    .count() as u64,
+            };
+        }
+        for doc in self.mem().iter() {
+            let counted = match &self.top_filter {
+                None => true,
+                Some(_) => self
+                    .top_filter_query
+                    .as_ref()
+                    .is_some_and(|q| doc_matches_filter(doc, q)),
+            };
+            if counted {
+                count += doc_count_weight(doc);
+            }
+        }
+        let buckets: Vec<Value> = if count == 0 || count < min_doc_count {
+            Vec::new()
+        } else {
+            vec![json!({"key": self.idx.name.as_str(), "doc_count": count})]
+        };
+        Some(json!({
+            "doc_count_error_upper_bound": 0,
+            "sum_other_doc_count": 0,
             "buckets": buckets
         }))
     }
@@ -4138,6 +4288,8 @@ impl<'a> FastCtx<'a> {
                 }
                 Some(())
             }
+            // A row set needs no column.
+            Pred::FtsRows => Some(()),
         }
     }
 
@@ -4614,6 +4766,41 @@ impl<'a> FastCtx<'a> {
                 continue;
             };
             let ord_ms = self.date_ord_index(seg, field)?;
+            // Under a top-level filter the per-ordinal histogram covers rows the
+            // query did not match: count the MATCHING rows per ordinal instead,
+            // and give a bucket only to ordinals some matching row holds (the
+            // brute path buckets the filtered documents alone, so neither its
+            // counts nor its gap-fill range see the others).
+            let matched_per_ord: Option<Vec<u64>> = match &self.top_filter {
+                None => None,
+                Some(pred) => {
+                    let sp = resolve_top(seg, pred, &self.segs, self.mapped_fields)?;
+                    let mut per_ord = vec![0u64; k.terms.len()];
+                    let kw_dense = k.null_bitmap.is_empty();
+                    for row in 0..seg.docs {
+                        if seg.ghosts.as_deref().is_some_and(|g| ghost_bit(g, row))
+                            || !seg_pred_matches(&sp, row)
+                        {
+                            continue;
+                        }
+                        let ord = if kw_dense {
+                            k.ords.get(row as usize).copied()
+                        } else {
+                            k.ord_for(row)
+                        };
+                        if let Some(ord) = ord {
+                            per_ord[ord as usize] += 1;
+                        }
+                    }
+                    Some(per_ord)
+                }
+            };
+            let ord_count = |ord: usize| -> u64 {
+                match &matched_per_ord {
+                    Some(per_ord) => per_ord.get(ord).copied().unwrap_or(0),
+                    None => k.per_ord_count.get(ord).copied().unwrap_or(0) as u64,
+                }
+            };
             // ord → bucket slot table.  Term ordinals are lexicographic and
             // ISO-8601 timestamps sort chronologically, so `ord_ms` is
             // (near-)ascending: memoise the current bucket's [start, end)
@@ -4626,7 +4813,7 @@ impl<'a> FastCtx<'a> {
             let mut ord_slot: Vec<i32> = Vec::with_capacity(k.terms.len());
             let mut run: Option<(i64, i64, i32)> = None; // (start, end, slot)
             for (ord, &ms) in ord_ms.iter().enumerate() {
-                if ms == i64::MIN || k.per_ord_count.get(ord).copied().unwrap_or(0) == 0 {
+                if ms == i64::MIN || ord_count(ord) == 0 {
                     ord_slot.push(-1);
                     continue;
                 }
@@ -4650,9 +4837,10 @@ impl<'a> FastCtx<'a> {
             // Bucket doc counts always come from the per-ord histogram —
             // exactly the count of rows with that (non-null) ordinal — so
             // the row pass below no longer pays a per-row counter bump.
-            for (ord, &cnt) in k.per_ord_count.iter().enumerate() {
+            for ord in 0..k.per_ord_count.len() {
+                let cnt = ord_count(ord);
                 if cnt > 0 && ord_slot[ord] >= 0 {
-                    counts[ord_slot[ord] as usize] += cnt as u64;
+                    counts[ord_slot[ord] as usize] += cnt;
                 }
             }
             if !has_row_work {
@@ -4695,8 +4883,18 @@ impl<'a> FastCtx<'a> {
             let Some(Column::Numeric(n)) = seg.col(field) else {
                 continue;
             };
+            let top_sp: Option<SegPred> = match &self.top_filter {
+                Some(pred) => Some(resolve_top(seg, pred, &self.segs, self.mapped_fields)?),
+                None => None,
+            };
             let mut row_slot: Vec<i32> = Vec::with_capacity(seg.docs as usize);
             for row in 0..seg.docs {
+                if seg.ghosts.as_deref().is_some_and(|g| ghost_bit(g, row))
+                    || top_sp.as_ref().is_some_and(|sp| !seg_pred_matches(sp, row))
+                {
+                    row_slot.push(-1);
+                    continue;
+                }
                 match n.get(row) {
                     // `NumericColumn::data` stores f64 BITS (see its doc comment
                     // + `exec_vwh`), not the raw integer — decode to the epoch-ms
@@ -4744,8 +4942,17 @@ impl<'a> FastCtx<'a> {
         }
 
         // Memtable docs — brute multi-value date extraction with per-doc
-        // bucket dedup.
+        // bucket dedup; under a top-level filter only the documents it matches
+        // (a full-text row set never reaches here with memtable documents).
         for doc in self.mem().iter() {
+            if self.top_filter.is_some()
+                && !self
+                    .top_filter_query
+                    .as_ref()
+                    .is_some_and(|q| doc_matches_filter(doc, q))
+            {
+                continue;
+            }
             let raws = extract_date_ms_values(doc, field);
             let weight = doc_count_weight(doc);
             let mut seen: Vec<i64> = Vec::with_capacity(raws.len());
@@ -5374,6 +5581,11 @@ enum Pred {
     /// `compile_pred` never yields this, so the filter/filters/adjacency
     /// executors are unaffected).
     And(Vec<Pred>),
+    /// The rows a full-text query matched, per segment (`SegEntry::rows`):
+    /// the top filter of [`Index::try_fast_aggs_over_fts_rows`]. Only
+    /// [`resolve_top`] resolves it (it needs the segment, not just its
+    /// columns); never produced by `compile_top_pred` / `compile_pred`.
+    FtsRows,
 }
 
 /// Compile a TOP-LEVEL query filter (`{size:0, query:Q, aggs:…}`) into a
@@ -5419,6 +5631,39 @@ fn compile_top_pred(filter: &Value) -> Option<Pred> {
 /// costs an extra clone, never correctness — so this deliberately mirrors
 /// the substring semantics (`top_hits` anywhere; the meta fields as exact
 /// key/string tokens, i.e. the serialized quoted form).
+/// Every string of an aggregation tree, object keys and string values alike:
+/// a superset of the field names its executors can look up.
+pub(super) fn agg_tree_strings(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m {
+                out.insert(k.clone());
+                agg_tree_strings(val, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|val| agg_tree_strings(val, out)),
+        Value::String(s) => {
+            out.insert(s.clone());
+        }
+        _ => {}
+    }
+}
+
+/// Whether a tree whose strings are `names` can read `.dv` column `column`:
+/// a string names the column, or a dotted name under it (`tag.keyword`, which
+/// [`dv_col`] resolves to `tag`, and every ancestor
+/// [`dotted_suffix_diverges_from_brute`] probes), or an object name above it.
+pub(super) fn agg_tree_may_read(names: &std::collections::BTreeSet<String>, column: &str) -> bool {
+    let under = |outer: &str, inner: &str| {
+        inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('.'))
+    };
+    names
+        .iter()
+        .any(|name| name == column || under(column, name) || under(name, column))
+}
+
 fn agg_tree_mentions_meta(v: &Value) -> bool {
     fn is_meta(s: &str) -> bool {
         s.contains("top_hits") || s == "_id" || s == "_index" || s == "_seq_no"
@@ -5629,6 +5874,8 @@ enum SegPred<'a> {
     PresExists(&'a PresenceColumn),
     /// Conjunction — every sub-predicate must match the row.
     And(Vec<SegPred<'a>>),
+    /// A full-text match set over the segment's rows (see `Pred::FtsRows`).
+    Rows(&'a [u64]),
 }
 
 /// Columnarise `pred` against one segment's doc-values.
@@ -5762,7 +6009,25 @@ fn resolve_pred<'a>(
             }
             SegPred::And(resolved)
         }
+        // The row set lives on the segment, not in its columns: only
+        // `resolve_top` resolves it. Anything else asking bails to brute.
+        Pred::FtsRows => return None,
     })
+}
+
+/// [`resolve_pred`] for the request's TOP filter, which may be the per-segment
+/// full-text row set ([`Pred::FtsRows`]); every other predicate resolves from
+/// the segment's columns as before.
+fn resolve_top<'a>(
+    seg: &'a SegEntry,
+    pred: &Pred,
+    segs: &[SegEntry],
+    mapped_fields: &std::collections::HashSet<String>,
+) -> Option<SegPred<'a>> {
+    match pred {
+        Pred::FtsRows => Some(SegPred::Rows(seg.rows.as_deref()?.as_slice())),
+        _ => resolve_pred(&seg.cols, pred, segs, mapped_fields),
+    }
 }
 
 #[inline]
@@ -5812,6 +6077,9 @@ fn seg_pred_matches(sp: &SegPred<'_>, row: u32) -> bool {
         SegPred::NumExists(n) => !n.null_bitmap.contains(row),
         SegPred::PresExists(p) => p.contains(row),
         SegPred::And(subs) => subs.iter().all(|s| seg_pred_matches(s, row)),
+        SegPred::Rows(bits) => bits
+            .get((row / 64) as usize)
+            .is_some_and(|w| w & (1u64 << (row % 64)) != 0),
     }
 }
 
@@ -5844,6 +6112,7 @@ fn seg_pred_count(sp: &SegPred<'_>, docs: u32) -> u64 {
         // reached from the top-level filter count (compile_pred, used by the
         // filter/filters executors, never yields `And`).
         SegPred::And(_) => (0..docs).filter(|&row| seg_pred_matches(sp, row)).count() as u64,
+        SegPred::Rows(bits) => bits.iter().map(|w| u64::from(w.count_ones())).sum(),
     }
 }
 
@@ -6119,6 +6388,7 @@ mod range_kw_tests {
             cols: crate::segment_cache_budget::CacheResident::uncached(m),
             docs: 2,
             ghosts: None,
+            rows: None,
         };
         assert!(
             seg.col("extension").is_some(),
@@ -6297,6 +6567,7 @@ mod range_kw_tests {
             cols: crate::segment_cache_budget::CacheResident::uncached(cols),
             docs: 1,
             ghosts: None,
+            rows: None,
         }
     }
 
@@ -6764,5 +7035,50 @@ mod range_kw_tests {
             resolve_pred(&c, &p, &[], &std::collections::HashSet::new()).expect("resolvable"),
             SegPred::Never
         ));
+    }
+}
+
+#[cfg(test)]
+mod column_selection_tests {
+    use super::*;
+
+    /// The columns a tree can read: named outright, through `.keyword`
+    /// (resolved to the base column), through any ancestor the multi-field
+    /// divergence probe looks at, and under an object name. A column only
+    /// sharing a prefix without the dot is not read.
+    #[test]
+    fn a_tree_reads_its_named_columns_their_ancestors_and_object_children() {
+        let mut names = std::collections::BTreeSet::new();
+        agg_tree_strings(
+            &serde_json::json!({
+                "a": {"terms": {"field": "tag.keyword"}},
+                "b": {"terms": {"field": "extension.raw.raw"},
+                      "aggs": {"c": {"avg": {"field": "bytes"}}}},
+                "d": {"filter": {"term": {"geo": "x"}}},
+                "e": {"top_hits": {"sort": [{"ts": "desc"}]}}
+            }),
+            &mut names,
+        );
+        for column in [
+            "tag",
+            "extension",
+            "extension.raw",
+            "bytes",
+            "geo.lat",
+            "ts",
+        ] {
+            assert!(agg_tree_may_read(&names, column), "{column}");
+        }
+        for column in [
+            "text",
+            "body",
+            "cat",
+            "tags",
+            "byte",
+            "geo_point",
+            "extension_raw",
+        ] {
+            assert!(!agg_tree_may_read(&names, column), "{column}");
+        }
     }
 }

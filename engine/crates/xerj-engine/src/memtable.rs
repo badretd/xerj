@@ -2782,6 +2782,70 @@ impl ShardedFtsMemtable {
         }
         (docs, bytes)
     }
+
+    /// Every shard's frozen generations right now, claimed or not, as
+    /// `(shard_idx, generations)` for the shards that have any.
+    ///
+    /// `Index::flush` takes this once its own shard flushes are done and
+    /// reports success only after each of these has left its shard's frozen
+    /// list, which happens at publish ([`FrozenClaim::retire`]). The handles
+    /// are `Weak`: a waiting flush keeps no retired generation alive, and an
+    /// address it holds cannot be reused by a later generation.
+    pub(crate) fn frozen_generations_by_shard(
+        &self,
+    ) -> Vec<(
+        usize,
+        Vec<std::sync::Weak<parking_lot::RwLock<FtsMemtable>>>,
+    )> {
+        self.shards
+            .iter()
+            .enumerate()
+            .filter_map(|(shard_idx, shard)| {
+                let g = shard.read();
+                (!g.frozen.is_empty()).then(|| {
+                    let generations = g.frozen.iter().map(|fg| Arc::downgrade(&fg.gen)).collect();
+                    (shard_idx, generations)
+                })
+            })
+            .collect()
+    }
+
+    /// Keep the generations of `generations` (taken from shard `shard_idx`
+    /// by [`Self::frozen_generations_by_shard`]) that still have to be
+    /// published. Returns `true` when one of them is unclaimed: the flush
+    /// that drained it failed and released it, so nobody is building it any
+    /// more and the caller has to drain the shard itself.
+    ///
+    /// Gone from the frozen list means published. An unclaimed generation
+    /// with no documents left (every one deleted while it was frozen) has
+    /// nothing to publish and is dropped too: frozen generations take no new
+    /// writes.
+    pub(crate) fn retain_still_frozen(
+        &self,
+        shard_idx: usize,
+        generations: &mut Vec<std::sync::Weak<parking_lot::RwLock<FtsMemtable>>>,
+    ) -> bool {
+        let g = self.shards[shard_idx].read();
+        let mut released = false;
+        generations.retain(|weak| {
+            let Some(fg) = g
+                .frozen
+                .iter()
+                .find(|fg| std::ptr::eq(Arc::as_ptr(&fg.gen), weak.as_ptr()))
+            else {
+                return false;
+            };
+            if fg.claimed {
+                return true;
+            }
+            if fg.gen.read().doc_count() == 0 {
+                return false;
+            }
+            released = true;
+            true
+        });
+        released
+    }
 }
 
 impl FrozenClaim {

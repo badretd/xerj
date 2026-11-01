@@ -154,6 +154,11 @@ pub(crate) fn validate_brain(brain: &str) -> Result<(), String> {
     if brain.ends_with("-edges") {
         return Err("namespace suffix '-edges' is reserved for graph edge indices".into());
     }
+    // `-facts`: brain `kb-facts`'s default nodes index is facts namespace `kb`'s index. Reserved in builds with the
+    // facts store only (feature `facts`), like the other copies of this rule.
+    if cfg!(feature = "facts") && brain.ends_with("-facts") {
+        return Err("namespace suffix '-facts' is reserved for facts indices".into());
+    }
     Ok(())
 }
 
@@ -1071,4 +1076,31 @@ fn es_wire_search_empty_ok() -> Response {
         "aggregations": {},
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod brain_name_tests {
+    use super::validate_brain;
+
+    /// The console's copy of the brain-name rule agrees with `xerj_api::graph_api` and `xerj_autoindex::detect`:
+    /// `-edges` always, `-facts` in builds with the facts store (brain `kb-facts`'s default nodes index is facts
+    /// namespace `kb`'s index).
+    #[test]
+    fn brain_names_reserve_the_edges_and_facts_suffixes() {
+        assert!(validate_brain("notes").is_ok());
+        assert_eq!(
+            validate_brain("kb-edges").unwrap_err(),
+            "namespace suffix '-edges' is reserved for graph edge indices"
+        );
+        let r = validate_brain("kb-facts");
+        if cfg!(feature = "facts") {
+            assert_eq!(
+                r.unwrap_err(),
+                "namespace suffix '-facts' is reserved for facts indices"
+            );
+        } else {
+            assert!(r.is_ok(), "{r:?}");
+        }
+        assert!(validate_brain("kb-factsheet").is_ok());
+    }
 }

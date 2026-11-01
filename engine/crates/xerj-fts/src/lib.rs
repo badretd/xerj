@@ -76,15 +76,16 @@ pub use bm25::{
 };
 
 pub use index::{
-    segment_indexed_field_names, segments_indexed_field_names, FieldIndexConfig, FieldValues,
-    FtsIndexReader, FtsIndexWriter, FtsMergeSource, POSITION_INCREMENT_GAP,
+    segment_indexed_field_names, segments_indexed_field_names, FieldIndexConfig, FieldLengths,
+    FieldValues, FtsIndexReader, FtsIndexWriter, FtsMergeSource, POSITION_INCREMENT_GAP,
 };
 
 pub use postings::{
-    DecodedPosting, PostingsReader, PostingsWriter, TermPostings, BLOCK_SIZE, SKIP_INTERVAL,
+    BlockCursor, BlockIndex, DecodedPosting, Impact, PostingsReader, PostingsWriter, TermBlocks,
+    TermPostings, BLOCK_SIZE, SKIP_INTERVAL,
 };
 
 pub use search::{
-    phrase_positions_match, search_segments, BoolQuery, FtsSearcher, PhraseQuery, PrefixQuery,
-    Query, ScoredHit, TermQuery,
+    phrase_positions_match, search_segments, tree_walk_enabled, BoolQuery, FtsSearcher,
+    PhraseQuery, PrefixQuery, Query, ScoredHit, SharedFloor, TermQuery, WalkStats,
 };

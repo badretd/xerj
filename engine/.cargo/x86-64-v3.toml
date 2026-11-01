@@ -1,0 +1,15 @@
+# Opt-in x86-64-v3 build: Haswell, Zen 1 and newer x86 CPUs (AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE). Cargo reads this file
+# only when it is named on the command line, so the default build is unchanged:
+#
+#   cd engine && cargo build --release --locked --config .cargo/x86-64-v3.toml -p xerj-server --features facts
+#
+# Cargo appends these flags after the x86-64-v2 flags of config.toml and rustc keeps the last `-C target-cpu`, so the whole
+# binary targets x86-64-v3: also the code the default build leaves at SSE4.2, and without the x86-64-v2 tuning that makes
+# LLVM split every unaligned 256-bit load into two 128-bit halves. Such a binary stops with an illegal instruction on a CPU
+# without AVX2 / FMA; the default x86-64-v2 build runs on any x86-64-v2 CPU and selects its AVX2 kernels at run time
+# (#2161), so this stays an explicit choice for hosts known to have AVX2.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

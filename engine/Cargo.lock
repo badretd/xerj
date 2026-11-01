@@ -7386,6 +7386,7 @@ dependencies = [
  "xerj-cluster",
  "xerj-common",
  "xerj-engine",
+ "xerj-facts",
  "xerj-hub",
  "xerj-query",
  "xerj-rerank",
@@ -7626,6 +7627,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "xerj-exec"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "smallvec",
+ "unicode-normalization",
+ "xerj-index",
+ "xerj-store",
+]
+
+[[package]]
+name = "xerj-facts"
+version = "1.0.0-rc.100"
+dependencies = [
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tokenizers",
+ "tokio",
+ "xerj-exec",
+ "xerj-index",
+ "xerj-infer",
+ "xerj-serve",
+ "xerj-store",
+]
+
+[[package]]
 name = "xerj-fts"
 version = "1.0.0-rc.100"
 dependencies = [
@@ -7674,6 +7703,29 @@ dependencies = [
  "xerj-common",
  "xerj-engine",
  "zstd",
+]
+
+[[package]]
+name = "xerj-index"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smallvec",
+ "xerj-store",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "xerj-infer"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+ "serde_json",
 ]
 
 [[package]]
@@ -7743,6 +7795,19 @@ dependencies = [
  "tokio",
  "tracing",
  "xerj-ai",
+]
+
+[[package]]
+name = "xerj-serve"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "smallvec",
+ "xerj-exec",
+ "xerj-index",
+ "xerj-infer",
+ "xerj-store",
 ]
 
 [[package]]
@@ -7832,6 +7897,21 @@ dependencies = [
  "xerj-common",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "xerj-store"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.0",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smallvec",
+ "unicode-normalization",
 ]
 
 [[package]]

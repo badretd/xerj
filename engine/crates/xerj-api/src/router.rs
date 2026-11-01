@@ -251,6 +251,16 @@ pub fn build_es_compat_router(state: AppState) -> Router {
 /// hands to the gRPC `XerjHub` service, so the two surfaces count one client
 /// against ONE hub rate-limit budget (and share one query-slot pool and one
 /// catalogue cache) instead of each granting the full allowance.
+/// SPIKE `/_facts` routes; empty without the `facts` feature.
+#[cfg(feature = "facts")]
+fn facts_routes() -> Router<AppState> {
+    crate::facts_api::routes()
+}
+#[cfg(not(feature = "facts"))]
+fn facts_routes() -> Router<AppState> {
+    Router::new()
+}
+
 pub fn build_es_compat_router_with_hub(
     state: AppState,
     hub: std::sync::Arc<hub_api::HubShared>,
@@ -958,6 +968,8 @@ pub fn build_es_compat_router_with_hub(
                 .post(memory_api::unsupported_memory_verb)
                 .put(memory_api::unsupported_memory_verb),
         )
+        // ── SPIKE: XERJ-R facts (feature `facts`; local branch, never pushed) ──
+        .merge(facts_routes())
         // ── Corpus Hub hosted endpoints ───────────────────────────────────────
         // Four read-only GET routes that answer from the packs restored on this
         // node (`hub_api.rs`; plan §6). Always mounted and keyed like every

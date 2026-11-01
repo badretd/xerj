@@ -2899,6 +2899,7 @@ fn check_bulk_outcome(
             outcome.server_errors,
             patience,
             &reason,
+            outcome.breaker_held,
         )));
     }
     if outcome.server_errors > 0 {
@@ -6181,6 +6182,7 @@ mod tests {
                     items: 7,
                     patience: std::time::Duration::from_secs(120),
                     reason: "breaker".into(),
+                    breaker_held: None,
                 }))
                 .context("replay sealed bulk");
             }

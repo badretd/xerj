@@ -24453,8 +24453,20 @@ const FILE_CARD_LOCATOR: &str = "file";
 /// file was inflating it. An explicit query is left alone, so a caller who
 /// asks for `ax_locator: file` still gets those documents, and a term query
 /// that cannot run (the field is absent) leaves the stat count unchanged.
+///
+/// An index whose mapping has no `ax_locator` field holds no file cards, so
+/// its count is the stat count and no search runs. The term query is not
+/// free there: on an unmapped field it is answered by the stored-document
+/// scan, which decodes every document of every segment. `_cat/indices`,
+/// `_cat/shards` and a bare `_count` all land here, and the result cache only
+/// helps until the next write, so a monitor polling `_cat/indices` during a
+/// bulk load re-ran that scan on every poll: 1.8 s per call on 1 M passages
+/// and more than 25 s on 6.2 M, measured.
 async fn content_doc_count(idx: &xerj_engine::index::Index) -> u64 {
     let total = idx.stats().await.doc_count;
+    if idx.schema().await.field("ax_locator").is_none() {
+        return total;
+    }
     let body = json!({
         "query": {"term": {"ax_locator": FILE_CARD_LOCATOR}},
         "size": 0,

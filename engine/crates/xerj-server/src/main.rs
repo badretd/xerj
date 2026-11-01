@@ -3141,6 +3141,41 @@ fn main() -> Result<()> {
 /// returns ("Goodbye" has been logged and the final flush is done).
 const RUNTIME_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The default budget of the final flush at shutdown (#1635).
+const SHUTDOWN_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The final flush's budget at shutdown: [`SHUTDOWN_FLUSH_BUDGET`], or the
+/// whole seconds of `XERJ_SHUTDOWN_FLUSH_SECS` (`raw`) when that is a positive
+/// number. Anything else (unset, empty, 0, not a whole number) keeps the
+/// default.
+fn shutdown_flush_budget(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map_or(SHUTDOWN_FLUSH_BUDGET, std::time::Duration::from_secs)
+}
+
+#[cfg(test)]
+mod shutdown_flush_budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_shutdown_flush_budget_stays_10s_unless_set_to_whole_seconds() {
+        let default = std::time::Duration::from_secs(10);
+        assert_eq!(shutdown_flush_budget(None), default);
+        for raw in ["", " ", "0", "-5", "abc", "1.5"] {
+            assert_eq!(shutdown_flush_budget(Some(raw)), default, "{raw:?}");
+        }
+        assert_eq!(
+            shutdown_flush_budget(Some("600")),
+            std::time::Duration::from_secs(600)
+        );
+        assert_eq!(
+            shutdown_flush_budget(Some(" 45 ")),
+            std::time::Duration::from_secs(45)
+        );
+    }
+}
+
 /// Drive the server future to completion, then tear the runtime down without
 /// waiting more than [`RUNTIME_SHUTDOWN_TIMEOUT`] for blocking jobs.
 ///
@@ -4520,6 +4555,14 @@ async fn async_main() -> Result<()> {
         }
     }
 
+    // 3e. Facts compiler preload (`XERJ_FACTS_PRELOAD`, off by default): start the model load now, in a background
+    //     thread, so it overlaps with opening the data directory and the engine; the facts service created in step 9
+    //     adopts this load instead of starting its own just before the listeners open.
+    #[cfg(feature = "facts")]
+    if xerj_api::facts_api::start_early_preload() {
+        info!("facts: compiler load started at start-up (XERJ_FACTS_PRELOAD)");
+    }
+
     // 4. Data directory — report after resolution/creation, before admin/TLS state.
     let data_dir_report =
         startup_data_dir::prepare(Path::new(&cfg.server.data_dir), data_dir_origin)?;
@@ -5244,8 +5287,13 @@ async fn async_main() -> Result<()> {
         let flush_started = std::time::Instant::now();
         // Bounded (#1635): a wedged memtable flush must not re-hang shutdown.
         // Docs live in the WAL and replay on the next boot, so a skipped
-        // final flush is non-destructive.
-        let flush_budget = std::time::Duration::from_secs(10);
+        // final flush is non-destructive. The final flush also waits for the
+        // segment builds other flushes still have in flight; one cut off by
+        // this budget is replayed from the WAL on the next start, which takes
+        // minutes after a large bulk load. `XERJ_SHUTDOWN_FLUSH_SECS` raises
+        // the budget where the supervisor allows a longer stop (opt-in).
+        let flush_budget =
+            shutdown_flush_budget(std::env::var("XERJ_SHUTDOWN_FLUSH_SECS").ok().as_deref());
         match tokio::time::timeout(flush_budget, state.engine.flush_all_force()).await {
             Ok(()) => info!("final flush complete in {:.0?}", flush_started.elapsed()),
             Err(_) => warn!(

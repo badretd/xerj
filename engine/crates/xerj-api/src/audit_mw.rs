@@ -195,6 +195,11 @@ fn classify(method: &Method, path: &str) -> Option<Audited> {
     if segs.first() == Some(&"_xerj-console") {
         return None;
     }
+    // `/_facts/{ns}/…`: the resource is the namespace's facts index — the name a
+    // grant must hold — not the `_facts` endpoint, and `_ask` / `_lookup` are reads.
+    if segs.first() == Some(&"_facts") {
+        return Some(classify_facts(method, &segs));
+    }
     let mutating = matches!(
         *method,
         Method::PUT | Method::POST | Method::DELETE | Method::PATCH
@@ -276,6 +281,44 @@ fn classify_share(method: &Method, segs: &[&str]) -> Audited {
         resource,
         only_if_denied: true,
         handler_audits: true,
+    }
+}
+
+/// `/_facts[/{ns}[/…]]` (design §5.4 "Guests, audit, cluster").
+///
+/// Writes (`_bulk`, `_world`, a fact's withdrawal, a namespace's deletion) are
+/// recorded whatever the outcome; the reads (`_ask`, `_lookup`, the status and
+/// the listing) only when refused, like every other read. Without this the
+/// generic rule below filed a question (`POST …/_ask`) as a write named
+/// `facts.post` on the resource `_facts`, which says neither what happened nor
+/// to which namespace.
+fn classify_facts(method: &Method, segs: &[&str]) -> Audited {
+    let Some(ns) = segs.get(1) else {
+        return Audited {
+            op: "facts.list".to_string(),
+            resource: "_facts".to_string(),
+            only_if_denied: true,
+            handler_audits: false,
+        };
+    };
+    let read = matches!(*method, Method::GET | Method::HEAD)
+        || (*method == Method::POST && segs.len() == 3 && matches!(segs[2], "_ask" | "_lookup"));
+    let op = match (method, segs.get(2).copied(), segs.len()) {
+        (&Method::GET | &Method::HEAD, Some(_), 3) => "facts.get".to_string(),
+        (&Method::GET | &Method::HEAD, _, _) => "facts.status".to_string(),
+        (&Method::POST, Some("_ask"), 3) => "facts.ask".to_string(),
+        (&Method::POST, Some("_lookup"), 3) => "facts.lookup".to_string(),
+        (&Method::POST, Some("_bulk"), 3) => "facts.bulk".to_string(),
+        (&Method::POST, Some("_world"), 3) => "facts.world".to_string(),
+        (&Method::DELETE, None, 2) => "facts.delete".to_string(),
+        (&Method::DELETE, Some(_), 3) => "facts.withdraw".to_string(),
+        (m, _, _) => format!("facts.{}", verb(m)),
+    };
+    Audited {
+        op,
+        resource: crate::authz::facts_index(ns),
+        only_if_denied: read,
+        handler_audits: false,
     }
 }
 
@@ -694,6 +737,46 @@ mod tests {
         assert_eq!(
             c(Method::POST, "/v1/indices"),
             Some(("index.create".into(), "_indices".into()))
+        );
+    }
+
+    /// `/_facts`: writes are recorded against the namespace's facts index, and a
+    /// question is a read (recorded only when refused), never a write on `_facts`.
+    #[test]
+    fn facts_routes_audit_the_facts_index_and_questions_are_reads() {
+        let idx = ".xerj-memory-alpha-facts";
+        let w = |op: &str| Some((op.to_string(), idx.to_string()));
+        assert_eq!(c(Method::POST, "/_facts/alpha/_bulk"), w("facts.bulk"));
+        assert_eq!(c(Method::POST, "/_facts/alpha/_world"), w("facts.world"));
+        assert_eq!(c(Method::DELETE, "/_facts/alpha/f1"), w("facts.withdraw"));
+        assert_eq!(c(Method::DELETE, "/_facts/alpha"), w("facts.delete"));
+        for (m, path) in [
+            (Method::POST, "/_facts/alpha/_ask"),
+            (Method::POST, "/_facts/alpha/_lookup"),
+            (Method::GET, "/_facts/alpha"),
+            (Method::GET, "/_facts/alpha/f1"),
+            (Method::GET, "/_facts"),
+        ] {
+            assert_eq!(c(m, path), None, "{path} is not a write");
+        }
+        assert_eq!(denied_only(Method::GET, "/_facts/alpha/f1"), w("facts.get"));
+        assert_eq!(
+            denied_only(Method::POST, "/_facts/alpha/_ask"),
+            w("facts.ask")
+        );
+        assert_eq!(
+            denied_only(Method::POST, "/_facts/alpha/_lookup"),
+            w("facts.lookup")
+        );
+        assert_eq!(denied_only(Method::GET, "/_facts/alpha"), w("facts.status"));
+        assert_eq!(
+            denied_only(Method::GET, "/_facts"),
+            Some(("facts.list".into(), "_facts".into()))
+        );
+        // a read op counts only in its own position
+        assert_eq!(
+            c(Method::POST, "/_facts/_ask/_bulk"),
+            Some(("facts.bulk".into(), ".xerj-memory-_ask-facts".into()))
         );
     }
 

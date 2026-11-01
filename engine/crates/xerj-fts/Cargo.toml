@@ -25,6 +25,8 @@ rayon.workspace = true
 memmap2 = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
+# Unlinked spill files for decompressed postings (`FtsIndexReader::spill_postings_to`).
+tempfile = { workspace = true }
 
 # Direct deps (not in workspace)
 unicode-segmentation = "1"

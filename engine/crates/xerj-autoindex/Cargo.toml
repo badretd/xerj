@@ -6,6 +6,12 @@ license.workspace = true
 authors.workspace = true
 description = "xerj autoindex — point it at any folder and make the contents AI-searchable with zero configuration"
 
+[features]
+# Reserve the `-facts` suffix in brain names: the facts store (`/_facts/{ns}`) keeps namespace `kb`'s facts in
+# `.xerj-memory-kb-facts`, brain `kb-facts`'s default nodes index. Off by default (no existing name changes); the
+# engine turns it on with its own `facts` feature (xerj-api / xerj-server).
+facts = []
+
 [dependencies]
 # The machine-resource policy (cores, memory safe zone, thread priority) is
 # shared with the server: one policy, one place (#240).

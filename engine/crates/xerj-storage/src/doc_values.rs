@@ -87,7 +87,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use fst::{Map as FstMap, MapBuilder};
 use roaring::RoaringBitmap;
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 const MAGIC: u32 = 0x44_56_30_31; // "DV01"
 const KIND_NUMERIC: u8 = 0;
@@ -1074,45 +1074,59 @@ pub fn encode_columns_at_level(columns: &BTreeMap<String, Column>, level: i32) -
 }
 
 pub fn decode_columns(bytes: &[u8]) -> Result<BTreeMap<String, Column>> {
-    let mut cur = Cursor::new(bytes);
-    let magic = cur.read_u32::<LittleEndian>().map_err(io_to_storage)?;
+    decode_columns_selected(Cursor::new(bytes), |_| true)
+}
+
+/// [`decode_columns`] restricted to the columns `keep` accepts. Every other
+/// column's payload is passed over by its recorded length: never read, never
+/// decompressed. A `.dv` file carries a keyword column for each indexed
+/// string field, a text field's whole values included, and on a passage
+/// corpus that one column is nearly all of the file (1 M Wikipedia passages:
+/// 169 MB of a segment's 170 MB sidecar), so a reader that wants a few facet
+/// columns should not pay for it.
+///
+/// A skipped payload that would run past the end of the input is an error,
+/// as a short read of a kept one is.
+pub fn decode_columns_selected<R: Read + Seek>(
+    mut input: R,
+    keep: impl Fn(&str) -> bool,
+) -> Result<BTreeMap<String, Column>> {
+    let start = input.stream_position().map_err(io_to_storage)?;
+    let end = input.seek(SeekFrom::End(0)).map_err(io_to_storage)?;
+    input.seek(SeekFrom::Start(start)).map_err(io_to_storage)?;
+    let magic = input.read_u32::<LittleEndian>().map_err(io_to_storage)?;
     if magic != MAGIC {
         return Err(StorageError::Other(anyhow::anyhow!(
             "doc-values magic mismatch: {:#x}",
             magic
         )));
     }
-    let num_columns = cur.read_u32::<LittleEndian>().map_err(io_to_storage)?;
+    let num_columns = input.read_u32::<LittleEndian>().map_err(io_to_storage)?;
     let mut out = BTreeMap::new();
     for _ in 0..num_columns {
-        let kind_byte = cur.read_u8().map_err(io_to_storage)?;
-        let is_zstd = (kind_byte & KIND_FLAG_ZSTD) != 0;
-        let kind = kind_byte & KIND_MASK;
-        let name_len = cur.read_u32::<LittleEndian>().map_err(io_to_storage)? as usize;
+        let kind_byte = input.read_u8().map_err(io_to_storage)?;
+        let name_len = input.read_u32::<LittleEndian>().map_err(io_to_storage)? as usize;
         let mut name_bytes = vec![0u8; name_len];
-        cur.read_exact(&mut name_bytes).map_err(io_to_storage)?;
+        input.read_exact(&mut name_bytes).map_err(io_to_storage)?;
         let name = String::from_utf8(name_bytes)
             .map_err(|e| StorageError::Other(anyhow::anyhow!("dv field name utf8: {e}")))?;
-        let payload_len = cur.read_u64::<LittleEndian>().map_err(io_to_storage)? as usize;
-        let mut compressed = vec![0u8; payload_len];
-        cur.read_exact(&mut compressed).map_err(io_to_storage)?;
-        let payload = if is_zstd {
-            zstd::decode_all(&compressed[..])
-                .map_err(|e| StorageError::Other(anyhow::anyhow!("dv zstd decompress: {e}")))?
-        } else {
-            lz4_flex::decompress_size_prepended(&compressed)
-                .map_err(|e| StorageError::Other(anyhow::anyhow!("dv lz4 decompress: {e}")))?
-        };
-        let column = match kind {
-            KIND_NUMERIC => Some(Column::Numeric(NumericColumn::decode(&payload)?)),
-            KIND_KEYWORD => Some(Column::Keyword(KeywordColumn::decode(&payload)?)),
-            KIND_PRESENCE => Some(Column::Presence(PresenceColumn::decode(&payload)?)),
-            // A kind this build does not know is skipped, not fatal: failing
-            // the whole sidecar would drop every keyword and numeric column
-            // beside it. The unknown field falls through to the source scan.
-            _ => None,
-        };
-        if let Some(column) = column {
+        let payload_len = input.read_u64::<LittleEndian>().map_err(io_to_storage)?;
+        if !keep(&name) {
+            let at = input.stream_position().map_err(io_to_storage)?;
+            let next = at
+                .checked_add(payload_len)
+                .filter(|&next| next <= end)
+                .ok_or_else(|| {
+                    StorageError::Other(anyhow::anyhow!(
+                        "doc-values column {name:?} ({payload_len} bytes at {at}) runs past the end ({end})"
+                    ))
+                })?;
+            input.seek(SeekFrom::Start(next)).map_err(io_to_storage)?;
+            continue;
+        }
+        let mut compressed = vec![0u8; payload_len as usize];
+        input.read_exact(&mut compressed).map_err(io_to_storage)?;
+        if let Some(column) = decode_column_payload(kind_byte, &compressed)? {
             out.insert(name, column);
         }
     }
@@ -1179,6 +1193,29 @@ pub fn estimate_decoded_bytes(bytes: &[u8], doc_count: u64) -> u64 {
         });
     }
     total
+}
+
+/// One column's payload as [`encode_columns_at_level`] framed it: zstd, or
+/// legacy LZ4, by the kind byte's high bit.
+fn decode_column_payload(kind_byte: u8, compressed: &[u8]) -> Result<Option<Column>> {
+    let is_zstd = (kind_byte & KIND_FLAG_ZSTD) != 0;
+    let kind = kind_byte & KIND_MASK;
+    let payload = if is_zstd {
+        zstd::decode_all(compressed)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("dv zstd decompress: {e}")))?
+    } else {
+        lz4_flex::decompress_size_prepended(compressed)
+            .map_err(|e| StorageError::Other(anyhow::anyhow!("dv lz4 decompress: {e}")))?
+    };
+    Ok(match kind {
+        KIND_NUMERIC => Some(Column::Numeric(NumericColumn::decode(&payload)?)),
+        KIND_KEYWORD => Some(Column::Keyword(KeywordColumn::decode(&payload)?)),
+        KIND_PRESENCE => Some(Column::Presence(PresenceColumn::decode(&payload)?)),
+        // A kind this build does not know is skipped, not fatal: failing
+        // the whole sidecar would drop every keyword and numeric column
+        // beside it. The unknown field falls through to the source scan.
+        _ => None,
+    })
 }
 
 fn io_to_storage(e: std::io::Error) -> StorageError {
@@ -1628,5 +1665,62 @@ mod tests {
         assert!(!decoded.contains_key("odd"));
         assert!(matches!(decoded.get("msg"), Some(Column::Presence(_))));
         assert!(matches!(decoded.get("ax_file"), Some(Column::Keyword(_))));
+    }
+
+    #[test]
+    fn selected_decode_keeps_the_chosen_columns_and_never_reads_the_others() {
+        let mut cols = BTreeMap::new();
+        cols.insert(
+            "cat".to_string(),
+            Column::Keyword(
+                KeywordColumn::from_iter(["c0", "c1", "c0"].map(|s| Some(s.to_string()))).unwrap(),
+            ),
+        );
+        cols.insert(
+            "n".to_string(),
+            Column::Numeric(NumericColumn::from_iter(vec![Some(7), None, Some(9)])),
+        );
+        let good = encode_columns(&cols);
+        let full = decode_columns(&good).unwrap();
+
+        // The same two columns behind a `text` column whose payload is not a
+        // zstd frame at all: a reader that touched it would fail.
+        let mut framed = Vec::new();
+        framed.write_u32::<LittleEndian>(MAGIC).unwrap();
+        framed.write_u32::<LittleEndian>(3).unwrap();
+        framed.write_u8(KIND_KEYWORD | KIND_FLAG_ZSTD).unwrap();
+        framed.write_u32::<LittleEndian>(4).unwrap();
+        framed.extend_from_slice(b"text");
+        let garbage = vec![0xA5u8; 4096];
+        framed
+            .write_u64::<LittleEndian>(garbage.len() as u64)
+            .unwrap();
+        framed.extend_from_slice(&garbage);
+        framed.extend_from_slice(&good[8..]);
+        assert!(
+            decode_columns(&framed).is_err(),
+            "the whole decode reads `text`"
+        );
+
+        let kept =
+            decode_columns_selected(Cursor::new(&framed[..]), |name| name != "text").unwrap();
+        assert_eq!(kept.keys().collect::<Vec<_>>(), ["cat", "n"]);
+        for name in ["cat", "n"] {
+            let one = |c: &Column| encode_columns(&BTreeMap::from([(name.to_string(), c.clone())]));
+            assert_eq!(
+                one(&kept[name]),
+                one(&full[name]),
+                "{name} decodes as in the whole read"
+            );
+        }
+        let none = decode_columns_selected(Cursor::new(&framed[..]), |_| false).unwrap();
+        assert!(none.is_empty());
+
+        // A skipped payload that claims more bytes than the input holds is
+        // an error, not a silent end of the column list.
+        let mut short = framed[..framed.len() - good.len() + 8].to_vec();
+        let at = 8 + 1 + 4 + 4;
+        short[at..at + 8].copy_from_slice(&(1u64 << 40).to_le_bytes());
+        assert!(decode_columns_selected(Cursor::new(&short[..]), |name| name != "text").is_err());
     }
 }

@@ -47,6 +47,10 @@ pub(crate) type Resident<T> = Arc<CacheResident<T>>;
 pub(crate) type DocValueMap = std::collections::BTreeMap<String, xerj_storage::doc_values::Column>;
 
 fn index_segment_hydration_budget(_config: &Config) -> Arc<SegmentHydrationBudget> {
+    #[cfg(test)]
+    if let Some(budget) = TEST_INDEX_HYDRATION_BUDGET.with(|b| b.borrow_mut().take()) {
+        return budget;
+    }
     if let Some(governor) = crate::governor::global() {
         return governor.segment_hydration_budget();
     }
@@ -5985,6 +5989,441 @@ mod flush_publication_recovery_tests {
         .unwrap();
         assert!(idx.search(&request).await.unwrap().hits.is_empty());
     }
+
+    /// Index with one ingest shard and eight documents whose flush is parked inside its
+    /// segment build: the documents are claimed (frozen, still searchable) and not yet
+    /// in a published segment. This is where a threshold flush started by the ingest
+    /// path spends most of its time on a fast bulk load. With `first_build_fails` the
+    /// parked build fails once it is released, and its flush releases the claim, as a
+    /// failed threshold flush does.
+    async fn eight_docs_claimed_by_a_parked_flush(
+        dir: &std::path::Path,
+        name: &str,
+        first_build_fails: bool,
+    ) -> (
+        crate::Engine,
+        Arc<Index>,
+        tokio::task::JoinHandle<Result<()>>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let mut config = Config::default();
+        config.server.data_dir = dir.to_string_lossy().into_owned();
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        let (idx, first, release_tx) =
+            park_a_flush_of_eight_docs(&engine, name, first_build_fails).await;
+        (engine, idx, first, release_tx)
+    }
+
+    /// The index part of [`eight_docs_claimed_by_a_parked_flush`], for a further index
+    /// of the same engine.
+    async fn park_a_flush_of_eight_docs(
+        engine: &crate::Engine,
+        name: &str,
+        first_build_fails: bool,
+    ) -> (
+        Arc<Index>,
+        tokio::task::JoinHandle<Result<()>>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let ledger: &'static crate::ingest_memory::Ledger =
+            Box::leak(Box::new(crate::ingest_memory::Ledger::new()));
+        engine.create_index(name, text_schema()).unwrap();
+        let idx = engine.get_index(name).unwrap();
+        idx.abort_background_tasks();
+        for i in 0..8u64 {
+            idx.index_document(
+                Some(format!("doc-{i}")),
+                json!({"body": format!("alpha {i}")}),
+            )
+            .await
+            .unwrap();
+        }
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let entered_tx = parking_lot::Mutex::new(Some(entered_tx));
+        let release_rx = parking_lot::Mutex::new(Some(release_rx));
+        let hook = FlushPublisherTestHook {
+            callback: Arc::new(move || {
+                let _ = entered_tx.lock().take().unwrap().send(());
+                release_rx.lock().take().unwrap().recv().unwrap();
+                first_build_fails
+            }),
+            after_warm: None,
+            ledger,
+            target_memtable: Arc::as_ptr(&idx.memtable) as usize,
+            // The parked build holds no permit of the process-global finalize gate. A test
+            // running in parallel that takes every permit (`acquire_many`, fair queue) would
+            // otherwise queue the waiting flush's own shard flush behind this park.
+            bypass_finalize_gate: true,
+            before_blocking_spawn: None,
+        };
+        let first = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(FLUSH_PUBLISHER_TEST_HOOK.scope(hook, async move { idx.flush().await }))
+        };
+        await_publication_barrier(entered_rx, "entered").await;
+        assert_eq!(
+            idx.memtable.shard_load(0).0,
+            0,
+            "precondition: the parked flush has claimed every document of the shard"
+        );
+        (idx, first, release_tx)
+    }
+
+    /// Writes `late-0` .. `late-3` (body "beta"): documents written after a flush was
+    /// parked, so they sit in the active generation next to the claimed ones.
+    async fn four_late_docs(idx: &Index) {
+        for i in 0..4u64 {
+            idx.index_document(
+                Some(format!("late-{i}")),
+                json!({"body": format!("beta {i}")}),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// Whether the four late documents are in a published segment of their own.
+    fn late_docs_published(idx: &Index) -> bool {
+        idx.store
+            .snapshot()
+            .segments
+            .iter()
+            .any(|s| s.doc_count == 4)
+    }
+
+    fn alpha_hits(total: bool) -> SearchRequest {
+        let mut request = json!({"query": {"match": {"body": "alpha"}}, "size": 10});
+        if total {
+            request["track_total_hits"] = json!(true);
+        }
+        xerj_query::parse_request(&request).unwrap()
+    }
+
+    fn docs_in_published_segments(idx: &Index) -> u64 {
+        idx.store
+            .snapshot()
+            .segments
+            .iter()
+            .map(|s| s.doc_count)
+            .sum()
+    }
+
+    /// 60_search finding 7.1 (2026-10-27): after a fast bulk load `POST /{index}/_flush`
+    /// returned at once, yet the next start found 416,672 of 1,000,001 documents only in
+    /// the WAL. `Index::flush` built its fan-out from `shard_load`, which does not count
+    /// generations another flush has claimed, and it kept no handle on that flush. So it
+    /// reported success while documents written before it were still in someone else's
+    /// segment build. A flush must not return before every document written before it is
+    /// in a published segment (Elasticsearch: `wait_if_ongoing` defaults to true). Failed
+    /// 3 / 3 before `settle_claimed_generations` (52_verify2, 32_save3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_waits_for_a_shard_flush_still_building_its_segment() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (_engine, idx, first, release_tx) =
+            eight_docs_claimed_by_a_parked_flush(dir.path(), "flush-waits", false).await;
+        let second = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(async move { idx.flush().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let returned_early = second.is_finished();
+        let published_then = docs_in_published_segments(&idx);
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(docs_in_published_segments(&idx), 8);
+        assert!(
+            !returned_early,
+            "flush() reported success while the 8 documents written before it were still in \
+             another flush's segment build ({published_then} of 8 in published segments)"
+        );
+    }
+
+    /// The same gap on the SIGTERM path: `Engine::flush_all_force` (the server's final
+    /// flush) returned while a shard flush was still building, and `xerj-server` then gives
+    /// the runtime 5 s before exiting, so a longer build was abandoned: its files are
+    /// removed as orphans at the next open and every one of its documents is replayed
+    /// from the WAL (60_search: "final flush complete in 445ms", then a 694 s boot).
+    /// Failed 3 / 3 before `settle_claimed_generations` (52_verify2, 32_save3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_flush_waits_for_a_shard_flush_still_building_its_segment() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, idx, first, release_tx) =
+            eight_docs_claimed_by_a_parked_flush(dir.path(), "shutdown-flush-waits", false).await;
+        let shutdown = engine.flush_all_force();
+        tokio::pin!(shutdown);
+        let returned_early = tokio::select! {
+            _ = &mut shutdown => true,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => false,
+        };
+        let published_then = docs_in_published_segments(&idx);
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        if !returned_early {
+            shutdown.await;
+        }
+        assert_eq!(docs_in_published_segments(&idx), 8);
+        assert!(
+            !returned_early,
+            "the shutdown flush returned while the 8 documents written before it were still \
+             in another flush's segment build ({published_then} of 8 in published segments)"
+        );
+    }
+
+    /// A flush that waits for another flush's build must not report success when that
+    /// build fails. The failed flush releases its claim: the documents stay searchable
+    /// and in the WAL, but nobody is building their segment any more. The waiting flush
+    /// drains them itself, so its `Ok` still means "published".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_publishes_the_documents_of_a_build_that_failed_while_it_waited() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (_engine, idx, first, release_tx) =
+            eight_docs_claimed_by_a_parked_flush(dir.path(), "flush-redrains", true).await;
+        let second = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(async move { idx.flush().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let returned_early = second.is_finished();
+        release_tx.send(()).unwrap();
+        assert!(
+            first.await.unwrap().is_err(),
+            "the parked build was told to fail"
+        );
+        let second = tokio::time::timeout(std::time::Duration::from_secs(30), second)
+            .await
+            .expect("the waiting flush did not finish within 30 s of the failed build")
+            .unwrap();
+        assert!(
+            !returned_early,
+            "flush() returned while another flush was still building the 8 documents"
+        );
+        second.expect("the waiting flush drains the released documents itself");
+        assert_eq!(
+            docs_in_published_segments(&idx),
+            8,
+            "flush() reported success, but the documents of the failed build are not in a \
+             published segment"
+        );
+        assert_eq!(idx.memtable.doc_count(), 0);
+        assert_eq!(idx.memtable.frozen_generation_count(), 0);
+        assert_eq!(idx.search(&alpha_hits(true)).await.unwrap().total.value, 8);
+    }
+
+    /// A released generation whose documents were all deleted while it was frozen has
+    /// nothing left to publish, and frozen generations take no new writes. The waiting
+    /// flush must treat it as settled instead of draining the shard again and again
+    /// until its budget runs out (a drain skips a shard with no documents).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flush_does_not_wait_on_a_released_generation_with_no_documents_left() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (_engine, idx, first, release_tx) =
+            eight_docs_claimed_by_a_parked_flush(dir.path(), "flush-empty-release", true).await;
+        for i in 0..8u64 {
+            assert!(idx.delete_document(&format!("doc-{i}")).await.unwrap());
+        }
+        assert_eq!(
+            idx.memtable.doc_count(),
+            0,
+            "precondition: every document deleted"
+        );
+        let second = {
+            let idx = Arc::clone(&idx);
+            tokio::spawn(async move { idx.flush().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        release_tx.send(()).unwrap();
+        assert!(first.await.unwrap().is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(30), second)
+            .await
+            .expect("a flush must not wait on a released generation that holds no documents")
+            .unwrap()
+            .unwrap();
+        assert_eq!(docs_in_published_segments(&idx), 0);
+        assert!(idx
+            .search(&alpha_hits(false))
+            .await
+            .unwrap()
+            .hits
+            .is_empty());
+    }
+
+    /// The contract of `refresh()` (`_refresh`, `?refresh=true`) is visibility: when it
+    /// returns, every write acknowledged before it is searchable. A document another
+    /// flush has already claimed is searchable in its frozen generation until that
+    /// flush publishes it (#1015), so `refresh()` does not wait for that build; the
+    /// durability point that does is `flush()`. This pins both halves: `refresh()`
+    /// returns while the build is parked, and the documents are searchable then.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_leaves_documents_searchable_while_another_flush_builds_them() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (_engine, idx, first, release_tx) =
+            eight_docs_claimed_by_a_parked_flush(dir.path(), "refresh-visible", false).await;
+        let refreshed =
+            tokio::time::timeout(std::time::Duration::from_secs(10), idx.refresh()).await;
+        let during_build = idx.search(&alpha_hits(true)).await.unwrap().total.value;
+        let published_then = docs_in_published_segments(&idx);
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        refreshed
+            .expect("refresh() waited for another flush's segment build")
+            .unwrap();
+        assert_eq!(
+            published_then, 0,
+            "precondition: the build was still parked"
+        );
+        assert_eq!(
+            during_build, 8,
+            "a document written before refresh() must be searchable when it returns"
+        );
+        assert_eq!(docs_in_published_segments(&idx), 8);
+        assert_eq!(idx.search(&alpha_hits(true)).await.unwrap().total.value, 8);
+    }
+
+    /// A flush whose wait for another flush's build is cut short by its budget (the
+    /// server's shutdown budget does exactly this) must still leave the segment it
+    /// published itself in the persisted snapshot, as it did before it waited: its
+    /// durability tail runs before the wait. Here the tail is the only thing that can
+    /// persist it, because the WAL maintenance run just before the flush took the 1 s
+    /// maintenance slot of the publish path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_flush_cut_short_while_waiting_keeps_its_own_segment_persisted() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (_engine, idx, first, release_tx) =
+            eight_docs_claimed_by_a_parked_flush(dir.path(), "flush-cut-short", false).await;
+        for i in 0..4u64 {
+            idx.index_document(
+                Some(format!("late-{i}")),
+                json!({"body": format!("beta {i}")}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush_timeout_ms.store(1_500, Ordering::Relaxed);
+        idx.store.force_wal_maintenance().unwrap();
+        let cut_short = idx.flush().await;
+        // In a parallel test run the flush's own shard task can still be waiting for the
+        // process-global finalize gate when the budget runs out. Its coordinator is then
+        // detached and finishes on its own, so look for the own segment for a while.
+        let own_segment = || {
+            idx.store
+                .snapshot()
+                .segments
+                .iter()
+                .find(|s| s.doc_count == 4)
+                .map(|s| s.id.as_str().to_string())
+        };
+        let persisted = |id: &str| {
+            std::fs::read_to_string(idx.data_dir.join("snapshot.json"))
+                .map(|snapshot| snapshot.contains(id))
+                .unwrap_or(false)
+        };
+        let mut own = None;
+        let mut own_persisted = false;
+        for _ in 0..300 {
+            own = own_segment();
+            if own.as_deref().is_some_and(persisted) {
+                own_persisted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        assert!(
+            cut_short.is_err(),
+            "precondition: the flush ran out of its 1.5 s budget while the build was parked"
+        );
+        let own = own.expect("precondition: the flush published its own 4 documents");
+        assert!(
+            own_persisted,
+            "the flush's own segment {own} is published but not in the persisted snapshot"
+        );
+    }
+
+    /// The shutdown flush waits for the segment builds other flushes have in flight
+    /// (above), but the caller's budget covers every index: the server gives
+    /// `flush_all_force` 10 s in total. So it must first drain the own memtable of every
+    /// index, as it did before it waited, and wait only after that; otherwise one index's
+    /// long build keeps the documents of the indices after it out of their segments and
+    /// in the WAL. Here both indices have a parked build and 4 later documents, the
+    /// shutdown flush runs out of its budget waiting, and by then the later documents of
+    /// both indices must be in published segments.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_flush_drains_every_index_before_it_waits_for_builds_in_flight() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, first_idx, first_build, first_release) =
+            eight_docs_claimed_by_a_parked_flush(dir.path(), "shutdown-drain-a", false).await;
+        let (second_idx, second_build, second_release) =
+            park_a_flush_of_eight_docs(&engine, "shutdown-drain-b", false).await;
+        four_late_docs(&first_idx).await;
+        four_late_docs(&second_idx).await;
+        let shutdown =
+            tokio::time::timeout(std::time::Duration::from_secs(8), engine.flush_all_force()).await;
+        let drained = [
+            late_docs_published(&first_idx),
+            late_docs_published(&second_idx),
+        ];
+        first_release.send(()).unwrap();
+        second_release.send(()).unwrap();
+        first_build.await.unwrap().unwrap();
+        second_build.await.unwrap().unwrap();
+        assert!(
+            shutdown.is_err(),
+            "precondition: the shutdown flush waited for the parked builds until its budget ran out"
+        );
+        assert_eq!(
+            drained,
+            [true, true],
+            "the shutdown flush waited for one index's build before it had drained the own \
+             memtable of every index"
+        );
+    }
+
+    /// The periodic sweep (`Engine::flush_all_if_needed`) is background work that no
+    /// client waits on, and it visits every index in turn. It drains an index's own
+    /// memtable (`Index::flush_memtable`), as it did before `flush()` learned to wait,
+    /// but must not wait for a segment build another flush has in flight: one long build
+    /// would hold up the sweep of every other index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn periodic_flush_sweep_does_not_wait_for_another_flushs_build() {
+        let _fault_test = FLUSH_FAULT_TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, idx, first, release_tx) =
+            eight_docs_claimed_by_a_parked_flush(dir.path(), "sweep-no-wait", false).await;
+        four_late_docs(&idx).await;
+        // Let the sweep's idle probe (#873) pick this index: arm it, then age it.
+        assert!(
+            !idx.needs_flush().await,
+            "precondition: below the size thresholds, idle probe armed"
+        );
+        idx.rewind_idle_probe_for_test(idx.flush_idle_secs.saturating_mul(1000) + 1_000);
+        let swept = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.flush_all_if_needed(),
+        )
+        .await;
+        let late_published = late_docs_published(&idx);
+        release_tx.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        assert!(
+            swept.is_ok(),
+            "the periodic sweep waited for another flush's segment build"
+        );
+        assert!(
+            late_published,
+            "precondition: the sweep drained the index's own memtable"
+        );
+    }
 }
 
 struct HnswPublicationGuard {
@@ -7600,6 +8039,86 @@ mod merge_publication_transaction_tests {
         let mut ids: Vec<_> = result.hits.iter().map(|hit| hit.id.clone()).collect();
         ids.sort();
         assert_eq!(ids, vec!["d0".to_string(), "d1".to_string()]);
+    }
+
+    /// A merge that publishes while an exact kNN scan is parked at its
+    /// capture rewrites the version entries the scan's admission reads: the
+    /// documents it keeps are repointed to its output, a segment the capture
+    /// never held, and the documents it drops lose their entries. The
+    /// captured segments still hold the copies the capture had retired — the
+    /// pre-update copy of an updated document, a deleted document — and the
+    /// parked scan must not hand them back: it answers what an unparked scan
+    /// over the same documents answers.
+    ///
+    /// The query is "alpha one", d0's text before its update, so a
+    /// resurrected pre-update copy outscores everything else.
+    #[tokio::test]
+    async fn a_knn_scan_parked_across_a_merge_publication_returns_no_retired_copy() {
+        let dir = TempDir::new().unwrap();
+        let (_engine, index) =
+            knn_capture_fixture(&dir, &["alpha one", "beta two", "gamma three"]).await;
+        // Retire two captured copies before the capture: update d0 away from
+        // the query text and delete d2, then flush, so the memtable is empty
+        // again and both retirements live in a segment.
+        index
+            .index_document(
+                Some("d0".into()),
+                serde_json::json!({ "body": "omega nine" }),
+            )
+            .await
+            .unwrap();
+        assert!(index.delete_document("d2").await.unwrap());
+        index.flush().await.unwrap();
+        let page = |result: &SearchResult| -> Vec<(String, u32)> {
+            result
+                .hits
+                .iter()
+                .map(|hit| (hit.id.clone(), hit.score.to_bits()))
+                .collect()
+        };
+        let expected = index.search(&knn_exact_request(3)).await.unwrap();
+        let mut expected_ids: Vec<&str> = expected.hits.iter().map(|h| h.id.as_str()).collect();
+        expected_ids.sort_unstable();
+        assert_eq!(expected_ids, ["d0", "d1"], "the live documents only");
+
+        index.query_cache.clear();
+        index
+            .test_pause_knn_after_capture
+            .store(true, Ordering::Release);
+        let search_index = Arc::clone(&index);
+        let search = tokio::spawn(async move { search_index.search(&knn_exact_request(3)).await });
+        wait_for_knn_parked(&index).await;
+
+        // Merge until one segment is left: every captured segment is merged
+        // away, and the merge that drops d2 purges its entry.
+        let mut merged = 0;
+        loop {
+            let pass =
+                tokio::time::timeout(std::time::Duration::from_secs(10), index.run_merge_once())
+                    .await
+                    .expect("merge blocked on the parked scan's read lease")
+                    .unwrap();
+            if pass == 0 {
+                break;
+            }
+            merged += pass;
+        }
+        assert!(merged > 0, "the parked window held a merge publication");
+        assert_eq!(
+            index.store.snapshot().segments.len(),
+            1,
+            "every captured segment was merged away"
+        );
+
+        index
+            .test_pause_knn_after_capture
+            .store(false, Ordering::Release);
+        let parked = search.await.unwrap().unwrap();
+        assert_eq!(
+            page(&parked),
+            page(&expected),
+            "no pre-update copy of d0 and no deleted d2 in the parked scan's answer"
+        );
     }
 
     /// #1220 control: capture-scoping must NOT resurrect a superseded copy
@@ -11565,9 +12084,25 @@ pub struct Index {
     /// this index, or because the hydration budget had no room for the
     /// slices they would build (#2427/#1122).
     cold_stored_warms_skipped: AtomicU64,
+    /// Segments whose decoded stored slices the hydration budget refused, with
+    /// the bytes it was asked for. While the budget has no room for them,
+    /// nothing warms such a segment in the background (see
+    /// `stored_slices_cannot_be_kept`).
+    stored_slices_refused: dashmap::DashMap<String, u64>,
+    /// Whole stored sections `stored_slices_for` decoded, for a page or a
+    /// warm.
+    whole_stored_decodes: AtomicU64,
     /// Cold segments answered by row-selective hydration (observability and
     /// tests).
     cold_row_hydrations: AtomicU64,
+    /// GETs by `_id` answered from the document's row because the hydration
+    /// budget cannot keep its segment's decoded stored section
+    /// (`source_from_refused_segment_row`; observability and tests).
+    refused_segment_row_gets: AtomicU64,
+    /// GETs by `_id` answered from a resident decoded stored section through
+    /// `decoded_row_offsets`, because the hydration budget cannot keep that
+    /// segment's `StoredSlices` (observability and tests).
+    refused_segment_resident_gets: AtomicU64,
     /// Per-(segment, field, bounds) Range pre-filter position sets.
     /// `build_range_prefilter_cached` was cached in name only — it re-ran
     /// the O(matches) `range_doc_ids` walk + HashSet build per query per
@@ -11646,6 +12181,13 @@ pub struct Index {
     /// Budgeted like `stored_slices_cache`; entries evicted by id at the
     /// merge-completion site.  Segments are immutable → no invalidation.
     decoded_stored_cache: Arc<dashmap::DashMap<String, Resident<Vec<u8>>>>,
+    /// Row offsets (`brace_walk_offsets`) into a segment's decoded stored
+    /// section while `decoded_stored_cache` holds that section, for GETs by
+    /// `_id` on a segment whose `StoredSlices` (a second copy of the section
+    /// plus these offsets) the hydration budget cannot keep
+    /// (`source_from_resident_decoded_row`). Charged as stored slices without
+    /// bytes; evicted with the segment's other hydration entries.
+    decoded_row_offsets: Arc<dashmap::DashMap<String, Resident<Vec<(u32, u32)>>>>,
     /// Per-(segment, field-set) cache of an opened `FtsIndexReader`.
     ///
     /// `FtsIndexReader::open` was called INSIDE the per-segment loop of
@@ -11882,7 +12424,7 @@ impl Index {
     /// retained-payload/key budget.
     pub fn segment_hydration_cache_capacities(&self) -> [usize; CATEGORY_COUNT] {
         [
-            self.stored_slices_cache.capacity(),
+            self.stored_slices_cache.capacity() + self.decoded_row_offsets.capacity(),
             self.dv_cache.capacity(),
             self.stored_value_cache.capacity(),
             self.sort_shadow_cache.capacity(),
@@ -12252,6 +12794,7 @@ impl Index {
             stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(per_index_map()),
             decoded_stored_cache: Arc::new(per_index_map()),
+            decoded_row_offsets: Arc::new(per_index_map()),
             fts_reader_cache: Arc::new(per_index_map()),
             vector_column_cache: Arc::new(per_index_map()),
             shortcut_count_cache: Arc::new(per_index_map()),
@@ -12281,7 +12824,11 @@ impl Index {
             #[cfg(test)]
             cold_stored_warm_live: std::sync::atomic::AtomicUsize::new(0),
             cold_stored_warms_skipped: AtomicU64::new(0),
+            stored_slices_refused: dashmap::DashMap::new(),
+            whole_stored_decodes: AtomicU64::new(0),
             cold_row_hydrations: AtomicU64::new(0),
+            refused_segment_row_gets: AtomicU64::new(0),
+            refused_segment_resident_gets: AtomicU64::new(0),
         });
         let _ = index.self_ref.set(Arc::downgrade(&index));
         // #871 — event-driven merge scheduling: the store fires this hook on
@@ -12733,6 +13280,7 @@ impl Index {
             stored_value_load_semaphore: Arc::new(Semaphore::new(4)),
             stored_slices_cache: Arc::new(per_index_map()),
             decoded_stored_cache: Arc::new(per_index_map()),
+            decoded_row_offsets: Arc::new(per_index_map()),
             fts_reader_cache: Arc::new(per_index_map()),
             vector_column_cache: Arc::new(per_index_map()),
             shortcut_count_cache: Arc::new(per_index_map()),
@@ -12762,7 +13310,11 @@ impl Index {
             #[cfg(test)]
             cold_stored_warm_live: std::sync::atomic::AtomicUsize::new(0),
             cold_stored_warms_skipped: AtomicU64::new(0),
+            stored_slices_refused: dashmap::DashMap::new(),
+            whole_stored_decodes: AtomicU64::new(0),
             cold_row_hydrations: AtomicU64::new(0),
+            refused_segment_row_gets: AtomicU64::new(0),
+            refused_segment_resident_gets: AtomicU64::new(0),
         });
         let _ = index.self_ref.set(Arc::downgrade(&index));
         // #871 — event-driven merge scheduling (see `Index::create` and
@@ -14871,11 +15423,15 @@ impl Index {
         )
         .await?;
         // M5.2 — explicit refresh drains EVERY non-empty shard in
-        // sequence (one shard per `do_flush_shard` call) so the
-        // user-visible `refresh()` returns with zero unflushed
-        // documents.  Sharded flushes run serially here because the
-        // caller is waiting synchronously; the background scheduler
-        // still fires shard flushes in parallel.
+        // sequence (one shard per `do_flush_shard` call).  Sharded
+        // flushes run serially here because the caller is waiting
+        // synchronously; the background scheduler still fires shard
+        // flushes in parallel.  What `refresh()` promises is visibility:
+        // documents another flush has already claimed are skipped here
+        // (`shard_load` does not count them) and stay searchable in their
+        // frozen generation until that flush publishes them (#1015).  It
+        // does not wait for that build; `flush()` does, because it is the
+        // durability point (`settle_claimed_generations`).
         let n_shards = self.memtable.shard_count();
         for shard_idx in 0..n_shards {
             // #1226 — skip empty shards (same reasoning as `flush()`): a
@@ -19257,6 +19813,35 @@ impl Index {
         true
     }
 
+    /// Whether a segment the scan captured has left the store's current
+    /// snapshot: a merge published after the capture.
+    ///
+    /// Such a merge has rewritten the version entries an exact scan reads
+    /// while it admits candidates. Every document it kept now names its
+    /// output segment, which the capture never held, so
+    /// [`admit_exact_scan_candidate`](Self::admit_exact_scan_candidate)
+    /// takes each copy of it in the merged-away segments for a later world's
+    /// and keeps it (`PostCapture`): the pre-update copy of an updated
+    /// document included, and that one comes first in oldest-first segment
+    /// order. The documents it dropped lost their entries
+    /// (`VersionMap::remove_segment`), so a deleted document reads as never
+    /// written. Neither copy is in the world the scan captured, and that
+    /// world's segments are gone, so the scans answer with the retry signal
+    /// and `search()` recaptures over the merge's output. A flush only adds
+    /// segments and never trips this.
+    fn captured_segments_left_the_snapshot(
+        &self,
+        captured: &[xerj_storage::segment::SegmentMeta],
+    ) -> bool {
+        let current = self.store.snapshot();
+        let live: std::collections::HashSet<&str> = current
+            .segments
+            .iter()
+            .map(|meta| meta.id.as_str())
+            .collect();
+        captured.iter().any(|meta| !live.contains(meta.id.as_str()))
+    }
+
     /// Run `work` on the engine's background pool and await its answer —
     /// never on tokio's blocking pool, for the #751 reason spelled out in
     /// `stored_values_for_async`. A panic answers `None`, as there.
@@ -19438,7 +20023,10 @@ impl Index {
     /// other winners then read the warm cache instead of each paying a
     /// projected decode, and the query that found the segment cold no longer
     /// waits for the whole-section decompress. `stored_slices_for` keeps its
-    /// single-flight, budget and retirement rules.
+    /// single-flight, budget and retirement rules. A section the budget
+    /// cannot keep is not warmed (`stored_slices_cannot_be_kept`): the decode
+    /// would be refused and dropped, and on an index far larger than the
+    /// budget every cold page queued one per segment it read.
     ///
     /// #2427: at most ONE warm per index runs at a time, and a warm whose
     /// decoded section cannot fit the hydration budget is not started. Each
@@ -19449,7 +20037,12 @@ impl Index {
     /// the decoded sections were then refused by the budget at publish and
     /// thrown away. A skipped warm costs nothing: the query that triggered it
     /// already has its rows, and a later cold visit schedules it again.
-    fn schedule_cold_stored_warm(&self, segment_id: &str, doc_count: u64) {
+    fn schedule_cold_stored_warm(&self, segment_id: &str, doc_count: u64, size_bytes: u64) {
+        if self.stored_slices_cannot_be_kept(segment_id, size_bytes) {
+            self.cold_stored_warms_skipped
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(index) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
             return;
         };
@@ -19457,6 +20050,14 @@ impl Index {
             return;
         };
         if crate::governor::global().is_some_and(|g| g.memory_breaker_engaged()) {
+            return;
+        }
+        // A row-blocked stored section (`RAW_JSON_BLOCKS`) answers a page's
+        // rows block by block, so the whole-section warm would only hold the
+        // decompressed section in memory. At 10 GB those warms (one per cold
+        // segment a page visits, hundreds of MB each) pushed the process over
+        // the breaker watermark, and every drain then dropped the FTS readers.
+        if self.stored_section_has_row_blocks(segment_id) {
             return;
         }
         if self
@@ -19559,6 +20160,23 @@ impl Index {
         }
     }
 
+    /// Whether `segment_id`'s stored section reads rows by block (see
+    /// [`xerj_storage::stored_codec::stored_v2_has_row_blocks`]); `false`
+    /// when the segment or its section cannot be opened.
+    fn stored_section_has_row_blocks(&self, segment_id: &str) -> bool {
+        self.store
+            .open_segment_arc(segment_id)
+            .ok()
+            .and_then(|reader| {
+                reader
+                    .section(SectionType::Stored)
+                    .ok()
+                    .flatten()
+                    .map(xerj_storage::stored_codec::stored_v2_has_row_blocks)
+            })
+            .unwrap_or(false)
+    }
+
     fn hydrate_fts_rows_cold(
         &self,
         segment_id: &str,
@@ -19566,12 +20184,20 @@ impl Index {
         keep: Option<&[String]>,
     ) -> Option<HashMap<u32, Value>> {
         use xerj_storage::stored_codec::{
-            decode_stored_v2_rows_projected_parallel, stored_v2_source_column_names,
-            StoredV2RowHydrationResult,
+            decode_stored_v2_rows_projected_parallel,
+            decode_stored_v2_rows_projected_parallel_no_seq, stored_row_select_enabled,
+            stored_v2_source_column_names, StoredV2RowHydrationResult,
         };
         let reader = self.store.open_segment_arc(segment_id).ok()?;
         let bytes = reader.section(SectionType::Stored).ok()??;
         let ordinals: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+        // Only `_id` and `_source` are read here; under
+        // `XERJ_STORED_ROW_SELECT` the `__seq_no` column is skipped.
+        let decode_parallel = if stored_row_select_enabled() {
+            decode_stored_v2_rows_projected_parallel_no_seq
+        } else {
+            decode_stored_v2_rows_projected_parallel
+        };
         // Columns decode concurrently: a handful of rows still streams every
         // wanted column, so the serial sum was the cost of a cold page.
         let hydrated = match keep {
@@ -19582,9 +20208,9 @@ impl Index {
                     .map(String::as_str)
                     .filter(|column| row_projection_keeps_column(keep, column))
                     .collect();
-                decode_stored_v2_rows_projected_parallel(bytes, &ordinals, Some(&include)).ok()?
+                decode_parallel(bytes, &ordinals, Some(&include)).ok()?
             }
-            None => decode_stored_v2_rows_projected_parallel(bytes, &ordinals, None).ok()?,
+            None => decode_parallel(bytes, &ordinals, None).ok()?,
         };
         let StoredV2RowHydrationResult::Hydrated { rows, .. } = hydrated else {
             return None;
@@ -19616,14 +20242,21 @@ impl Index {
         positions: &[u32],
     ) -> Option<HashMap<u32, String>> {
         use xerj_storage::stored_codec::{
-            decode_stored_v2_rows_projected, StoredV2RowHydrationResult,
+            decode_stored_v2_rows_projected, decode_stored_v2_rows_projected_no_seq,
+            stored_row_select_enabled, StoredV2RowHydrationResult,
         };
         let reader = self.store.open_segment_arc(segment_id).ok()?;
         let bytes = reader.section(SectionType::Stored).ok()??;
         let ordinals: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
-        let StoredV2RowHydrationResult::Hydrated { rows, .. } =
-            decode_stored_v2_rows_projected(bytes, &ordinals, &[]).ok()?
-        else {
+        // Only `_id` is read here; under `XERJ_STORED_ROW_SELECT` the
+        // `__seq_no` column (parsed whole when it is a RAW_JSON stream) is
+        // skipped.
+        let decoded = if stored_row_select_enabled() {
+            decode_stored_v2_rows_projected_no_seq(bytes, &ordinals, &[])
+        } else {
+            decode_stored_v2_rows_projected(bytes, &ordinals, &[])
+        };
+        let StoredV2RowHydrationResult::Hydrated { rows, .. } = decoded.ok()? else {
             return None;
         };
         let mut out: HashMap<u32, String> = HashMap::with_capacity(rows.len());
@@ -20159,6 +20792,12 @@ impl Index {
             if !segment_complete {
                 break;
             }
+        }
+        // A merge that published during the walk left admitted copies the
+        // capture had retired; recapture (see
+        // `captured_segments_left_the_snapshot`).
+        if self.captured_segments_left_the_snapshot(&snap.segments) {
+            return Err(collection_capture_crossed());
         }
         let collect_elapsed = started.elapsed();
 
@@ -22007,6 +22646,12 @@ impl Index {
             }
         }
 
+        // Same as the top-level exact scan: a merge that published during
+        // the walk left admitted parents the capture had retired.
+        if self.captured_segments_left_the_snapshot(&snap.segments) {
+            return Err(collection_capture_crossed());
+        }
+
         // ── Score each parent by best-matching nested element ─────────
         // Pre-filter is applied before scoring (alias filter, knn.filter).
         let mut scored: Vec<(String, f32, Value)> = Vec::new();
@@ -22754,16 +23399,28 @@ impl Index {
             // before the repoint (`SegmentWriter::finish` fsyncs), and
             // `open_segment_arc` derives `{id}.seg` for ids missing from
             // the snapshot, so opening it directly is race-free.
-            let seg_doc_count: Option<u64> =
-                match snap.segments.iter().find(|m| m.id.as_str() == &*seg_id) {
-                    Some(meta) => Some(meta.doc_count),
-                    None if &*seg_id != xerj_storage::version_map::IN_MEMORY_SEGMENT_ID => self
-                        .store
-                        .open_segment_arc(&seg_id)
-                        .ok()
-                        .map(|r| r.header().doc_count),
-                    None => None,
-                };
+            let seg_meta = snap.segments.iter().find(|m| m.id.as_str() == &*seg_id);
+            // A listed segment whose decoded stored section the hydration
+            // budget cannot keep answers without decoding that section.
+            if let Some(meta) = seg_meta {
+                if let Some(source) = self.source_from_refused_segment_row(
+                    &seg_id,
+                    meta.doc_count,
+                    meta.size_bytes,
+                    id,
+                ) {
+                    return Ok(Some(source));
+                }
+            }
+            let seg_doc_count: Option<u64> = match seg_meta {
+                Some(meta) => Some(meta.doc_count),
+                None if &*seg_id != xerj_storage::version_map::IN_MEMORY_SEGMENT_ID => self
+                    .store
+                    .open_segment_arc(&seg_id)
+                    .ok()
+                    .map(|r| r.header().doc_count),
+                None => None,
+            };
             if let Some(doc_count) = seg_doc_count {
                 if let (Some(pos_map), Some(slices)) = (
                     self.id_pos_map_for(&seg_id, doc_count),
@@ -23592,12 +24249,15 @@ impl Index {
                     Some(id) => id,
                     None => continue,
                 };
-                if !seen.insert(id_ref.to_string()) {
-                    continue;
-                }
                 // Version-map liveness + superseded-copy skip (the scan arm's
                 // exact predicate, including the raw-source-without-`_seq_no`
-                // pass-through).
+                // pass-through), checked BEFORE the id is marked seen, in the
+                // scan arms' order: a document updated after a flush has its
+                // pre-update copy in an older segment, walked first. Marking
+                // the id seen on that stale copy and then skipping it as
+                // superseded dropped the live copy of the newer segment as a
+                // duplicate, so the fold returned neither copy (the facts
+                // rebuild then failed with "no fact document").
                 if let Some(ver) = self.store.version_map.get(id_ref) {
                     if ver.deleted {
                         continue;
@@ -23607,6 +24267,9 @@ impl Index {
                             continue;
                         }
                     }
+                }
+                if !seen.insert(id_ref.to_string()) {
+                    continue;
                 }
                 let matched = if is_match_all {
                     true
@@ -24952,6 +25615,30 @@ impl Index {
             && request.rescore.is_empty()
             && request.aggs.is_none()
             && request.min_score.is_none();
+
+        // How far `hits.total` must be counted exactly: `track_total_hits: N`
+        // (the ES layer injects ES's default 10,000) is answered `N, gte` past
+        // N, and `false` is capped at `size` below. `None` = count every match
+        // — `true`, and every shape that reads `total_count` or the whole match
+        // set itself (aggregations, `min_score`, collapse, a field sort, a
+        // count-only request).
+        let total_count_limit: Option<u64> = if count_only
+            || request.aggs.is_some()
+            || request.min_score.is_some()
+            || request.collapse.is_some()
+            || request
+                .sort
+                .iter()
+                .any(|sf| !sf.is_score() && !sf.is_doc_order())
+        {
+            None
+        } else {
+            match request.track_total_hits {
+                TrackTotalHits::Limit(limit) => Some(limit),
+                TrackTotalHits::False => Some(size as u64),
+                TrackTotalHits::True => None,
+            }
+        };
 
         // --- Memtable search ---
         // `all_hits` is the bounded collector of fully-hydrated hits (source +
@@ -26555,6 +27242,54 @@ impl Index {
             }
         }
 
+        // Aggregations over a FULL-TEXT match set — Discover's `match` page
+        // with `terms` facets and a `date_histogram`. The columnar path above
+        // takes only `size: 0` with a columnar filter; every other shape
+        // materialised every document's `_source` for the brute aggregation
+        // (`need_full_corpus` below), which the query-memory guard refuses on
+        // a large index (11.3 M documents x 2 KiB against 512 MiB: HTTP 429).
+        // Here the segments' inverted indexes give the exact match set and the
+        // same columnar executors reduce the aggregations over those rows from
+        // doc values. Only where the projection IS the match set (no residual
+        // clause, no pinned kNN ids), with no `min_score`, an empty memtable
+        // and no deleted or overwritten document; anything else keeps the
+        // exact `_source` path. Hits and `hits.total` still come from the
+        // walk below, so the result is held apart from `precomputed_aggs`
+        // (which skips the segment loop) until the aggregation section.
+        let mut fts_row_aggs: Option<Value> = None;
+        if precomputed_aggs.is_none()
+            && request.aggs.is_some()
+            && request.min_score.is_none()
+            && query_needs_fts
+            && pinned_probe.is_none()
+            && mem_doc_count == 0
+            && !deletes_present
+        {
+            #[cfg(test)]
+            let disabled = FTS_ROW_AGGS_DISABLED.with(|c| c.get());
+            #[cfg(not(test))]
+            let disabled = false;
+            if let (false, Some(aggs_def)) = (disabled, &request.aggs) {
+                if let Some(r) = self
+                    .try_aggs_fast_over_fts_match(
+                        aggs_def,
+                        query,
+                        &text_fields,
+                        &exact_fields,
+                        fts_kw_fields,
+                        &snap,
+                        &segments_dir,
+                        search_deadline,
+                    )
+                    .await
+                {
+                    #[cfg(test)]
+                    FTS_ROW_AGGS_SERVED.with(|c| c.set(c.get() + 1));
+                    fts_row_aggs = Some(r);
+                }
+            }
+        }
+
         // LOSS_BATTLE_PLAN B6 — page-cap materialisation.  The +100/256
         // hydration slack in `materialisation_limit` buys headroom against
         // memtable/segment dedup overlap and version-map rejections; with an
@@ -26590,18 +27325,32 @@ impl Index {
         // Cold score-ordered FTS hits whose `_source` is read only once the
         // segment loop has settled the page: `_id` -> (segment, row).
         let mut deferred_sources: HashMap<String, (String, u32, u64)> = HashMap::new();
+        // Opt-in (`XERJ_FTS_FACET_PAGE_CAP`): a request whose aggregations
+        // the full-text row sets answered above (`fts_row_aggs`) takes the
+        // same cap. The slack exists for the brute aggregation, which
+        // aggregates the materialised hits; with `fts_row_aggs` set it never
+        // runs (it becomes `precomputed_aggs` after the loop), the total is
+        // counted apart from the page, and the merge keeps the global top-k
+        // by score, so the cap changes only the work (on Discover's page at
+        // 10 GB: 256 candidates instead of 25).
+        let facet_page_capped =
+            request.aggs.is_some() && fts_row_aggs.is_some() && fts_facet_page_cap();
         let materialisation_limit: usize = if mem_doc_count == 0
             && !deletes_present
             && size > 0
             && request.sort.is_empty()
             && sort_topk.is_none()
-            && request.aggs.is_none()
+            && (request.aggs.is_none() || facet_page_capped)
             && request.rescore.is_empty()
             && request.collapse.is_none()
             && request.min_score.is_none()
             && !request.explain
             && !matches!(query, QueryNode::Pinned { .. })
         {
+            #[cfg(test)]
+            if facet_page_capped {
+                FTS_FACET_PAGE_CAPPED.with(|c| c.set(c.get() + 1));
+            }
             from + size
         } else {
             materialisation_limit
@@ -26863,6 +27612,75 @@ impl Index {
                 });
                 v
             };
+            // Opt-in (`XERJ_FTS_OPEN_THREADS` > 1): open the query's cold FTS
+            // readers in parallel before the walk below, which opens them one
+            // segment at a time. A cold reader decompresses its fields' whole
+            // `.post` frames (and maps the large postings, `fts_reader_for`):
+            // at 10 GB (11.3 M passages, 27-32 segments) the first `match`
+            // after a start spent 14-19 s of 20-45 s in that sequential
+            // `ftsopen` on one x86 server core. Same readers, same cache keys:
+            // the walk then finds them resident.
+            if needs_fts {
+                let open_threads = fts_open_threads();
+                if open_threads > 1 {
+                    let t_open = std::time::Instant::now();
+                    let field_refs: Vec<&str> =
+                        fts_open_fields.iter().map(|s| s.as_str()).collect();
+                    self.open_fts_readers_parallel(
+                        &segments_dir,
+                        &ordered_segments,
+                        &field_refs,
+                        open_threads,
+                    );
+                    dbg_fts_ms += t_open.elapsed().as_millis() as u64;
+                }
+            }
+            // Opt-in (`XERJ_FTS_SEGMENT_THREADS` > 1): every segment's
+            // full-text walk, that many segments at a time, before the loop
+            // below; the loop then takes each segment's `(hits, total)` from
+            // here instead of walking it itself (`fts_segment_prepass`).
+            // Only the plain ranked page on an index without deleted or
+            // overwritten documents: no field sort, not count-only, no
+            // residual clause, no pinned kNN ids.
+            let mut fts_prepass: std::collections::HashMap<String, FtsPrepassResult> =
+                std::collections::HashMap::new();
+            if needs_fts
+                && !count_only
+                && sort_topk.is_none()
+                && !residual_gate
+                && !deletes_present
+                && pinned_probe.is_none()
+                && ordered_segments.len() > 1
+            {
+                let seg_threads = fts_segment_threads();
+                if seg_threads > 1 {
+                    let t_pre = std::time::Instant::now();
+                    let field_refs: Vec<&str> =
+                        fts_open_fields.iter().map(|s| s.as_str()).collect();
+                    fts_prepass = self.fts_segment_prepass(
+                        query,
+                        &FtsPrepassArgs {
+                            segments_dir: &segments_dir,
+                            segments: &ordered_segments,
+                            open_fields: &field_refs,
+                            text_fields: &text_fields,
+                            exact_fields: &exact_fields,
+                            kw_fields: fts_kw_fields,
+                            stats: collection_stats(),
+                            deadline: search_deadline,
+                            cap: materialisation_limit,
+                            // every segment counts to one past the limit:
+                            // the sum is exact below it and `gte` above it
+                            count_limit: total_count_limit
+                                .map_or(u64::MAX, |limit| limit.saturating_add(1)),
+                        },
+                        seg_threads,
+                    );
+                    dbg_fts_ms += t_pre.elapsed().as_millis() as u64;
+                    #[cfg(test)]
+                    FTS_PREPASS_SEGMENTS.with(|c| c.set(c.get() + fts_prepass.len()));
+                }
+            }
             for meta in ordered_segments {
                 dbg_segs += 1;
                 // F1: once the exact total is authoritative AND the bounded
@@ -27112,8 +27930,83 @@ impl Index {
                                     }
                                 })
                             } else {
-                                searcher.search_bounded(&fq, fts_cap, false)
+                                // `hits.total` is exact only up to
+                                // `total_count_limit`; one match past it is
+                                // enough to answer `gte`, so this segment
+                                // stops counting there and only ranks.
+                                let segment_count_limit = total_count_limit
+                                    .map_or(u64::MAX, |limit| {
+                                        limit.saturating_add(1).saturating_sub(total_count)
+                                    });
+                                // Once `all_hits` holds a full page, a document
+                                // of this segment scoring below the lowest kept
+                                // score can never be admitted: the admission walk
+                                // below needs a score above `page_worst`, or the
+                                // same score and an earlier `seq_no`. Handing that
+                                // score to the match walk as its floor lets it
+                                // prune from the segment's first document instead
+                                // of rebuilding its own bar from an empty page
+                                // (Lucene shares the minimum competitive score
+                                // across leaves the same way). The walk returns
+                                // every hit of its top `fts_cap` that scores AT
+                                // LEAST the floor, ties included, so what the
+                                // admission walk sees above the floor — and hence
+                                // the page — is unchanged. The minimum over
+                                // `all_hits` is never above the cap-th best score
+                                // even when `all_hits` holds more than the cap.
+                                let page_floor: Option<f32> = if sort_topk.is_none()
+                                    && !count_only
+                                    && fts_cap != usize::MAX
+                                    && all_hits.len() >= materialisation_limit
+                                {
+                                    all_hits.iter().map(|h| h.score).reduce(f32::min)
+                                } else {
+                                    None
+                                };
+                                #[cfg(test)]
+                                let page_floor = if FTS_FLOOR_DISABLED.with(|c| c.get()) {
+                                    None
+                                } else {
+                                    page_floor
+                                };
+                                #[cfg(test)]
+                                if page_floor.is_some() {
+                                    SEG_FTS_FLOORS.with(|c| c.set(c.get() + 1));
+                                }
+                                match fts_prepass.remove(seg_id.as_str()) {
+                                    // walked by `fts_segment_prepass` (same
+                                    // reader, projection, cap and contract)
+                                    Some(pre) => {
+                                        if pre.deadline_tripped {
+                                            fts_deadline_tripped = true;
+                                        }
+                                        Ok((pre.hits, pre.total))
+                                    }
+                                    None => searcher.search_bounded_counting_floor(
+                                        &fq,
+                                        fts_cap,
+                                        false,
+                                        segment_count_limit,
+                                        page_floor,
+                                    ),
+                                }
                             };
+                            // #fts-floor fail-before instrument: hits this segment
+                            // returned that score below the full page's lowest
+                            // kept score — work the admission walk can only drop.
+                            #[cfg(test)]
+                            if sort_topk.is_none()
+                                && !count_only
+                                && !deletes_present
+                                && all_hits.len() >= materialisation_limit
+                            {
+                                let worst = all_hits.iter().map(|h| h.score).reduce(f32::min);
+                                if let (Some(worst), Ok((seg_hits, _))) = (worst, bounded.as_ref())
+                                {
+                                    let below = seg_hits.iter().filter(|h| h.score < worst).count();
+                                    SEG_FTS_HITS_BELOW_PAGE.with(|c| c.set(c.get() + below));
+                                }
+                            }
                             // Record a deadline trip regardless of Ok/Err —
                             // the expansion may have stopped early either
                             // way (RC4 blocker 12).
@@ -27611,6 +28504,7 @@ impl Index {
                                             self.schedule_cold_stored_warm(
                                                 seg_id.as_str(),
                                                 meta.doc_count,
+                                                meta.size_bytes,
                                             );
                                         }
                                         None
@@ -27652,6 +28546,7 @@ impl Index {
                                                 self.schedule_cold_stored_warm(
                                                     seg_id.as_str(),
                                                     meta.doc_count,
+                                                    meta.size_bytes,
                                                 );
                                             }
                                             rows
@@ -29279,6 +30174,9 @@ impl Index {
         // This corpus also serves as the `significant_terms` / `global` /
         // `min_doc_count:0` background, so it must exist after `_refresh` has
         // flushed the memtable to segments.
+        if precomputed_aggs.is_none() {
+            precomputed_aggs = fts_row_aggs.take();
+        }
         let need_full_corpus = precomputed_aggs.is_none() && request.aggs.is_some();
         // #464: the brute agg corpus below deep-clones EVERY memtable AND
         // segment source into owned `Value`s — the allocation that escaped
@@ -29793,11 +30691,39 @@ impl Index {
     // ── Flush ─────────────────────────────────────────────────────────────────
 
     /// Flush the memtable to a new segment on disk, then build the FTS index.
+    ///
+    /// `Ok` means every document written before the call is in a published
+    /// segment and the WAL maintenance after it has run. That includes the
+    /// documents another flush had already claimed when this one started: it
+    /// waits until their segment is published, or drains them itself if that
+    /// flush failed (`settle_claimed_generations`). `_flush`, the shutdown
+    /// flush and every caller that uses this as a durability barrier rely on
+    /// it. Bounded by the index's flush budget; on timeout the documents stay
+    /// searchable and in the WAL.
     pub async fn flush(self: &Arc<Self>) -> Result<()> {
-        self.flush_with(FlushFanout::Parallel).await
+        self.flush_with(FlushFanout::Parallel, true).await
     }
 
-    /// [`Self::flush`] with one shard building at a time (#2427).
+    /// Drain this index's own memtable into published segments, without
+    /// waiting for the segment builds other flushes already have in flight:
+    /// the flush as it was before `settle_claimed_generations`. Not a
+    /// durability barrier. For background work that no client waits on and
+    /// that must not stall behind another flush's build: the periodic sweep,
+    /// the memory-relief paths, and the first pass of the shutdown flush
+    /// (`Engine::flush_all_force` waits in its second pass, once every index
+    /// has drained its own memtable).
+    pub(crate) async fn flush_memtable(self: &Arc<Self>) -> Result<()> {
+        self.flush_with(FlushFanout::Parallel, false).await
+    }
+
+    /// Whether this index still has frozen generations: documents a flush has
+    /// claimed (or a failed flush released) that are searchable but not yet in
+    /// a published segment.
+    pub(crate) fn has_unpublished_frozen_generations(&self) -> bool {
+        !self.memtable.frozen_generations_by_shard().is_empty()
+    }
+
+    /// [`Self::flush_memtable`] with one shard building at a time (#2427).
     ///
     /// A shard flush parses the drained documents, builds columns, postings
     /// and the stored blocks, and none of that working set is charged to the
@@ -29809,10 +30735,13 @@ impl Index {
     /// shard's segment publishes and its working set is freed before the
     /// next shard starts.
     pub async fn flush_one_shard_at_a_time(self: &Arc<Self>) -> Result<()> {
-        self.flush_with(FlushFanout::Serial).await
+        self.flush_with(FlushFanout::Serial, false).await
     }
 
-    async fn flush_with(self: &Arc<Self>, fanout: FlushFanout) -> Result<()> {
+    /// The coordinator behind [`Self::flush`] (`settle_claimed = true`),
+    /// [`Self::flush_memtable`] and [`Self::flush_one_shard_at_a_time`]
+    /// (`false`).
+    async fn flush_with(self: &Arc<Self>, fanout: FlushFanout, settle_claimed: bool) -> Result<()> {
         // #873: this flush is about to take whatever the memtable holds, so
         // every idle-probe observation about it is stale from here on. Clear
         // the pair at the ONE coordinator every flush path runs through
@@ -29869,34 +30798,18 @@ impl Index {
         let flush_timeout =
             std::time::Duration::from_millis(self.flush_timeout_ms.load(Ordering::Relaxed));
         let coordinator_name = index_name.clone();
+        // The settle step below shares the caller's flush budget.
+        let settle_deadline = std::time::Instant::now() + flush_timeout;
         // This coordinator is the cancellation boundary for the whole flush.
         // If the request future is dropped, its JoinHandle detaches and the
         // coordinator continues owning every shard publication transaction.
         // The await below uses the same detach on timeout (#1635): the
         // coordinator is not aborted (#1015).
         let coordinator = tokio::spawn(async move {
-            let mut shard_futures = Vec::with_capacity(n_shards);
-            let mut result: Result<()> = Ok(());
-            for shard_idx in 0..n_shards {
-                // #1226 — do not fan a finalize out for an EMPTY shard.
-                //
-                // `do_flush_shard` acquires the *process-global*
-                // `flush_finalize_gate` (a handful of permits shared by every
-                // index) before it discovers the shard has nothing to drain,
-                // and it first takes a per-index `flush_sema` permit. Under a
-                // multi-index bulk storm that global gate is saturated by
-                // other indices' ingest flushes, so each no-op shard task
-                // still queues behind the whole backlog. A user-visible
-                // `_refresh` / `delete_by_query?refresh=true` therefore paid
-                // one full admission wait PER SHARD even when the memtable was
-                // already drained — the "latency tracks write load, not index
-                // size" signature in #1226. Skipping empty shards bounds a
-                // flush's finalize-admission cost to the shards it actually
-                // has to drain; an all-empty memtable now does zero finalize
-                // work (just the durability tail below).
-                if memtable.shard_load(shard_idx).0 == 0 {
-                    continue;
-                }
+            // One shard's flush task: admission, freeze, build, publish. The
+            // fan-out uses it, and so does the settle step after it, for a
+            // generation another flush claimed and then released.
+            let spawn_shard_flush = |shard_idx: usize| {
                 let sema = Arc::clone(&flush_sema);
                 let store = Arc::clone(&store);
                 let memtable = Arc::clone(&memtable);
@@ -29910,7 +30823,7 @@ impl Index {
                 let shard_index_name = coordinator_name.clone();
                 #[cfg(test)]
                 let test_hook = flush_test_hook.clone();
-                let shard_task = tokio::spawn(async move {
+                tokio::spawn(async move {
                     #[cfg(test)]
                     let _in_flight = FlushShardProbe::enter(&shard_index_name).await;
                     let permit = match wait_for_flush_permit(
@@ -29954,7 +30867,35 @@ impl Index {
                         let _ = guard.take();
                     }
                     result
-                });
+                })
+            };
+            let mut shard_futures = Vec::with_capacity(n_shards);
+            let mut result: Result<()> = Ok(());
+            for shard_idx in 0..n_shards {
+                // #1226 — do not fan a finalize out for an EMPTY shard.
+                //
+                // `do_flush_shard` acquires the *process-global*
+                // `flush_finalize_gate` (a handful of permits shared by every
+                // index) before it discovers the shard has nothing to drain,
+                // and it first takes a per-index `flush_sema` permit. Under a
+                // multi-index bulk storm that global gate is saturated by
+                // other indices' ingest flushes, so each no-op shard task
+                // still queues behind the whole backlog. A user-visible
+                // `_refresh` / `delete_by_query?refresh=true` therefore paid
+                // one full admission wait PER SHARD even when the memtable was
+                // already drained — the "latency tracks write load, not index
+                // size" signature in #1226. Skipping empty shards bounds a
+                // flush's finalize-admission cost to the shards it actually
+                // has to drain; an all-empty memtable now does zero finalize
+                // work (just the durability tail below).
+                //
+                // A shard whose documents another flush has already claimed
+                // also reads as empty here (`shard_load` does not count claimed
+                // generations). The settle step below waits for those.
+                if memtable.shard_load(shard_idx).0 == 0 {
+                    continue;
+                }
+                let shard_task = spawn_shard_flush(shard_idx);
                 match fanout {
                     FlushFanout::Parallel => shard_futures.push(shard_task),
                     FlushFanout::Serial => fold_shard_flush(&mut result, shard_task.await),
@@ -29967,17 +30908,31 @@ impl Index {
             // request that initiated the flush was cancelled. The coordinator
             // owns this transition, so it cannot be skipped with the waiter.
             // The detached coordinator owns the complete durability tail.
-            // Persist the graph before WAL maintenance can checkpoint vector
-            // writes past the point from which restart can rebuild it.
             if result.is_ok() {
-                if let Err(error) = index.save_hnsw_to_disk().await {
-                    result = Err(error);
-                }
+                result = flush_durability_tail(&index).await;
             }
-            if result.is_ok() {
-                if let Err(error) = index.store.force_wal_maintenance() {
-                    result = Err(error.into());
-                }
+            // Report success only once the documents written before this
+            // call are published, also those another flush claimed first and
+            // is still building (a threshold flush of the ingest path, or a
+            // concurrent `_flush`). After the tail above, so a wait that is
+            // cut short (the server's shutdown budget) leaves this flush's own
+            // segments persisted as before; when there was something to wait
+            // for, the tail runs again so its WAL maintenance covers those
+            // segments too. `flush_memtable` skips this step.
+            if result.is_ok() && settle_claimed {
+                result = match settle_claimed_generations(
+                    &memtable,
+                    &coordinator_name,
+                    settle_deadline,
+                    flush_timeout,
+                    &spawn_shard_flush,
+                )
+                .await
+                {
+                    Ok(true) => flush_durability_tail(&index).await,
+                    Ok(false) => Ok(()),
+                    Err(error) => Err(error),
+                };
             }
             index.dataset_version.fetch_add(1, Ordering::Release);
             index.query_cache.clear();
@@ -30116,6 +31071,23 @@ impl Index {
     /// The `Arc<Index>` shell itself stays in `Engine::indices` so every
     /// loaded-index view (`_cat/indices`, `_cluster/health`, …) is unchanged.
     pub fn release_memory(&self) {
+        self.release_caches(false);
+    }
+
+    /// [`Self::release_memory`] for `Engine::release_rebuildable_memory` (the
+    /// memory breaker's drain and `POST /{index}/_cache/clear`): it keeps the
+    /// FTS readers whose postings live in mapped files
+    /// ([`FtsIndexReader::postings_mapped`], see `spill_fts_postings`). Dropping
+    /// such a reader frees almost no anonymous memory, its postings being
+    /// file-backed pages the kernel reclaims on its own, while the next query
+    /// reopens it: it decompresses the field's whole `.post` frame and maps it
+    /// again. After each drain on 177 segments of 11.3 M passages, the next
+    /// query spent 47-55 s opening readers.
+    pub fn release_memory_under_pressure(&self) {
+        self.release_caches(true);
+    }
+
+    fn release_caches(&self, keep_mapped_readers: bool) {
         self.dv_cache.clear();
         self.sort_shadow_cache.clear();
         self.range_prefilter_cache.clear();
@@ -30124,7 +31096,13 @@ impl Index {
         self.stored_value_cache.clear();
         self.stored_slices_cache.clear();
         self.decoded_stored_cache.clear();
-        self.fts_reader_cache.clear();
+        self.decoded_row_offsets.clear();
+        if keep_mapped_readers {
+            self.fts_reader_cache
+                .retain(|_, reader| reader.postings_mapped());
+        } else {
+            self.fts_reader_cache.clear();
+        }
         self.vector_column_cache.clear();
         self.shortcut_count_cache.clear();
         self.ghost_positions_cache.clear();
@@ -30146,6 +31124,7 @@ impl Index {
             + self.stored_value_cache.len()
             + self.stored_slices_cache.len()
             + self.decoded_stored_cache.len()
+            + self.decoded_row_offsets.len()
             + self.fts_reader_cache.len()
             + self.vector_column_cache.len()
             + self.shortcut_count_cache.len()
@@ -33241,6 +34220,8 @@ impl Index {
         self.row_seq_cache.remove(segment_id);
         self.stored_slices_cache.remove(segment_id);
         self.decoded_stored_cache.remove(segment_id);
+        self.decoded_row_offsets.remove(segment_id);
+        self.stored_slices_refused.remove(segment_id);
         // Keyed by "<segment_id>\u{1}<field-set>", so evict by prefix.
         let fts_prefix = format!("{segment_id}\u{1}");
         self.fts_reader_cache
@@ -33272,6 +34253,9 @@ impl Index {
         if self.decoded_stored_cache.is_empty() {
             self.decoded_stored_cache.shrink_to_fit();
         }
+        if self.decoded_row_offsets.is_empty() {
+            self.decoded_row_offsets.shrink_to_fit();
+        }
         if self.sort_shadow_cache.is_empty() {
             self.sort_shadow_cache.shrink_to_fit();
         }
@@ -33294,37 +34278,201 @@ impl Index {
         segment_id: &str,
         fields: &[&str],
     ) -> Option<Resident<Arc<FtsIndexReader>>> {
-        // The field set is part of the identity: `open` loads only the fields
-        // it is given, so a reader opened for a narrower set must never serve a
-        // query that needs a wider one. Sort so that permutations of the same
-        // set share one entry.
-        let mut sorted: Vec<&str> = fields.to_vec();
-        sorted.sort_unstable();
-        sorted.dedup();
-        let key = format!("{segment_id}\u{1}{}", sorted.join("\u{2}"));
-
+        let key = fts_reader_cache_key(segment_id, fields);
         if let Some(hit) = self.fts_reader_cache.get(&key) {
             return Some(Arc::clone(hit.value()));
         }
 
         // #2427/#1122: a reader the cache cannot hold is built per query and
         // decompresses every requested field's postings; reserve that in the
-        // read budget before paying it (see `stored_slices_for_with`).
+        // read budget before paying it (see `stored_slices_for_with`). A
+        // reader whose postings spill below keeps only the mapped form, and
+        // `publish_current_permitted` trues the reservation down to that.
         let read_budget = crate::read_budget::global();
         let estimate = FtsIndexReader::estimate_open_bytes(fts_dir, segment_id, fields);
         let permit = transient_read_permit(&self.segment_hydration_budget, read_budget, estimate);
-        let reader = Arc::new(FtsIndexReader::open(fts_dir, segment_id, fields).ok()?);
-        let bytes = reader.retained_bytes();
+        let mut reader = FtsIndexReader::open(fts_dir, segment_id, fields).ok()?;
+        #[cfg(test)]
+        FTS_READER_OPENS.with(|c| c.set(c.get() + 1));
+        // A reader holds its fields' postings decompressed: each field's whole
+        // `.post` zstd frame. A reader the hydration budget had no room for
+        // went back uncached, and every later query that needed it decompressed
+        // the whole frame again — on 11.3 M Wikipedia passages under the AUTO
+        // budget ~68 of 136 readers per question, ~2.4 s of a 4.1 s `match`.
+        // `spill_fts_postings` decides when the postings move into an unlinked
+        // file beside the segment, mapped read-only (`spill_postings_to`): the
+        // bytes then live in the page cache — file-backed, reclaimable, outside
+        // the breaker's RSS — and the reader is kept like any other.
+        let mut bytes = reader.retained_bytes();
+        let spillable = reader.spillable_postings_bytes();
+        if spill_fts_postings(bytes, spillable, &self.segment_hydration_budget)
+            && reader.spill_postings_to(fts_dir) > 0
+        {
+            bytes = reader.retained_bytes();
+        }
         Some(self.publish_current_permitted(
             &self.fts_reader_cache,
             segment_id,
             key,
             SegmentCacheCategory::FtsReader,
             bytes,
-            reader,
+            Arc::new(reader),
             &self.segment_hydration_budget,
             permit,
         ))
+    }
+
+    /// Opens and caches, `threads` at a time, the FTS readers of `segments`
+    /// that are not cached yet: each through [`Self::fts_reader_for`], so the
+    /// cache key, the hydration budget and the postings spill are those of
+    /// the sequential walk. Returns how many readers it opened.
+    fn open_fts_readers_parallel(
+        &self,
+        fts_dir: &std::path::Path,
+        segments: &[&xerj_storage::segment::SegmentMeta],
+        fields: &[&str],
+        threads: usize,
+    ) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cold: Vec<&str> = segments
+            .iter()
+            .map(|meta| meta.id.as_str())
+            .filter(|id| {
+                self.fts_reader_cache
+                    .get(&fts_reader_cache_key(id, fields))
+                    .is_none()
+            })
+            .collect();
+        if cold.len() < 2 || threads < 2 {
+            return 0;
+        }
+        let next = AtomicUsize::new(0);
+        let opened = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(cold.len()) {
+                scope.spawn(|| {
+                    while let Some(id) = cold.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        if self.fts_reader_for(fts_dir, id, fields).is_some() {
+                            opened.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        opened.into_inner()
+    }
+
+    /// The full-text walk of `args.segments`, `threads` segments at a time
+    /// (`XERJ_FTS_SEGMENT_THREADS`), for `search_inner`'s segment loop to
+    /// take instead of walking each segment itself. Per segment exactly what
+    /// the loop does: the cached reader (`fts_reader_for`), the query's
+    /// projection with the missing-field pruning, the same searcher (deadline,
+    /// collection statistics) and `search_bounded_counting_floor` with the
+    /// page cap. A segment the loop would not answer from its inverted index
+    /// (no reader, no projection, a queried field missing) is left out and
+    /// the loop handles it as before.
+    ///
+    /// The floor: the loop hands a later segment the lowest score of its full
+    /// page; here every finished segment offers its hits to one shared top-cap
+    /// of scores, and a segment that starts after it is full walks with its
+    /// lowest score as the floor. The caller runs this only without deleted or
+    /// overwritten documents, so every hit is a live, distinct document of the
+    /// final candidate set: the shared cap-th best score never exceeds the
+    /// final page's lowest score, and a walk returns every hit at or above its
+    /// floor (ties included) — so the loop's page is unchanged. Totals: each
+    /// segment counts to `args.count_limit` (one past `track_total_hits`), so
+    /// their sum is exact below the limit and answered `gte` above it.
+    fn fts_segment_prepass(
+        &self,
+        query: &QueryNode,
+        args: &FtsPrepassArgs<'_>,
+        threads: usize,
+    ) -> std::collections::HashMap<String, FtsPrepassResult> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        let floor = std::sync::Mutex::new(std::collections::BinaryHeap::<
+            std::cmp::Reverse<PrepassScore>,
+        >::new());
+        let out = std::sync::Mutex::new(std::collections::HashMap::new());
+        // Opt-in (`XERJ_FTS_LIVE_FLOOR`): one floor the walks share while they
+        // run. A walk raises it to its full page's worst score, and the merged
+        // top of the finished segments below raises it too. Each such score is
+        // the worst of `cap` distinct live documents competing for the one
+        // merged page (no deleted or overwritten documents here), so it never
+        // exceeds that page's lowest score: the walks keep every document of
+        // it, as with the start floor. Read here, on the caller's thread.
+        let live: Option<Arc<xerj_fts::SharedFloor>> =
+            (args.cap > 0 && fts_live_floor()).then(|| Arc::new(xerj_fts::SharedFloor::new()));
+        let walk_one = |meta: &xerj_storage::segment::SegmentMeta| -> Option<FtsPrepassResult> {
+            let reader = self.fts_reader_for(args.segments_dir, &meta.id, args.open_fields)?;
+            let reader = Arc::clone(&*reader);
+            let fq = query_node_to_fts_projected(
+                query,
+                args.text_fields,
+                args.exact_fields,
+                args.kw_fields,
+                self.segment_analyzer_binding(),
+                None,
+            )?;
+            let fq = prune_missing_should_fields(&fq, &|f| reader.field_stats(f).is_some())
+                .unwrap_or(fq);
+            let mut queried: Vec<String> = Vec::new();
+            collect_fts_query_fields(&fq, &mut queried);
+            if !queried.iter().all(|f| reader.field_stats(f).is_some()) {
+                return None;
+            }
+            let searcher = FtsSearcher::new(Arc::clone(&reader), Arc::clone(&self.registry))
+                .with_deadline(Some(args.deadline))
+                .with_collection_stats(args.stats.clone())
+                .with_shared_floor(live.clone());
+            let page_floor = {
+                let heap = floor.lock().unwrap_or_else(|e| e.into_inner());
+                (args.cap > 0 && heap.len() >= args.cap)
+                    .then(|| heap.peek().map(|r| r.0 .0))
+                    .flatten()
+            };
+            let (hits, total) = searcher
+                .search_bounded_counting_floor(&fq, args.cap, false, args.count_limit, page_floor)
+                .ok()?;
+            let deadline_tripped = searcher.deadline_tripped();
+            if args.cap > 0 {
+                let mut heap = floor.lock().unwrap_or_else(|e| e.into_inner());
+                for h in &hits {
+                    heap.push(std::cmp::Reverse(PrepassScore(h.score)));
+                    if heap.len() > args.cap {
+                        heap.pop();
+                    }
+                }
+                if heap.len() >= args.cap {
+                    if let (Some(live), Some(worst)) = (live.as_deref(), heap.peek()) {
+                        live.raise(worst.0 .0);
+                    }
+                }
+            }
+            Some(FtsPrepassResult {
+                hits,
+                total,
+                deadline_tripped,
+            })
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(args.segments.len()) {
+                scope.spawn(|| {
+                    while let Some(&meta) = args.segments.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        if std::time::Instant::now() >= args.deadline {
+                            break;
+                        }
+                        if let Some(r) = walk_one(meta) {
+                            out.lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(meta.id.clone(), r);
+                        }
+                    }
+                });
+            }
+        });
+        out.into_inner().unwrap_or_else(|e| e.into_inner())
     }
 
     fn dv_columns_for(
@@ -33390,6 +34538,53 @@ impl Index {
             hydration,
             permit,
         ))
+    }
+
+    /// The `.dv` columns of a segment that `wanted` accepts, for a reader that
+    /// needs a few of them: the segment's whole cached map when it is already
+    /// resident, otherwise a read of the sidecar that passes over every other
+    /// column's payload unread
+    /// ([`xerj_storage::doc_values::decode_columns_selected`]).
+    ///
+    /// The partial map is neither published to `dv_cache`, whose entries are
+    /// whole sidecars other readers index into, nor charged to the hydration
+    /// budget: it lives for one request. The sidecar keeps a keyword column
+    /// for each indexed string field, the text field's whole values included,
+    /// and on a passage corpus that column is nearly all of it (1 M Wikipedia
+    /// passages: 169 MB of a segment's 170 MB). `None` where
+    /// [`Self::dv_columns_for`] has none: no sidecar, or one that does not
+    /// decode.
+    fn dv_columns_selected(
+        &self,
+        segments_dir: &std::path::Path,
+        segment_id: &str,
+        wanted: &(dyn Fn(&str) -> bool + Sync),
+    ) -> Option<Resident<DocValueMap>> {
+        if let Some(entry) = self.dv_cache.get(segment_id) {
+            return Some(Arc::clone(entry.value()));
+        }
+        let file = std::fs::File::open(segments_dir.join(format!("{segment_id}.dv"))).ok()?;
+        let cols = xerj_storage::doc_values::decode_columns_selected(
+            std::io::BufReader::new(file),
+            wanted,
+        )
+        .ok()?;
+        // Never cached, so when the hydration budget has no room this is a
+        // transient like a refused `dv_columns_for_with` decode (#2778): the
+        // selected columns hold a read reservation until the request drops
+        // them. Measured after the read: only the header walk of the whole
+        // sidecar could say what the selection costs beforehand.
+        let bytes = cache_estimates::doc_values_bytes(
+            &segment_id.to_string(),
+            std::mem::size_of::<CacheResident<DocValueMap>>(),
+            &cols,
+        );
+        let permit = transient_read_permit(
+            &self.segment_hydration_budget,
+            crate::read_budget::global(),
+            bytes,
+        );
+        Some(CacheResident::uncached_with_permit(cols, permit))
     }
 
     /// Columnar `function_score { match_all, field_value_factor }` fast path.
@@ -33766,22 +34961,49 @@ impl Index {
 
         let mut out = xerj_fts::CollectionStats::new();
         let segments_dir = self.data_dir.join("segments");
+        // The segment loop opens each segment's FULL reader over the text
+        // fields plus the query's fields (`fts_open_fields`) and keeps it in
+        // `fts_reader_cache` whenever the hydration budget admits it. That
+        // reader holds the same FST and decoded `.meta` this pre-pass reads,
+        // so a cached one answers `field_stats` / `term_doc_freq` with the
+        // same numbers. `open_stats_only` instead re-reads and re-decodes the
+        // `.meta` of every segment on every query — O(field vocabulary) per
+        // segment, a third of a warm 1 M-passage `match` (perf).
+        let mut open_fields: Vec<&str> = text_fields.iter().map(String::as_str).collect();
+        for &f in &field_refs {
+            if !open_fields.contains(&f) {
+                open_fields.push(f);
+            }
+        }
         for meta in snap.segments.iter() {
-            let Ok(reader) =
-                xerj_fts::FtsIndexReader::open_stats_only(&segments_dir, &meta.id, &field_refs)
-            else {
-                // A segment whose statistics we cannot read would skew the
-                // union low and silently inflate every other arm's IDF.
-                // Fall back to per-arm statistics rather than half a union —
-                // and SAY so (#1186: every decline from index-wide stats is
-                // a silent ranking change, never a quiet local decision).
-                tracing::warn!(
-                    segment = %meta.id,
-                    "search: BM25 collection statistics declined — segment stats \
-                     unreadable; segments will score against their own df/avgdl and \
-                     scores will not be comparable across segments"
-                );
-                return None;
+            let cached: Option<Resident<Arc<FtsIndexReader>>> = self
+                .fts_reader_cache
+                .get(&fts_reader_cache_key(&meta.id, &open_fields))
+                .map(|hit| Arc::clone(hit.value()));
+            let stats_only: FtsIndexReader;
+            let reader: &FtsIndexReader = if let Some(resident) = cached.as_ref() {
+                resident
+            } else {
+                #[cfg(test)]
+                STATS_ONLY_OPENS.with(|c| c.set(c.get() + 1));
+                let Ok(opened) =
+                    xerj_fts::FtsIndexReader::open_stats_only(&segments_dir, &meta.id, &field_refs)
+                else {
+                    // A segment whose statistics we cannot read would skew the
+                    // union low and silently inflate every other arm's IDF.
+                    // Fall back to per-arm statistics rather than half a union —
+                    // and SAY so (#1186: every decline from index-wide stats is
+                    // a silent ranking change, never a quiet local decision).
+                    tracing::warn!(
+                        segment = %meta.id,
+                        "search: BM25 collection statistics declined — segment stats \
+                         unreadable; segments will score against their own df/avgdl and \
+                         scores will not be comparable across segments"
+                    );
+                    return None;
+                };
+                stats_only = opened;
+                &stats_only
             };
             for f in &fields {
                 if let Some(fs) = reader.field_stats(f) {
@@ -36584,6 +37806,7 @@ impl Index {
                 read_budget,
                 stored_slices_bound(raw, expect_docs),
             );
+            self.whole_stored_decodes.fetch_add(1, Ordering::Relaxed);
             (xerj_storage::stored_codec::decode_stored(raw).ok()?, permit)
         };
         if bytes.len() > u32::MAX as usize {
@@ -36601,7 +37824,7 @@ impl Index {
             slices.bytes.capacity(),
             slices.offsets.capacity(),
         );
-        Some(self.publish_current_permitted(
+        let resident = self.publish_current_permitted(
             &self.stored_slices_cache,
             seg_id,
             key,
@@ -36610,7 +37833,173 @@ impl Index {
             slices,
             hydration,
             permit,
-        ))
+        );
+        // A refusal is remembered: until the budget has room for these bytes,
+        // nothing warms this segment again.
+        if resident.is_cached() {
+            self.stored_slices_refused.remove(seg_id);
+        } else {
+            self.stored_slices_refused.insert(seg_id.to_string(), bytes);
+        }
+        Some(resident)
+    }
+
+    /// Whether the hydration budget cannot keep `seg_id`'s decoded stored
+    /// slices now: it refused them before and still has no room for them, or
+    /// it has no room for the segment file itself (`size_bytes`, which holds
+    /// the compressed stored section; a decoded section that would fit where
+    /// its file does not is rare, and misjudging one costs a page a row read
+    /// instead of a warm cache). Decoding such a section whole in the
+    /// background is thrown away, and every cold page used to queue it again.
+    fn stored_slices_cannot_be_kept(&self, seg_id: &str, size_bytes: u64) -> bool {
+        let budget = &self.segment_hydration_budget;
+        self.stored_slices_refused
+            .get(seg_id)
+            .is_some_and(|refused| !budget.has_headroom(*refused.value()))
+            || !budget.has_headroom(size_bytes)
+    }
+
+    /// The `_source` a GET by `_id` returns from a segment whose decoded
+    /// stored section the hydration budget cannot keep
+    /// ([`Self::stored_slices_cannot_be_kept`], or a section that
+    /// `decoded_stored_cache` holds while the budget has no room for a copy
+    /// of it), without decoding that section: from the resident section
+    /// through cached row offsets ([`Self::source_from_resident_decoded_row`])
+    /// or from the document's row alone
+    /// ([`xerj_storage::stored_codec::decode_stored_v2_row_for_get`]).
+    ///
+    /// The primary-key path below needs the segment's `StoredSlices`; on such
+    /// a segment `stored_slices_for` decodes the whole section, the budget
+    /// refuses it, and the next GET decodes it again (52_verify2, 2026-10-28:
+    /// 1.1-6.6 s per GET on every repeat for segments of 97 k documents and
+    /// more of a one-million-fact store whose budget searches had filled; a
+    /// facts edit batch, whose repairs are updates by `_id`, ran for over 17
+    /// minutes). A segment the budget can keep still takes that path, which
+    /// caches the slices for the GETs after it.
+    ///
+    /// `None` leaves the GET to the paths below, unchanged: slices already
+    /// warm or keepable, a legacy (non-columnar) section, a dependency shape
+    /// the row reader declines, an id the position map does not hold, a row
+    /// whose `_id` differs, or any read or parse error.
+    ///
+    /// The slice path serialises each stored document and parses its slice
+    /// back. The row is put through the same text step, wrapped like a stored
+    /// document, so both paths return the same value: serde_json's default
+    /// float parsing is not an exact round trip, and the wrapper keeps the
+    /// nesting depth the parser sees.
+    fn source_from_refused_segment_row(
+        &self,
+        seg_id: &str,
+        doc_count: u64,
+        size_bytes: u64,
+        id: &str,
+    ) -> Option<Value> {
+        use xerj_storage::stored_codec::{
+            decode_stored_v2_row_for_get, StoredV2RowHydrationResult,
+        };
+        if self.stored_slices_cache.contains_key(seg_id) {
+            return None;
+        }
+        // `stored_slices_for` copies a resident decoded section into the
+        // slices, so the slices cannot be kept either while the budget has
+        // no room for that copy.
+        let decoded = self
+            .decoded_stored_cache
+            .get(seg_id)
+            .map(|entry| Arc::clone(entry.value()));
+        let budget = &self.segment_hydration_budget;
+        if !self.stored_slices_cannot_be_kept(seg_id, size_bytes)
+            && !decoded
+                .as_ref()
+                .is_some_and(|decoded| !budget.has_headroom(decoded.value().len() as u64))
+        {
+            return None;
+        }
+        let pos = *self.id_pos_map_for(seg_id, doc_count)?.get(id)?;
+        if let Some(decoded) = decoded {
+            if let Some(source) =
+                self.source_from_resident_decoded_row(seg_id, &decoded, doc_count, pos, id)
+            {
+                return Some(source);
+            }
+        }
+        let reader = self.store.open_segment_arc(seg_id).ok()?;
+        let bytes = reader.section(SectionType::Stored).ok()??;
+        let StoredV2RowHydrationResult::Hydrated { mut rows, .. } =
+            decode_stored_v2_row_for_get(bytes, pos as usize).ok()?
+        else {
+            return None;
+        };
+        let row = rows.pop()?;
+        if row.ordinal != pos as usize || row.id.as_str() != Some(id) {
+            return None;
+        }
+        let mut doc = serde_json::Map::with_capacity(3);
+        doc.insert("_id".into(), row.id);
+        doc.insert("_seq_no".into(), row.seq_no);
+        doc.insert("_source".into(), Value::Object(row.source));
+        let text = serde_json::to_vec(&Value::Object(doc)).ok()?;
+        let mut doc = serde_json::from_slice::<Value>(&text).ok()?;
+        let source = doc.get_mut("_source")?.take();
+        self.refused_segment_row_gets
+            .fetch_add(1, Ordering::Relaxed);
+        Some(source)
+    }
+
+    /// The `_source` a GET by `_id` returns from row `pos` of a segment's
+    /// decoded stored section that `decoded_stored_cache` holds (`decoded`),
+    /// when the budget cannot keep its `StoredSlices`: the bytes, the row
+    /// offsets (`brace_walk_offsets`, the same count check) and the parse of
+    /// the slice path, which would copy this very section into its slices,
+    /// without the copy. Only the offsets are kept, in `decoded_row_offsets`;
+    /// while the budget refuses them too, each GET walks the section again.
+    /// `None` (offsets that do not match the segment's documents, a row whose
+    /// `_id` differs, a parse error) leaves the GET to the row read.
+    fn source_from_resident_decoded_row(
+        &self,
+        seg_id: &str,
+        decoded: &Resident<Vec<u8>>,
+        doc_count: u64,
+        pos: u32,
+        id: &str,
+    ) -> Option<Value> {
+        let bytes = decoded.value();
+        if bytes.len() > u32::MAX as usize {
+            return None;
+        }
+        let offsets = match self.decoded_row_offsets.get(seg_id) {
+            Some(entry) => Arc::clone(entry.value()),
+            None => {
+                let offsets = brace_walk_offsets(bytes);
+                if offsets.len() as u64 != doc_count {
+                    return None;
+                }
+                let key = seg_id.to_string();
+                let charge = crate::segment_cache_estimates::stored_slices_bytes(
+                    &key,
+                    std::mem::size_of::<CacheResident<Vec<(u32, u32)>>>(),
+                    0,
+                    offsets.capacity(),
+                );
+                self.publish_current(
+                    &self.decoded_row_offsets,
+                    seg_id,
+                    key,
+                    SegmentCacheCategory::StoredSlices,
+                    charge,
+                    offsets,
+                )
+            }
+        };
+        let &(start, end) = offsets.get(pos as usize)?;
+        let doc = serde_json::from_slice::<Value>(bytes.get(start as usize..end as usize)?).ok()?;
+        if doc.get("_id").and_then(Value::as_str) != Some(id) {
+            return None;
+        }
+        let source = doc.get("_source").cloned()?;
+        self.refused_segment_resident_gets
+            .fetch_add(1, Ordering::Relaxed);
+        Some(source)
     }
 
     /// Retained-size bound of this segment's `StoredSlices`, from framing
@@ -37178,6 +38567,182 @@ impl Index {
         let arc = Arc::new(exp);
         self.regexp_expand_cache.insert(key, Arc::clone(&arc));
         Some(arc)
+    }
+
+    /// The aggregations of `aggs_def` over the documents `query` matches,
+    /// reduced from doc values (see the call site in `search_inner`): per
+    /// segment, the rows the query's full-text projection matches
+    /// ([`FtsSearcher::matching_docs`]) gate the same columnar executors a
+    /// columnar query filter uses (`try_fast_aggs_over_fts_rows`).
+    ///
+    /// `None` — the caller keeps the exact `_source` path — when the
+    /// projection is not the exact match set (no projection, or a residual
+    /// clause it dropped), when a segment's FTS side-car is missing or does not
+    /// hold every queried field (the walk would scan that segment's stored
+    /// documents), when the deadline cut a match set short, and on every
+    /// shape the columnar executors bail on.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_aggs_fast_over_fts_match(
+        &self,
+        aggs_def: &Value,
+        query: &QueryNode,
+        text_fields: &[String],
+        exact_fields: &std::collections::HashSet<String>,
+        kw_fields: &std::collections::HashSet<String>,
+        snap: &xerj_storage::index_store::IndexSnapshot,
+        segments_dir: &std::path::Path,
+        deadline: std::time::Instant,
+    ) -> Option<Value> {
+        let binding = self.segment_analyzer_binding();
+        let fq = query_node_to_fts_projected(
+            query,
+            text_fields,
+            exact_fields,
+            kw_fields,
+            binding,
+            None,
+        )?;
+        if bool_has_nonprojectable_nonscoring(
+            query,
+            text_fields,
+            exact_fields,
+            kw_fields,
+            binding,
+            None,
+        ) {
+            return None;
+        }
+        let mut fields: Vec<String> = text_fields.to_vec();
+        let mut queried: Vec<String> = Vec::new();
+        collect_fts_query_fields(&fq, &mut queried);
+        for f in &queried {
+            if !fields.contains(f) {
+                fields.push(f.clone());
+            }
+        }
+        let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+        let mut rows: std::collections::HashMap<String, Arc<Vec<u64>>> =
+            std::collections::HashMap::new();
+        // Opt-in (`XERJ_FTS_SEGMENT_THREADS` > 1): the segments' match sets
+        // that many at a time (`fts_match_sets_parallel`, the same work per
+        // segment and the same `None`); the loop then has nothing left to do.
+        let threads = fts_segment_threads();
+        let sequential: &[xerj_storage::segment::SegmentMeta] =
+            if threads > 1 && snap.segments.len() > 1 {
+                rows = self.fts_match_sets_parallel(
+                    &snap.segments,
+                    segments_dir,
+                    &field_refs,
+                    &queried,
+                    &fq,
+                    deadline,
+                    threads,
+                )?;
+                #[cfg(test)]
+                FTS_FACET_PARALLEL.with(|c| c.set(c.get() + 1));
+                &[]
+            } else {
+                &snap.segments
+            };
+        for meta in sequential {
+            if meta.doc_count == 0 {
+                continue;
+            }
+            let reader = self.fts_reader_for(segments_dir, &meta.id, &field_refs)?;
+            let reader = Arc::clone(&*reader);
+            // The walk scans the stored documents of a segment whose side-car
+            // lacks a queried field; the inverted index cannot stand in there.
+            if !queried.iter().all(|f| reader.field_stats(f).is_some()) {
+                return None;
+            }
+            let searcher =
+                FtsSearcher::new(reader, Arc::clone(&self.registry)).with_deadline(Some(deadline));
+            let bits = searcher.matching_docs(&fq).ok()??;
+            rows.insert(meta.id.clone(), Arc::new(bits));
+        }
+        let (bool_fields, mapped_fields) = {
+            let guard = self.schema.read().await;
+            let mut bool_fields = std::collections::HashSet::new();
+            let mut mapped_fields = std::collections::HashSet::new();
+            for f in &guard.schema.fields {
+                if f.field_type == xerj_common::FieldType::Boolean {
+                    bool_fields.insert(f.name.clone());
+                }
+                mapped_fields.insert(f.name.clone());
+            }
+            (bool_fields, mapped_fields)
+        };
+        self.try_fast_aggs_over_fts_rows(
+            aggs_def,
+            &rows,
+            snap,
+            segments_dir,
+            &bool_fields,
+            &mapped_fields,
+        )
+        .map(|(aggs, _)| aggs)
+    }
+
+    /// [`Self::try_aggs_fast_over_fts_match`]'s per-segment match sets on
+    /// `threads` threads (`XERJ_FTS_SEGMENT_THREADS`). Per segment exactly
+    /// what its sequential loop does (skip an empty segment; the cached
+    /// reader; `None` when a queried field is missing from the side-car or
+    /// the deadline cut the match set short), so the same rows, or `None` as
+    /// soon as any segment declines. At 10 GB (35 segments) the sequential
+    /// loop was 158-210 ms of a console page's 416-642 ms.
+    #[allow(clippy::too_many_arguments)]
+    fn fts_match_sets_parallel(
+        &self,
+        segments: &[xerj_storage::segment::SegmentMeta],
+        segments_dir: &std::path::Path,
+        field_refs: &[&str],
+        queried: &[String],
+        fq: &FtsQuery,
+        deadline: std::time::Instant,
+        threads: usize,
+    ) -> Option<std::collections::HashMap<String, Arc<Vec<u64>>>> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let metas: Vec<&xerj_storage::segment::SegmentMeta> =
+            segments.iter().filter(|m| m.doc_count > 0).collect();
+        let next = AtomicUsize::new(0);
+        let declined = AtomicBool::new(false);
+        let out = std::sync::Mutex::new(std::collections::HashMap::new());
+        let one = |meta: &xerj_storage::segment::SegmentMeta| -> Option<Vec<u64>> {
+            let reader = self.fts_reader_for(segments_dir, &meta.id, field_refs)?;
+            let reader = Arc::clone(&*reader);
+            if !queried.iter().all(|f| reader.field_stats(f).is_some()) {
+                return None;
+            }
+            let searcher =
+                FtsSearcher::new(reader, Arc::clone(&self.registry)).with_deadline(Some(deadline));
+            searcher.matching_docs(fq).ok()?
+        };
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(metas.len()) {
+                scope.spawn(|| {
+                    while let Some(&meta) = metas.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        if declined.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        match one(meta) {
+                            Some(bits) => {
+                                out.lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(meta.id.clone(), Arc::new(bits));
+                            }
+                            None => {
+                                declined.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        if declined.into_inner() {
+            return None;
+        }
+        Some(out.into_inner().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Version of `try_aggs_fast_with_segments` that caches decoded columns
@@ -38033,7 +39598,10 @@ enum CapturedEntryVerdict {
     /// The entry names a publication after the capture (a merge output or a
     /// flush segment the captured snapshot never held). The hit stands; the
     /// entry's seq/version belong to that later world and must not be
-    /// reported on the hit.
+    /// reported on the hit. A merge output cannot be told from a later write
+    /// here, so the exact kNN scans also check, after their walk, that no
+    /// captured segment was merged away, and recapture if one was
+    /// (`Index::captured_segments_left_the_snapshot`).
     PostCapture,
 }
 
@@ -38349,6 +39917,105 @@ async fn await_flush_task(
             format!("index [{index}] flush task failed: {error}"),
         ))),
         None => Err(flush_budget_timeout_error(index, budget)),
+    }
+}
+
+/// The outcome of one shard flush task spawned by `Index::flush`.
+async fn join_shard_flush(task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    match task.await {
+        Ok(result) => result,
+        Err(error) => Err(EngineError::Common(xerj_common::XerjError::internal(
+            format!("flush shard task failed: {error}"),
+        ))),
+    }
+}
+
+/// The durability tail of `Index::flush`: persist the HNSW graph, then run
+/// verified WAL maintenance, which also persists the segment snapshot. The
+/// graph goes first so WAL maintenance cannot checkpoint vector writes past
+/// the point from which a restart can rebuild the graph.
+async fn flush_durability_tail(index: &Index) -> Result<()> {
+    index.save_hnsw_to_disk().await?;
+    index.store.force_wal_maintenance()?;
+    Ok(())
+}
+
+/// How often `settle_claimed_generations` looks again at the builds it waits
+/// for. A segment build takes tens of milliseconds to minutes.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Wait until no frozen generation that exists now is still unpublished.
+///
+/// `Index::flush` builds its fan-out from `shard_load`, which does not count a
+/// frozen generation another flush has claimed: a threshold flush of the
+/// ingest path, or a concurrent `_flush`. Nothing else records that such a
+/// build is still running (a threshold flush gives its `flush_sema` permit
+/// back at the drain), so the fan-out used to skip those shards and the flush
+/// reported success while the documents were still in someone else's segment
+/// build. A stop right after that abandoned the build: orphaned segment files
+/// at the next open and a WAL replay of every one of its documents.
+///
+/// Called after this flush's own shard tasks succeeded. A document written
+/// before the call is then either in a published segment or in a generation
+/// that is frozen now, because a generation leaves the frozen list only at
+/// publish (`FrozenClaim::retire`). So this takes the frozen generations of
+/// every shard once and waits until each has left the list. One that is
+/// still there but unclaimed was released by a flush that failed, and nobody
+/// is building it any more: this flush drains that shard itself, and that
+/// drain's error, if any, is the flush's answer. Generations frozen later are
+/// not waited for, so a flush under continuous ingest still ends. The wait is
+/// bounded by the flush budget; on timeout the documents stay searchable and
+/// in the WAL.
+///
+/// Returns whether there was anything to wait for: the caller then runs its
+/// durability tail again, so the WAL maintenance covers those segments.
+async fn settle_claimed_generations(
+    memtable: &crate::memtable::ShardedFtsMemtable,
+    index_name: &str,
+    deadline: std::time::Instant,
+    budget: std::time::Duration,
+    spawn_shard_flush: impl Fn(usize) -> tokio::task::JoinHandle<Result<()>>,
+) -> Result<bool> {
+    let mut pending = memtable.frozen_generations_by_shard();
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    loop {
+        let mut released = Vec::new();
+        pending.retain_mut(|(shard_idx, generations)| {
+            if memtable.retain_still_frozen(*shard_idx, generations) {
+                released.push(*shard_idx);
+            }
+            !generations.is_empty()
+        });
+        if pending.is_empty() {
+            return Ok(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            let builds: usize = pending
+                .iter()
+                .map(|(_, generations)| generations.len())
+                .sum();
+            warn!(
+                index = index_name,
+                budget_ms = budget.as_millis() as u64,
+                segment_builds = builds,
+                "flush timed out waiting for segment builds of other flushes"
+            );
+            return Err(EngineError::Common(xerj_common::XerjError::internal(
+                format!(
+                    "index [{index_name}] flush timed out after {budget:?} waiting for {builds} \
+                     segment build(s) that other flushes still have in flight; their documents \
+                     stay searchable and in the WAL, and this flush can be retried"
+                ),
+            )));
+        }
+        for &shard_idx in &released {
+            join_shard_flush(spawn_shard_flush(shard_idx)).await?;
+        }
+        if released.is_empty() {
+            tokio::time::sleep(SETTLE_POLL).await;
+        }
     }
 }
 
@@ -55640,6 +57307,162 @@ fn seg_range_positions(
     )
 }
 
+/// A segment field whose decompressed postings reach this size keeps them in
+/// a mapped unlinked file from the reader's first open (`spill_fts_postings`).
+const FTS_POSTINGS_MAP_ABOVE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Whether `fts_reader_for` moves a new reader's decompressed postings
+/// (`spillable` of its `whole` retained bytes) into a mapped unlinked file
+/// before publishing it to `budget`.
+///
+/// * Postings of at least [`FTS_POSTINGS_MAP_ABOVE_BYTES`] always move: past
+///   that size they are most of the reader, and readers kept whole fill the
+///   budget first-come-first-served, so the readers opened later — needed by
+///   every query too — found no room even without their postings. On 11.3 M
+///   Wikipedia passages (136 segments, ~40 MiB of `text` postings each) the
+///   AUTO budget held ~68 whole readers, and moving only the refused ones
+///   left 2,010 refusals in 30 questions (window 6).
+/// * Smaller postings move only when the whole reader does not fit now.
+/// * Nothing moves when the reader would not fit even without its postings:
+///   it is not kept either way.
+fn spill_fts_postings(whole: u64, spillable: u64, budget: &SegmentHydrationBudget) -> bool {
+    spillable > 0
+        && (spillable >= FTS_POSTINGS_MAP_ABOVE_BYTES || !budget.has_headroom(whole))
+        && budget.has_headroom(whole - spillable)
+}
+
+/// One segment's walk from [`Index::fts_segment_prepass`].
+struct FtsPrepassResult {
+    hits: Vec<xerj_fts::ScoredHit>,
+    total: u64,
+    deadline_tripped: bool,
+}
+
+/// What [`Index::fts_segment_prepass`] needs from `search_inner`.
+struct FtsPrepassArgs<'a> {
+    segments_dir: &'a std::path::Path,
+    segments: &'a [&'a xerj_storage::segment::SegmentMeta],
+    open_fields: &'a [&'a str],
+    text_fields: &'a [String],
+    exact_fields: &'a std::collections::HashSet<String>,
+    kw_fields: &'a std::collections::HashSet<String>,
+    stats: Option<Arc<xerj_fts::CollectionStats>>,
+    deadline: std::time::Instant,
+    cap: usize,
+    count_limit: u64,
+}
+
+/// A hit score ordered by `f32::total_cmp` (the pre-pass's shared top-cap).
+#[derive(Clone, Copy, PartialEq)]
+struct PrepassScore(f32);
+
+impl Eq for PrepassScore {}
+
+impl PartialOrd for PrepassScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrepassScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// `XERJ_FTS_SEGMENT_THREADS`: how many segments' full-text walks one
+/// search runs at once before its segment loop
+/// (`Index::fts_segment_prepass`). Unset, `0` or `1` = off: the loop walks
+/// them one by one, as before. Read once (tests: `FTS_SEGMENT_THREADS_TEST`).
+fn fts_segment_threads() -> usize {
+    #[cfg(test)]
+    if let Some(n) = FTS_SEGMENT_THREADS_TEST.with(|c| c.get()) {
+        return n;
+    }
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("XERJ_FTS_SEGMENT_THREADS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64)
+    })
+}
+
+/// `XERJ_FTS_OPEN_THREADS`: how many cold FTS readers one search opens at
+/// once before its segment walk (`Index::open_fts_readers_parallel`). Unset,
+/// `0` or `1` = off: the walk opens them one by one, as before. Read once
+/// (tests: `FTS_OPEN_THREADS_TEST`).
+fn fts_open_threads() -> usize {
+    #[cfg(test)]
+    if let Some(n) = FTS_OPEN_THREADS_TEST.with(|c| c.get()) {
+        return n;
+    }
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("XERJ_FTS_OPEN_THREADS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64)
+    })
+}
+
+/// `XERJ_FTS_LIVE_FLOOR`: the segments' parallel walks
+/// (`XERJ_FTS_SEGMENT_THREADS` > 1) share one floor while they run
+/// (`xerj_fts::SharedFloor`), instead of taking the finished segments' floor
+/// only when they start. `1` / `true` / `on` / `yes`; off unless set. Read
+/// once (tests: `FTS_LIVE_FLOOR_TEST`).
+fn fts_live_floor() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FTS_LIVE_FLOOR_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XERJ_FTS_LIVE_FLOOR").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+    })
+}
+
+/// `XERJ_FTS_FACET_PAGE_CAP`: a page whose aggregations the full-text row
+/// sets answered (`try_aggs_fast_over_fts_match`) materialises `from + size`
+/// hits instead of the 256-hit slack the brute aggregation needs. `1` /
+/// `true` / `on` / `yes`; off unless set. Read once (tests:
+/// `FTS_FACET_PAGE_CAP_TEST`).
+fn fts_facet_page_cap() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FTS_FACET_PAGE_CAP_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XERJ_FTS_FACET_PAGE_CAP").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+    })
+}
+
+/// The key `fts_reader_cache` files a segment's reader under.
+///
+/// The field set is part of the identity: `FtsIndexReader::open` loads only
+/// the fields it is given, so a reader opened for a narrower set must never
+/// serve a query that needs a wider one. Sorted and de-duplicated, so
+/// permutations of the same set share one entry.
+fn fts_reader_cache_key(segment_id: &str, fields: &[&str]) -> String {
+    let mut sorted: Vec<&str> = fields.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    format!("{segment_id}\u{1}{}", sorted.join("\u{2}"))
+}
+
 fn brace_walk_offsets(bytes: &[u8]) -> Vec<(u32, u32)> {
     let n = bytes.len();
     let mut out: Vec<(u32, u32)> = Vec::new();
@@ -65795,8 +67618,677 @@ thread_local! {
     /// the same either way — so this is what a test can assert on.
     pub(crate) static SEG_FTS_HANDLED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Full-text row-set aggregations: requests they served, and a switch that
+    /// withholds them (the exact `_source` path) so a test can compare both.
+    pub(crate) static FTS_ROW_AGGS_SERVED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    pub(crate) static FTS_ROW_AGGS_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// fts-floor fail-before instruments: segment walks that received the
+    /// merged page's floor, the hits segments returned below the full page's
+    /// lowest kept score, and a switch that withholds the floor (the
+    /// behaviour before it existed) so a test can compare the two pages.
+    pub(crate) static SEG_FTS_FLOORS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    pub(crate) static SEG_FTS_HITS_BELOW_PAGE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    pub(crate) static FTS_FLOOR_DISABLED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// `fts_segment_prepass`: a thread count that overrides
+    /// `XERJ_FTS_SEGMENT_THREADS` for this test thread, and how many segments
+    /// the pre-pass walked for the loop.
+    pub(crate) static FTS_SEGMENT_THREADS_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static FTS_PREPASS_SEGMENTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// `open_fts_readers_parallel`: a thread count that overrides
+    /// `XERJ_FTS_OPEN_THREADS` for this test thread.
+    pub(crate) static FTS_OPEN_THREADS_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// `fts_segment_prepass`: overrides `XERJ_FTS_LIVE_FLOOR` for this test
+    /// thread.
+    pub(crate) static FTS_LIVE_FLOOR_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    /// The console-page speed-ups: an override of `XERJ_FTS_FACET_PAGE_CAP`,
+    /// requests whose facet match sets were computed in parallel, and pages
+    /// capped at `from + size` because the facets were answered.
+    pub(crate) static FTS_FACET_PAGE_CAP_TEST: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static FTS_FACET_PARALLEL: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    pub(crate) static FTS_FACET_PAGE_CAPPED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     pub(crate) static SEG_STORED_SCANS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// How many stats-only FTS readers the BM25 collection-statistics
+    /// pre-pass opened (`build_collection_stats`).
+    pub(crate) static STATS_ONLY_OPENS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// How many full FTS readers `fts_reader_for` opened (cache misses).
+    pub(crate) static FTS_READER_OPENS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// A hydration budget for the next `Index` this thread constructs, in
+    /// place of the process governor's (`index_segment_hydration_budget`).
+    pub(crate) static TEST_INDEX_HYDRATION_BUDGET:
+        std::cell::RefCell<Option<Arc<SegmentHydrationBudget>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod fts_reader_spill_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Three flushes of 2,000 passages `{id, text}`: several segments whose
+    /// `text` postings (long passages, few distinct words) are far bigger
+    /// than the rest of their readers (dictionary, term metadata, norms).
+    async fn passages(
+        engine: &crate::Engine,
+        name: &str,
+        budget: Arc<SegmentHydrationBudget>,
+    ) -> Arc<Index> {
+        TEST_INDEX_HYDRATION_BUDGET.with(|slot| *slot.borrow_mut() = Some(budget));
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("id", FieldType::Keyword))
+            .unwrap();
+        schema
+            .add_field(FieldConfig::new("text", FieldType::Text))
+            .unwrap();
+        engine.create_index(name, schema).unwrap();
+        TEST_INDEX_HYDRATION_BUDGET.with(|slot| slot.borrow_mut().take());
+        let idx = engine.get_index(name).unwrap();
+        let filler = "words that only make the passage long enough to matter ".repeat(64);
+        for round in 0..3 {
+            for i in 0..2000 {
+                let head = if i % 5 == 0 {
+                    "alpha beta"
+                } else {
+                    "gamma delta"
+                };
+                let id = format!("r{round}p{i}");
+                idx.index_document(
+                    Some(id.clone()),
+                    json!({"id": id, "text": format!("{head} passage {round} {i} {filler}")}),
+                )
+                .await
+                .unwrap();
+            }
+            idx.flush().await.unwrap();
+        }
+        idx
+    }
+
+    /// Large postings always move; small ones only when the whole reader
+    /// does not fit; nothing moves when even the rest would not fit.
+    #[test]
+    fn spill_policy() {
+        let big = FTS_POSTINGS_MAP_ABOVE_BYTES;
+        let roomy = SegmentHydrationBudget::new(u64::MAX);
+        assert!(spill_fts_postings(big + 10, big, &roomy));
+        assert!(!spill_fts_postings(1_000, 900, &roomy));
+        assert!(!spill_fts_postings(1_000, 0, &roomy));
+        let tight = SegmentHydrationBudget::new(500);
+        assert!(spill_fts_postings(1_000, 900, &tight));
+        assert!(
+            !spill_fts_postings(1_000, 400, &tight),
+            "the rest does not fit"
+        );
+        let off = SegmentHydrationBudget::new(0);
+        assert!(!spill_fts_postings(big + 10, big, &off), "nothing is kept");
+    }
+
+    /// An FTS reader the hydration budget cannot keep whole is kept with its
+    /// postings mapped from an unlinked file, so the next query reuses it
+    /// instead of decompressing the field's whole `.post` frame again.
+    ///
+    /// FAIL-BEFORE: such a reader went back uncached, and the second of two
+    /// identical queries opened one reader per segment again
+    /// (`FTS_READER_OPENS`). The page — ids and bit-identical scores — and the
+    /// total equal those of an index whose budget keeps every reader whole.
+    #[tokio::test]
+    async fn a_reader_too_big_for_the_budget_is_kept_with_mapped_postings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        // One memtable shard, so a flush is one segment whatever the core count:
+        // the default (half the cores) cut a 1,000-document flush into segments
+        // of < 128 documents on a 16-core host, which are written in the
+        // pre-columnar stored layout the fixture is not about.
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        // A word absent from the corpus changes no score but keeps a repeated
+        // question out of the result cache.
+        let request = |absent: &str| {
+            xerj_query::parse_request(&json!({
+                "size": 5,
+                "_source": ["id"],
+                "query": {"match": {"text": format!("alpha passage 1 {absent}")}}
+            }))
+            .unwrap()
+        };
+        let page = |r: &SearchResult| -> Vec<(String, u32)> {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), h.score.to_bits()))
+                .collect()
+        };
+
+        // The same documents in an index that keeps every reader whole give
+        // the reference page and the readers' sizes: whole, and without their
+        // postings.
+        let keeping = passages(&engine, "spill-kept", SegmentHydrationBudget::new(u64::MAX)).await;
+        let reference = keeping.search(&request("zqa")).await.unwrap();
+        let sizes: Vec<(u64, u64)> = keeping
+            .fts_reader_cache
+            .iter()
+            .map(|entry| {
+                let reader: &FtsIndexReader = entry.value();
+                let whole = reader.retained_bytes();
+                (whole, whole - reader.spillable_postings_bytes())
+            })
+            .collect();
+        let segments = keeping.store.snapshot().segments.len();
+        assert!(segments >= 3, "fixture: several segments");
+        assert_eq!(sizes.len(), segments, "one reader per segment");
+        let smallest_whole = sizes.iter().map(|(whole, _)| *whole).min().unwrap();
+        let all_without_postings: u64 = sizes.iter().map(|(_, rest)| *rest).sum();
+        assert!(
+            2 * all_without_postings < smallest_whole,
+            "fixture: readers without postings ({all_without_postings} bytes for all of them) \
+             must be far smaller than one whole reader ({smallest_whole} bytes)"
+        );
+
+        // A budget below the smallest whole reader: none fits as it is.
+        let tight = passages(
+            &engine,
+            "spill-tight",
+            SegmentHydrationBudget::new(smallest_whole - 1),
+        )
+        .await;
+        let first = tight.search(&request("zqa")).await.unwrap();
+        FTS_READER_OPENS.with(|c| c.set(0));
+        let second = tight.search(&request("zqb")).await.unwrap();
+        assert_eq!(
+            FTS_READER_OPENS.with(|c| c.get()),
+            0,
+            "the second query must reuse the readers, not decompress their postings again"
+        );
+        assert_eq!(
+            tight.fts_reader_cache.len(),
+            tight.store.snapshot().segments.len(),
+            "every reader is kept"
+        );
+
+        for result in [&first, &second] {
+            assert_eq!(page(result), page(&reference));
+            assert_eq!(result.total.value, reference.total.value);
+        }
+    }
+
+    /// Cold readers opened in parallel before the walk
+    /// (`open_fts_readers_parallel`, `XERJ_FTS_OPEN_THREADS` > 1) are the
+    /// walk's own readers: afterwards every segment's reader is resident, the
+    /// query opens none itself, and its page (ids and bit-identical scores)
+    /// and total equal those of the sequential walk. Without the pre-open the
+    /// first query opens one reader per segment in the walk.
+    #[tokio::test]
+    async fn readers_opened_in_parallel_are_the_walks_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        let request = |absent: &str| {
+            xerj_query::parse_request(&json!({
+                "size": 5,
+                "_source": ["id"],
+                "query": {"match": {"text": format!("alpha passage 1 {absent}")}}
+            }))
+            .unwrap()
+        };
+        let page = |r: &SearchResult| -> Vec<(String, u32)> {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), h.score.to_bits()))
+                .collect()
+        };
+
+        // Both arms run with the opt-in switches off, whatever the environment
+        // says: `XERJ_FTS_OPEN_THREADS` / `XERJ_FTS_SEGMENT_THREADS` open the
+        // readers on worker threads, where this thread's `FTS_READER_OPENS`
+        // does not see them, so the sequential reference would count none.
+        FTS_OPEN_THREADS_TEST.with(|c| c.set(Some(1)));
+        FTS_SEGMENT_THREADS_TEST.with(|c| c.set(Some(1)));
+        let sequential = passages(&engine, "open-seq", SegmentHydrationBudget::new(u64::MAX)).await;
+        let segments = sequential.store.snapshot().segments.len();
+        assert!(segments >= 3, "fixture: several segments");
+        FTS_READER_OPENS.with(|c| c.set(0));
+        let reference = sequential.search(&request("zqa")).await.unwrap();
+        assert_eq!(
+            FTS_READER_OPENS.with(|c| c.get()),
+            segments,
+            "the sequential walk opens one reader per segment"
+        );
+
+        let parallel = passages(&engine, "open-par", SegmentHydrationBudget::new(u64::MAX)).await;
+        let segments_dir = parallel.data_dir.join("segments");
+        let snap = parallel.store.snapshot();
+        let metas: Vec<&xerj_storage::segment::SegmentMeta> = snap.segments.iter().collect();
+        assert_eq!(metas.len(), segments);
+        assert_eq!(
+            parallel.open_fts_readers_parallel(&segments_dir, &metas, &["text"], 4),
+            segments
+        );
+        assert_eq!(parallel.fts_reader_cache.len(), segments);
+        assert_eq!(
+            parallel.open_fts_readers_parallel(&segments_dir, &metas, &["text"], 4),
+            0,
+            "resident readers are not opened again"
+        );
+        FTS_READER_OPENS.with(|c| c.set(0));
+        let result = parallel.search(&request("zqa")).await.unwrap();
+        assert_eq!(
+            FTS_READER_OPENS.with(|c| c.get()),
+            0,
+            "the walk finds every reader resident"
+        );
+        assert_eq!(page(&result), page(&reference));
+        assert_eq!(result.total.value, reference.total.value);
+        FTS_OPEN_THREADS_TEST.with(|c| c.set(None));
+        FTS_SEGMENT_THREADS_TEST.with(|c| c.set(None));
+    }
+
+    /// The memory breaker's drain (`Engine::release_rebuildable_memory`)
+    /// keeps the FTS readers whose postings are mapped files. Dropping them
+    /// freed almost no anonymous memory, and the next query decompressed and
+    /// mapped every reader's postings again: 47-55 s of every query after a
+    /// drain on the 10 GB index (177 segments). Every other cache is released,
+    /// and the page and total stay those of the reference index.
+    ///
+    /// FAIL-BEFORE: the drain cleared every reader, and the query after it
+    /// opened one reader per segment again (`FTS_READER_OPENS`).
+    #[tokio::test]
+    async fn a_breaker_drain_keeps_readers_with_mapped_postings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        let request = |absent: &str| {
+            xerj_query::parse_request(&json!({
+                "size": 5,
+                "_source": ["id"],
+                "query": {"match": {"text": format!("alpha passage 1 {absent}")}}
+            }))
+            .unwrap()
+        };
+        let page = |r: &SearchResult| -> Vec<(String, u32)> {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), h.score.to_bits()))
+                .collect()
+        };
+        let keeping = passages(&engine, "drain-kept", SegmentHydrationBudget::new(u64::MAX)).await;
+        let reference = keeping.search(&request("zqa")).await.unwrap();
+        let smallest_whole = keeping
+            .fts_reader_cache
+            .iter()
+            .map(|entry| entry.value().retained_bytes())
+            .min()
+            .unwrap();
+        // Below the smallest whole reader: every reader is kept with its
+        // postings mapped (the case of a large index).
+        let tight = passages(
+            &engine,
+            "drain-tight",
+            SegmentHydrationBudget::new(smallest_whole - 1),
+        )
+        .await;
+        tight.search(&request("zqa")).await.unwrap();
+        let segments = tight.store.snapshot().segments.len();
+        assert_eq!(
+            tight.fts_reader_cache.len(),
+            segments,
+            "precondition: readers kept"
+        );
+        assert!(
+            tight
+                .fts_reader_cache
+                .iter()
+                .all(|entry| entry.value().postings_mapped()),
+            "precondition: their postings are mapped"
+        );
+
+        engine
+            .release_rebuildable_memory(&[Arc::clone(&tight)])
+            .await;
+        assert_eq!(
+            tight.fts_reader_cache.len(),
+            segments,
+            "the drain must keep readers whose postings are mapped"
+        );
+        assert_eq!(
+            tight.total_cache_entries(),
+            tight.fts_reader_cache.len(),
+            "every other cache is released"
+        );
+        FTS_READER_OPENS.with(|c| c.set(0));
+        let after = tight.search(&request("zqb")).await.unwrap();
+        assert_eq!(
+            FTS_READER_OPENS.with(|c| c.get()),
+            0,
+            "the query after a drain reuses the readers"
+        );
+        assert_eq!(page(&after), page(&reference));
+        assert_eq!(after.total.value, reference.total.value);
+    }
+}
+
+#[cfg(test)]
+mod stored_warm_refusal_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One one-shard flush of 3,000 passages `{id, title, text}` into an index
+    /// whose hydration budget is `budget`.
+    async fn passages(
+        engine: &crate::Engine,
+        name: &str,
+        budget: Arc<SegmentHydrationBudget>,
+    ) -> Arc<Index> {
+        TEST_INDEX_HYDRATION_BUDGET.with(|slot| *slot.borrow_mut() = Some(budget));
+        let mut schema = Schema::empty();
+        for (field, kind) in [
+            ("id", FieldType::Keyword),
+            ("title", FieldType::Keyword),
+            ("text", FieldType::Text),
+        ] {
+            schema.add_field(FieldConfig::new(field, kind)).unwrap();
+        }
+        engine.create_index(name, schema).unwrap();
+        TEST_INDEX_HYDRATION_BUDGET.with(|slot| slot.borrow_mut().take());
+        let idx = engine.get_index(name).unwrap();
+        let filler = "words that only make the passage long enough to matter ".repeat(6);
+        for i in 0..3000 {
+            let id = format!("p{i}");
+            idx.index_document(
+                Some(id.clone()),
+                json!({"id": id, "title": format!("title {}", i % 7),
+                       "text": format!("alpha passage {i} {filler}")}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush().await.unwrap();
+        idx
+    }
+
+    /// A stored section the hydration budget refused is not decoded again by a
+    /// background warm. Every cold page queued one per segment it read, and on
+    /// an index far larger than the budget each was decoded and dropped; on
+    /// the 10 GB index (177 segments) those decodes pushed RSS over the breaker
+    /// watermark, and each drain cleared the FTS readers.
+    ///
+    /// FAIL-BEFORE: the second warm decoded the refused section again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refused_stored_slices_are_not_warmed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        // The decoded size of the segment's stored section, from an index with
+        // room for everything.
+        let probe = passages(
+            &engine,
+            "refusal-probe",
+            SegmentHydrationBudget::new(u64::MAX),
+        )
+        .await;
+        let probe_meta = probe.store.snapshot().segments[0].clone();
+        let decoded = {
+            let reader = probe.store.open_segment_arc(&probe_meta.id).unwrap();
+            let raw = reader.section(SectionType::Stored).unwrap().unwrap();
+            xerj_storage::stored_codec::decode_stored(raw)
+                .unwrap()
+                .len() as u64
+        };
+        assert!(
+            decoded > 2 * probe_meta.size_bytes,
+            "fixture: stored JSON compresses ({decoded} decoded, {} on disk)",
+            probe_meta.size_bytes
+        );
+        // Room for the same segment's file, not for its decoded section.
+        let limit = (probe_meta.size_bytes + decoded) / 2;
+        let idx = passages(&engine, "refusal", SegmentHydrationBudget::new(limit)).await;
+        idx.release_memory();
+        idx.stored_slices_refused.clear();
+        let meta = idx.store.snapshot().segments[0].clone();
+        assert!(
+            !idx.stored_slices_cannot_be_kept(&meta.id, meta.size_bytes),
+            "precondition: the segment file fits the budget ({limit} B)"
+        );
+        let decodes = || idx.whole_stored_decodes.load(Ordering::Relaxed);
+        let settle = || async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !idx.cold_stored_warms.is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "background warm never finished"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        let before = decodes();
+        idx.schedule_cold_stored_warm(&meta.id, meta.doc_count, meta.size_bytes);
+        settle().await;
+        assert_eq!(decodes(), before + 1, "the first warm decodes the section");
+        assert!(
+            !idx.stored_slices_cache.contains_key(meta.id.as_str()),
+            "and the budget refuses it"
+        );
+        idx.schedule_cold_stored_warm(&meta.id, meta.doc_count, meta.size_bytes);
+        settle().await;
+        assert_eq!(
+            decodes(),
+            before + 1,
+            "a refused section must not be warmed again"
+        );
+        assert!(idx.stored_slices_cannot_be_kept(&meta.id, meta.size_bytes));
+    }
+
+    /// One background warm runs per index at a time: while a warm holds the
+    /// slot, a cold page's warm for another segment is skipped, not started
+    /// beside it and not queued. Unbounded, one cold query on the 10 GB
+    /// autoindex index started 23 whole-section decodes, up to 8 at once, and
+    /// their memory engaged the breaker seven times.
+    ///
+    /// FAIL-BEFORE: every scheduled warm started while another held the slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_background_stored_warm_runs_per_index_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        for (field, kind) in [("id", FieldType::Keyword), ("text", FieldType::Text)] {
+            schema.add_field(FieldConfig::new(field, kind)).unwrap();
+        }
+        // A budget of its own with room for everything, so the slot alone
+        // decides.
+        TEST_INDEX_HYDRATION_BUDGET
+            .with(|slot| *slot.borrow_mut() = Some(SegmentHydrationBudget::new(u64::MAX)));
+        engine.create_index("warm-slot", schema).unwrap();
+        TEST_INDEX_HYDRATION_BUDGET.with(|slot| slot.borrow_mut().take());
+        let idx = engine.get_index("warm-slot").unwrap();
+        // No background merge may retire the segments under the test.
+        idx.abort_background_tasks();
+        for batch in 0..3 {
+            for i in 0..50 {
+                let id = format!("b{batch}-{i}");
+                idx.index_document(
+                    Some(id.clone()),
+                    json!({"id": id, "text": format!("alpha passage {i} of batch {batch}")}),
+                )
+                .await
+                .unwrap();
+            }
+            idx.flush().await.unwrap();
+        }
+        let segments = idx.store.snapshot().segments.clone();
+        assert!(
+            segments.len() >= 2,
+            "fixture: several segments ({})",
+            segments.len()
+        );
+        idx.release_memory();
+        let decodes = || idx.whole_stored_decodes.load(Ordering::Relaxed);
+        let settle = || async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !idx.cold_stored_warms.is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "background warm never finished"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        let before = decodes();
+        // A warm in progress holds the running flag.
+        idx.cold_stored_warm_running.store(true, Ordering::Release);
+        for meta in &segments {
+            idx.schedule_cold_stored_warm(&meta.id, meta.doc_count, meta.size_bytes);
+        }
+        // A skipped warm leaves nothing queued: `settle` would time out.
+        settle().await;
+        assert_eq!(decodes(), before, "no second warm may start while one runs");
+        idx.cold_stored_warm_running.store(false, Ordering::Release);
+        // Free again: the next cold page's warm runs and clears the flag.
+        let meta = &segments[0];
+        idx.schedule_cold_stored_warm(&meta.id, meta.doc_count, meta.size_bytes);
+        settle().await;
+        assert_eq!(decodes(), before + 1);
+        assert!(idx.stored_slices_cache.contains_key(meta.id.as_str()));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while idx.cold_stored_warm_running.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "warm flag stuck");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod collection_stats_reader_reuse_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The index-wide BM25 statistics pre-pass (#188) must not re-open and
+    /// re-decode the `.meta` of a segment whose full reader the segment loop
+    /// already keeps in `fts_reader_cache`: that reader holds the same FST and
+    /// `.meta`, and so the same `field_stats` / `term_doc_freq`.
+    ///
+    /// FAIL-BEFORE: every scored query opened one stats-only reader per
+    /// segment, warm cache or not — O(field vocabulary) per segment per query,
+    /// a third of a warm `match` over 1 M Wikipedia passages (perf).
+    /// The scores must be bit-identical to the stats-only route's.
+    #[tokio::test]
+    async fn collection_stats_reuse_the_cached_segment_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        // One memtable shard, so a flush is one segment whatever the core count:
+        // the default (half the cores) cut a 1,000-document flush into segments
+        // of < 128 documents on a 16-core host, which are written in the
+        // pre-columnar stored layout the fixture is not about.
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        // The first three arms are the sequential walk's routes, whatever the
+        // environment's opt-in switches say: `XERJ_FTS_OPEN_THREADS` opens a
+        // cold query's full readers before the statistics pre-pass (the last
+        // arm), and `XERJ_FTS_SEGMENT_THREADS` walks the segments on worker
+        // threads.
+        FTS_OPEN_THREADS_TEST.with(|c| c.set(Some(1)));
+        FTS_SEGMENT_THREADS_TEST.with(|c| c.set(Some(1)));
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        engine.create_index("stats-reuse", schema).unwrap();
+        let idx = engine.get_index("stats-reuse").unwrap();
+        // Three flushes, so several segments and the statistics pre-pass runs
+        // (it is skipped when a single arm answers the query).
+        for round in 0..3 {
+            for i in 0..40 {
+                let body = if i % 4 == 0 {
+                    format!("alpha beta round{round} w{i}")
+                } else {
+                    format!("beta gamma round{round} w{i}")
+                };
+                idx.index_document(Some(format!("r{round}d{i}")), json!({ "body": body }))
+                    .await
+                    .unwrap();
+            }
+            idx.flush().await.unwrap();
+        }
+        let segments = idx.store.snapshot().segments.len();
+        assert!(segments >= 2, "the fixture must span segments: {segments}");
+        let search = |q: &str| {
+            xerj_query::parse_request(&json!({"size": 5, "query": {"match": {"body": q}}})).unwrap()
+        };
+        let page = |r: &SearchResult| -> Vec<(String, u32)> {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), h.score.to_bits()))
+                .collect()
+        };
+
+        // The first query opens every segment's full reader and caches it.
+        let warm = idx.search(&search("alpha beta")).await.unwrap();
+        assert!(!warm.hits.is_empty());
+
+        // A different query (no result-cache answer) over the same field.
+        STATS_ONLY_OPENS.with(|c| c.set(0));
+        let reused = idx.search(&search("alpha gamma")).await.unwrap();
+        assert!(!reused.hits.is_empty());
+        assert_eq!(
+            STATS_ONLY_OPENS.with(|c| c.get()),
+            0,
+            "with every segment's reader cached, the statistics pre-pass must \
+             not open a stats-only reader ({segments} segments)"
+        );
+
+        // Same query with every cache dropped: the pre-pass takes the
+        // stats-only route, and the page must not move by a single bit.
+        idx.release_memory();
+        STATS_ONLY_OPENS.with(|c| c.set(0));
+        let reopened = idx.search(&search("alpha gamma")).await.unwrap();
+        assert!(
+            STATS_ONLY_OPENS.with(|c| c.get()) > 0,
+            "precondition: a cold cache takes the stats-only route"
+        );
+        assert_eq!(page(&reused), page(&reopened));
+        assert_eq!(reused.total.value, reopened.total.value);
+
+        // `XERJ_FTS_OPEN_THREADS` > 1: a cold query opens its full readers in
+        // parallel before the pre-pass, which then reads them instead of
+        // opening stats-only readers; the page must not move by a single bit.
+        idx.release_memory();
+        assert_eq!(idx.fts_reader_cache.len(), 0, "precondition: a cold cache");
+        FTS_OPEN_THREADS_TEST.with(|c| c.set(Some(4)));
+        STATS_ONLY_OPENS.with(|c| c.set(0));
+        let preopened = idx.search(&search("alpha gamma")).await.unwrap();
+        assert_eq!(
+            STATS_ONLY_OPENS.with(|c| c.get()),
+            0,
+            "after the parallel open the statistics pre-pass finds every reader"
+        );
+        assert_eq!(page(&reused), page(&preopened));
+        assert_eq!(reused.total.value, preopened.total.value);
+        FTS_OPEN_THREADS_TEST.with(|c| c.set(None));
+        FTS_SEGMENT_THREADS_TEST.with(|c| c.set(None));
+    }
 }
 
 #[cfg(test)]
@@ -65863,6 +68355,331 @@ mod residual_gate_trim_577_tests {
 }
 
 #[cfg(test)]
+mod fts_row_aggs_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 12,000 documents (the columnar aggregations' minimum is 10,000) over
+    /// three flushed segments: two text fields, two keyword facets, a date.
+    async fn discover_index(engine: &crate::Engine, name: &str) -> Arc<Index> {
+        let mut schema = Schema::empty();
+        for (f, t) in [
+            ("title", FieldType::Text),
+            ("body", FieldType::Text),
+            ("cat", FieldType::Keyword),
+            ("tag", FieldType::Keyword),
+            ("ts", FieldType::Date),
+        ] {
+            schema.add_field(FieldConfig::new(f, t)).unwrap();
+        }
+        engine.create_index(name, schema).unwrap();
+        let idx = engine.get_index(name).unwrap();
+        let words = ["alpha", "beta", "gamma", "delta", "omega", "sigma", "kappa"];
+        for batch in 0..3u32 {
+            for i in 0..4_000u32 {
+                let g = batch * 4_000 + i;
+                let w = |k: u32| words[((g / k) % words.len() as u32) as usize];
+                let body = format!("{} {} filler {}", w(1), w(3), w(7));
+                let title = if g % 5 == 0 {
+                    format!("{} title", w(11))
+                } else {
+                    "plain title".to_owned()
+                };
+                let day = 1 + (g * 7) % 28;
+                let hour = (g * 13) % 24;
+                idx.index_document(
+                    Some(format!("d{g}")),
+                    json!({
+                        "title": title,
+                        "body": body,
+                        "cat": format!("c{}", g % 9),
+                        "tag": format!("t{}", (g / 3) % 4),
+                        "ts": format!("2026-09-{day:02}T{hour:02}:00:00.000Z"),
+                    }),
+                )
+                .await
+                .unwrap();
+            }
+            idx.flush().await.unwrap();
+        }
+        idx
+    }
+
+    fn discover_aggs() -> serde_json::Value {
+        json!({
+            "by__index": {"terms": {"field": "_index", "size": 8}},
+            "by_cat": {"terms": {"field": "cat", "size": 8}},
+            "by_tag": {"terms": {"field": "tag", "size": 8}},
+            "by_date": {"date_histogram": {"field": "ts", "calendar_interval": "day"}}
+        })
+    }
+
+    /// `terms` on `_index` over flushed segments, through the columnar path
+    /// (`size: 0` with no query, and with a columnar `term` filter): one
+    /// bucket, the index name with every aggregated document. The meta field
+    /// has no doc-values column, and the columnar path used to take it for a
+    /// field no document holds and answer no bucket.
+    #[tokio::test]
+    async fn terms_on_index_name_over_flushed_segments_counts_every_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let idx = discover_index(&engine, "discover2").await;
+        let agg = json!({"by__index": {"terms": {"field": "_index", "size": 8}}});
+        for (query, expected) in [
+            (json!({"match_all": {}}), 12_000u64),
+            (
+                json!({"term": {"cat": "c3"}}),
+                (0..12_000u64).filter(|g| g % 9 == 3).count() as u64,
+            ),
+        ] {
+            let req = xerj_query::parse_request(&json!({"size": 0, "query": query, "aggs": agg}))
+                .unwrap();
+            idx.query_cache.clear();
+            let r = idx.search(&req).await.unwrap();
+            let buckets = r.aggs.as_ref().unwrap()["by__index"]["buckets"].clone();
+            assert_eq!(
+                buckets,
+                json!([{"key": "discover2", "doc_count": expected}]),
+                "{query}"
+            );
+        }
+    }
+
+    /// A daily `date_histogram` under a columnar `term` filter now takes the
+    /// filtered columnar executors: its buckets are the filtered documents'
+    /// days and counts, computed here from the fixture itself.
+    #[tokio::test]
+    async fn date_histogram_under_a_columnar_filter_buckets_only_matching_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let idx = discover_index(&engine, "discover3").await;
+        let mut per_day: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+        for g in 0..12_000u32 {
+            if g % 9 == 3 {
+                *per_day.entry(1 + (g * 7) % 28).or_default() += 1;
+            }
+        }
+        let req = xerj_query::parse_request(&json!({
+            "size": 0,
+            "query": {"term": {"cat": "c3"}},
+            "aggs": {"by_date": {"date_histogram": {"field": "ts", "calendar_interval": "day"}}}
+        }))
+        .unwrap();
+        idx.query_cache.clear();
+        let r = idx.search(&req).await.unwrap();
+        let buckets = r.aggs.as_ref().unwrap()["by_date"]["buckets"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let (first, last) = (
+            *per_day.keys().next().unwrap(),
+            *per_day.keys().last().unwrap(),
+        );
+        assert_eq!(buckets.len() as u32, last - first + 1, "{buckets:?}");
+        for b in &buckets {
+            let key = b["key_as_string"].as_str().unwrap();
+            let day: u32 = key[8..10].parse().unwrap();
+            assert_eq!(
+                b["doc_count"].as_u64().unwrap(),
+                per_day.get(&day).copied().unwrap_or(0),
+                "{key}"
+            );
+        }
+    }
+
+    /// Discover's request — a `match` over the text fields (the console's
+    /// `bool.should` of per-field `match`), 25 hits, exact `track_total_hits`,
+    /// `terms` facets and a daily `date_histogram` — answers the same
+    /// aggregations, hits and total through the full-text row sets as through
+    /// the exact `_source` path, with and without a keyword filter, and the
+    /// row-set path is the one that served it.
+    #[tokio::test]
+    async fn discover_aggs_over_a_full_text_match_equal_the_exact_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let idx = discover_index(&engine, "discover1").await;
+        let text = |q: &str| {
+            json!({"bool": {"should": [
+                {"match": {"title": q}},
+                {"match": {"body": q}}
+            ]}})
+        };
+        let bodies = vec![
+            json!({"query": text("alpha"), "size": 25, "track_total_hits": true, "aggs": discover_aggs()}),
+            json!({"query": text("gamma kappa"), "size": 25, "track_total_hits": true, "aggs": discover_aggs()}),
+            json!({"query": {"bool": {"must": text("beta"), "filter": [{"term": {"cat": "c3"}}]}},
+                   "size": 25, "track_total_hits": true, "aggs": discover_aggs()}),
+            json!({"query": {"match": {"body": "omega"}}, "size": 0, "aggs": discover_aggs()}),
+        ];
+        for body in &bodies {
+            let req = xerj_query::parse_request(body).unwrap();
+            FTS_ROW_AGGS_DISABLED.with(|c| c.set(true));
+            idx.query_cache.clear();
+            let exact = idx.search(&req).await.unwrap();
+            FTS_ROW_AGGS_DISABLED.with(|c| c.set(false));
+            FTS_ROW_AGGS_SERVED.with(|c| c.set(0));
+            idx.query_cache.clear();
+            let rows = idx.search(&req).await.unwrap();
+            assert_eq!(
+                FTS_ROW_AGGS_SERVED.with(|c| c.get()),
+                1,
+                "the row-set path served {body}"
+            );
+            assert_eq!(rows.aggs, exact.aggs, "aggregations of {body}");
+            assert_eq!(rows.total.value, exact.total.value, "total of {body}");
+            let page = |r: &SearchResult| -> Vec<(String, u32)> {
+                r.hits
+                    .iter()
+                    .map(|h| (h.id.clone(), h.score.to_bits()))
+                    .collect()
+            };
+            assert_eq!(page(&rows), page(&exact), "hits of {body}");
+            let buckets = rows.aggs.as_ref().unwrap()["by_date"]["buckets"]
+                .as_array()
+                .unwrap();
+            assert!(!buckets.is_empty(), "the histogram has buckets for {body}");
+        }
+    }
+
+    /// The console page's opt-in speed-ups over a full-text facet request,
+    /// each exact: with `XERJ_FTS_SEGMENT_THREADS` > 1 the segments' match
+    /// sets are computed in parallel (`fts_match_sets_parallel`), and with
+    /// `XERJ_FTS_FACET_PAGE_CAP` a page whose facets the row sets answered is
+    /// capped at `from + size`. Aggregations, hits (ids and score bits) and
+    /// totals equal the sequential, uncapped run, for the `_index` facet alone
+    /// and for Discover's facets, with and without `from` and a keyword
+    /// filter. FAIL-BEFORE: without the two paths the counters stay 0.
+    #[tokio::test]
+    async fn console_page_speedups_keep_the_facets_hits_and_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let idx = discover_index(&engine, "discover9").await;
+        let text = |q: &str| {
+            json!({"bool": {"should": [
+                {"match": {"title": q}},
+                {"match": {"body": q}}
+            ], "minimum_should_match": 1}})
+        };
+        let index_only = json!({"_index": {"terms": {"field": "_index", "size": 10}}});
+        let bodies = vec![
+            json!({"query": text("alpha"), "size": 25, "track_total_hits": true, "aggs": index_only}),
+            json!({"query": text("gamma kappa"), "size": 25, "track_total_hits": true,
+                   "aggs": discover_aggs()}),
+            json!({"query": text("beta omega"), "from": 10, "size": 15, "aggs": index_only}),
+            json!({"query": {"bool": {"must": text("beta"), "filter": [{"term": {"cat": "c3"}}]}},
+                   "size": 25, "track_total_hits": true, "aggs": discover_aggs()}),
+        ];
+        let page = |r: &SearchResult| -> Vec<(String, u32)> {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), h.score.to_bits()))
+                .collect()
+        };
+        let (mut parallel, mut capped) = (0usize, 0usize);
+        for body in &bodies {
+            let req = xerj_query::parse_request(body).unwrap();
+            FTS_SEGMENT_THREADS_TEST.with(|c| c.set(Some(1)));
+            FTS_FACET_PAGE_CAP_TEST.with(|c| c.set(Some(false)));
+            idx.query_cache.clear();
+            let reference = idx.search(&req).await.unwrap();
+            FTS_SEGMENT_THREADS_TEST.with(|c| c.set(Some(4)));
+            FTS_FACET_PAGE_CAP_TEST.with(|c| c.set(Some(true)));
+            FTS_FACET_PARALLEL.with(|c| c.set(0));
+            FTS_FACET_PAGE_CAPPED.with(|c| c.set(0));
+            idx.query_cache.clear();
+            let fast = idx.search(&req).await.unwrap();
+            parallel += FTS_FACET_PARALLEL.with(|c| c.get());
+            capped += FTS_FACET_PAGE_CAPPED.with(|c| c.get());
+            FTS_SEGMENT_THREADS_TEST.with(|c| c.set(None));
+            FTS_FACET_PAGE_CAP_TEST.with(|c| c.set(None));
+            assert!(!reference.hits.is_empty(), "fixture: {body} matches");
+            assert!(reference.aggs.is_some(), "fixture: {body} aggregates");
+            assert_eq!(fast.aggs, reference.aggs, "aggregations of {body}");
+            assert_eq!(page(&fast), page(&reference), "hits of {body}");
+            assert_eq!(fast.total.value, reference.total.value, "total of {body}");
+            assert_eq!(
+                fast.total.relation, reference.total.relation,
+                "total relation of {body}"
+            );
+        }
+        assert_eq!(parallel, bodies.len(), "match sets computed in parallel");
+        assert_eq!(capped, bodies.len(), "pages capped at from + size");
+    }
+
+    /// The row-set aggregations read only the `.dv` columns the request can
+    /// name. Each segment's sidecar also holds a keyword column per text
+    /// field — on a passage corpus nearly all of its bytes — and Discover's
+    /// facets must neither decode those nor leave the whole sidecar resident
+    /// in the hydration cache the page shares.
+    #[tokio::test]
+    async fn discover_aggs_over_a_full_text_match_leave_the_text_columns_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let idx = discover_index(&engine, "discover4").await;
+        let segments_dir = idx.data_dir.join("segments");
+        let snap = idx.store.snapshot();
+        let whole = read_doc_values_sidecar(&segments_dir, &snap.segments[0].id);
+        assert!(
+            whole.contains_key("body") && whole.contains_key("title"),
+            "the fixture's sidecar carries the text fields' columns: {:?}",
+            whole.keys().collect::<Vec<_>>()
+        );
+
+        let req = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "gamma"}}, "size": 25, "track_total_hits": true,
+            "aggs": discover_aggs()
+        }))
+        .unwrap();
+        idx.query_cache.clear();
+        idx.dv_cache.clear();
+        FTS_ROW_AGGS_SERVED.with(|c| c.set(0));
+        let r = idx.search(&req).await.unwrap();
+        assert_eq!(
+            FTS_ROW_AGGS_SERVED.with(|c| c.get()),
+            1,
+            "the row-set path served it"
+        );
+        assert!(r.aggs.as_ref().unwrap()["by_cat"]["buckets"]
+            .as_array()
+            .is_some_and(|b| !b.is_empty()));
+        assert!(
+            idx.dv_cache.is_empty(),
+            "no whole sidecar was decoded into the shared cache: {:?}",
+            idx.dv_cache
+                .iter()
+                .map(|e| e.key().clone())
+                .collect::<Vec<_>>()
+        );
+
+        // What the executors read instead: the named columns, nothing else.
+        let wanted = {
+            let mut names = std::collections::BTreeSet::new();
+            fast_aggs::agg_tree_strings(&discover_aggs(), &mut names);
+            names
+        };
+        let read = idx
+            .dv_columns_selected(&segments_dir, &snap.segments[0].id, &|c: &str| {
+                fast_aggs::agg_tree_may_read(&wanted, c)
+            })
+            .unwrap();
+        assert_eq!(
+            read.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["cat", "tag", "ts"]
+        );
+    }
+}
+
+#[cfg(test)]
 mod pinned_knn_fts_892_tests {
     use super::*;
     use serde_json::json;
@@ -65890,6 +68707,229 @@ mod pinned_knn_fts_892_tests {
     /// `search_inner` — the pre-#892 behaviour — the page is 10 lexical-only
     /// documents and the assertion below reports the both-halves documents
     /// missing. `hits.total` is 407 either way.
+    /// fts-floor: once the merged page is full, each later segment's match
+    /// walk gets the page's lowest kept score as its floor
+    /// (`search_bounded_counting_floor`). The page must be exactly the one the
+    /// walk produces without it (ids, scores, order, total), and no segment may
+    /// still return hits below the full page's lowest score.
+    ///
+    /// Shape (three flushes, each split over the index's ingest shards):
+    /// batch 0 fills the 300-hit collector (600 moderate matches); batch 1 is
+    /// weak except for twelve strong documents that must reach the top of the
+    /// page; batch 2 is weak except for documents whose text repeats batch 0's,
+    /// so they TIE the page's lowest score (the walk must return ties; the
+    /// admission walk then ranks them by `seq_no`).
+    ///
+    /// FAIL-BEFORE (watched): with the floor withheld (`FTS_FLOOR_DISABLED`,
+    /// i.e. `search_bounded_counting` as before) the later segments return
+    /// their whole 300-hit top, almost all of it below the page, and the
+    /// `below_with == 0` assertion fails.
+    /// `fts_segment_prepass` (`XERJ_FTS_SEGMENT_THREADS` > 1): the segments'
+    /// full-text walks run in parallel before the segment loop, sharing one
+    /// floor. The page (ids, bit-identical scores, order) and `hits.total`
+    /// must be those of the sequential loop, for a flat `match`, a two-field
+    /// `multi_match` and a bool of per-field matches, at page sizes below and
+    /// above one segment's matches, with the default and the exact total.
+    ///
+    /// FAIL-BEFORE: without the pre-pass (thread override 1) no segment is
+    /// served by it and the `FTS_PREPASS_SEGMENTS` assertion fails.
+    #[tokio::test]
+    async fn segment_prepass_keeps_the_sequential_page_and_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        for f in ["title", "body"] {
+            schema
+                .add_field(FieldConfig::new(f, FieldType::Text))
+                .unwrap();
+        }
+        engine.create_index("prepass1", schema).unwrap();
+        let idx = engine.get_index("prepass1").unwrap();
+        let words = ["alpha", "beta", "gamma", "delta", "eps", "zeta", "eta"];
+        for seg in 0..5u32 {
+            for i in 0..400u32 {
+                let g = seg * 400 + i;
+                let mut body = String::new();
+                for k in 0..(3 + g % 11) {
+                    body.push_str(words[((g * 7 + k * 3) % 7) as usize]);
+                    body.push(' ');
+                }
+                let title = words[((g / 3) % 7) as usize];
+                idx.index_document(
+                    Some(format!("d{g}")),
+                    json!({ "title": title, "body": body }),
+                )
+                .await
+                .unwrap();
+            }
+            idx.flush().await.unwrap();
+        }
+        assert!(
+            idx.store.snapshot().segments.len() >= 3,
+            "fixture: several segments"
+        );
+        let page = |r: &SearchResult| -> Vec<(String, u32)> {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), h.score.to_bits()))
+                .collect()
+        };
+        let bodies = [
+            json!({"size": 10, "query": {"match": {"body": "alpha zeta eta"}}}),
+            json!({"size": 300, "query": {"match": {"body": "alpha zeta eta"}}}),
+            json!({"size": 10, "query": {"multi_match": {"query": "beta gamma",
+                "fields": ["title", "body"], "type": "most_fields"}}}),
+            json!({"size": 25, "track_total_hits": true, "query": {"bool": {"should": [
+                {"match": {"title": "delta eps"}}, {"match": {"body": "delta eps"}}],
+                "minimum_should_match": 1}}}),
+        ];
+        let mut served = 0usize;
+        let mut served_live = 0usize;
+        for body in &bodies {
+            let req = xerj_query::parse_request(body).unwrap();
+            FTS_SEGMENT_THREADS_TEST.with(|c| c.set(Some(1)));
+            idx.query_cache.clear();
+            let sequential = idx.search(&req).await.unwrap();
+            FTS_SEGMENT_THREADS_TEST.with(|c| c.set(Some(4)));
+            FTS_LIVE_FLOOR_TEST.with(|c| c.set(Some(false)));
+            FTS_PREPASS_SEGMENTS.with(|c| c.set(0));
+            idx.query_cache.clear();
+            let parallel = idx.search(&req).await.unwrap();
+            served += FTS_PREPASS_SEGMENTS.with(|c| c.get());
+            // the same walks sharing one live floor (`XERJ_FTS_LIVE_FLOOR`)
+            FTS_LIVE_FLOOR_TEST.with(|c| c.set(Some(true)));
+            FTS_PREPASS_SEGMENTS.with(|c| c.set(0));
+            idx.query_cache.clear();
+            let live = idx.search(&req).await.unwrap();
+            served_live += FTS_PREPASS_SEGMENTS.with(|c| c.get());
+            FTS_LIVE_FLOOR_TEST.with(|c| c.set(None));
+            FTS_SEGMENT_THREADS_TEST.with(|c| c.set(None));
+            assert!(!sequential.hits.is_empty(), "fixture: {body} matches");
+            assert_eq!(page(&live), page(&sequential), "live floor: page of {body}");
+            assert_eq!(
+                live.total.value, sequential.total.value,
+                "live floor: total of {body}"
+            );
+            assert_eq!(
+                live.total.relation, sequential.total.relation,
+                "live floor: total relation of {body}"
+            );
+            assert_eq!(page(&parallel), page(&sequential), "page of {body}");
+            assert_eq!(
+                parallel.total.value, sequential.total.value,
+                "total of {body}"
+            );
+            assert_eq!(
+                parallel.total.relation, sequential.total.relation,
+                "total relation of {body}"
+            );
+        }
+        assert!(served > 0, "the pre-pass walked the segments ({served})");
+        assert!(
+            served_live > 0,
+            "the pre-pass walked the segments with the live floor ({served_live})"
+        );
+    }
+
+    #[tokio::test]
+    async fn match_walk_takes_the_merged_page_floor_and_keeps_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        engine.create_index("floor1", schema).unwrap();
+        let idx = engine.get_index("floor1").unwrap();
+        // The floor under test is the sequential segment loop's. With
+        // `XERJ_FTS_SEGMENT_THREADS` > 1 the segments are walked in parallel
+        // first, and those started before the shared top is full walk without
+        // a floor (same page, tested in `segment_prepass_keeps_the_sequential_
+        // page_and_total`), so the below-page count does not apply to it.
+        FTS_SEGMENT_THREADS_TEST.with(|c| c.set(Some(1)));
+        for seg in 0..3u32 {
+            for i in 0..600u32 {
+                let g = seg * 600 + i;
+                let mut body = match seg {
+                    0 => String::from("alpha beta filler"),
+                    1 if i % 50 == 7 => String::from("alpha alpha alpha beta beta"),
+                    2 if i % 10 == 3 => String::from("alpha beta filler"),
+                    _ => String::from("filler"),
+                };
+                for _ in 0..(g % 9) {
+                    body.push_str(" pad");
+                }
+                idx.index_document(Some(format!("d{g}")), json!({ "body": body }))
+                    .await
+                    .unwrap();
+            }
+            idx.flush().await.unwrap();
+        }
+        let req = xerj_query::parse_request(&json!({
+            "size": 200,
+            "query": {"match": {"body": "alpha beta filler"}}
+        }))
+        .unwrap();
+        let page = |r: &SearchResult| -> Vec<(String, u32)> {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), h.score.to_bits()))
+                .collect()
+        };
+
+        // the identical request must run both times (no response cache)
+        FTS_FLOOR_DISABLED.with(|c| c.set(true));
+        SEG_FTS_HITS_BELOW_PAGE.with(|c| c.set(0));
+        idx.query_cache.clear();
+        let reference = idx.search(&req).await.unwrap();
+        let below_without = SEG_FTS_HITS_BELOW_PAGE.with(|c| c.get());
+        FTS_FLOOR_DISABLED.with(|c| c.set(false));
+
+        SEG_FTS_FLOORS.with(|c| c.set(0));
+        SEG_FTS_HITS_BELOW_PAGE.with(|c| c.set(0));
+        idx.query_cache.clear();
+        let floored = idx.search(&req).await.unwrap();
+        let floors = SEG_FTS_FLOORS.with(|c| c.get());
+        let below_with = SEG_FTS_HITS_BELOW_PAGE.with(|c| c.get());
+
+        assert!(
+            below_without > 0,
+            "precondition: without the floor the later segments return hits \
+             below the full page ({below_without})"
+        );
+        // three flushes over the index's ingest shards: every segment searched
+        // after the collector filled must have received the floor
+        assert!(
+            floors >= 2,
+            "the segments searched after the page filled must receive its floor ({floors})"
+        );
+        assert_eq!(
+            below_with, 0,
+            "with the floor no segment returns a hit below the full page's \
+             lowest score"
+        );
+        assert_eq!(page(&floored), page(&reference), "the page must not change");
+        assert_eq!(floored.total.value, reference.total.value);
+        // batch 1's twelve strong documents come from segments searched after
+        // the page filled: all must be on it, the ten shortest at the top
+        let is_strong = |id: &str| {
+            let n: u32 = id[1..].parse().unwrap();
+            (600..1200).contains(&n) && n % 50 == 7
+        };
+        let top: Vec<&str> = floored.hits[..10].iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            top.iter().all(|id| is_strong(id)),
+            "batch 1's strong documents lead the page: {top:?}"
+        );
+        let on_page = floored.hits.iter().filter(|h| is_strong(&h.id)).count();
+        assert_eq!(on_page, 12, "every strong document is on the page");
+        FTS_SEGMENT_THREADS_TEST.with(|c| c.set(None));
+    }
+
     #[tokio::test]
     async fn pinned_knn_hybrid_is_answered_from_the_inverted_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -66829,7 +69869,15 @@ mod exact_scan_hydration_tests {
     #[tokio::test]
     async fn exact_scan_is_bit_identical_to_the_clone_everything_scan() {
         let dir = TempDir::new().unwrap();
-        let engine = engine(&dir);
+        // One ingest shard: the fixture's two flushes write two segments, so
+        // no background merge publishes while the scan is compared with the
+        // oracle. With a shard per two cores the fixture had four segments
+        // and the debounced merge landed mid-test: the oracle reads the live
+        // version map, and the scan, called here without `search()`'s retry
+        // loop, answers a merge inside its walk with the retry signal. The
+        // merge race itself is pinned by
+        // `a_knn_scan_parked_across_a_merge_publication_returns_no_retired_copy`.
+        let engine = single_shard_engine(&dir);
         engine
             .create_index("scan-939", vector_schema(None))
             .unwrap();
@@ -66910,7 +69958,15 @@ mod exact_scan_hydration_tests {
     #[tokio::test]
     async fn scalar8_scan_is_bit_identical_to_the_clone_everything_scan() {
         let dir = TempDir::new().unwrap();
-        let engine = engine(&dir);
+        // One ingest shard: the fixture's two flushes write two segments, so
+        // no background merge publishes while the scan is compared with the
+        // oracle. With a shard per two cores the fixture had four segments
+        // and the debounced merge landed mid-test: the oracle reads the live
+        // version map, and the scan, called here without `search()`'s retry
+        // loop, answers a merge inside its walk with the retry signal. The
+        // merge race itself is pinned by
+        // `a_knn_scan_parked_across_a_merge_publication_returns_no_retired_copy`.
+        let engine = single_shard_engine(&dir);
         engine
             .create_index("scan-939-sq8", vector_schema(Some("scalar8")))
             .unwrap();
@@ -67708,5 +70764,435 @@ mod sqs_wildcard_fields_2427_tests {
         .await;
         assert_eq!(total_multi, 200);
         assert!(fts > 0 && scans == 0, "fts={fts} stored_scans={scans}");
+    }
+}
+
+#[cfg(test)]
+mod refused_segment_get_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One one-shard flush of 3,000 passages `{id, text}` into an index whose
+    /// hydration budget is `budget`.
+    async fn passages(
+        engine: &crate::Engine,
+        name: &str,
+        budget: Arc<SegmentHydrationBudget>,
+    ) -> Arc<Index> {
+        TEST_INDEX_HYDRATION_BUDGET.with(|slot| *slot.borrow_mut() = Some(budget));
+        let mut schema = Schema::empty();
+        for (field, kind) in [("id", FieldType::Keyword), ("text", FieldType::Text)] {
+            schema.add_field(FieldConfig::new(field, kind)).unwrap();
+        }
+        engine.create_index(name, schema).unwrap();
+        TEST_INDEX_HYDRATION_BUDGET.with(|slot| slot.borrow_mut().take());
+        let idx = engine.get_index(name).unwrap();
+        let filler = "words that only make the passage long enough to matter ".repeat(6);
+        for i in 0..3000 {
+            let id = format!("p{i}");
+            idx.index_document(
+                Some(id.clone()),
+                json!({"id": id, "text": format!("alpha passage {i} {filler}")}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush().await.unwrap();
+        idx
+    }
+
+    /// A GET by `_id` on a segment whose decoded stored section the hydration
+    /// budget refuses decodes that whole section again on every call: the
+    /// primary-key fast path needs `stored_slices_for`, which on a cache miss
+    /// decodes the section, is refused by the budget, serves this one lookup
+    /// from the uncached slices and keeps nothing (`stored_slices_refused` is
+    /// consulted by background warms only).
+    ///
+    /// Measured by 52_verify2 (2026-10-28) on copies of a one-million-fact
+    /// store loaded with background merges on (8 segments, two merged ones of
+    /// 465 k and 475 k documents), merged release build, merges deferred
+    /// during the probe: after eight `range` searches the budget held
+    /// decoded stored sections (512 MiB) and doc values (408 MiB) of its
+    /// 1,000 MiB (engine limit 5,000 MB); every following GET was refused
+    /// (87 refusals in 64 GETs) and took 1.1-6.6 s on every repeat for the
+    /// segments of 97 k documents and more. With 2,500 MiB the 97 k and 17 k
+    /// segments were kept (under 1 ms), the 122 k and both merged segments
+    /// still refused on every GET (1.1-2.3 s). A facts edit batch (its
+    /// step-5 repairs are updates by `_id`) ran for over 17 minutes on such a
+    /// store; the same batch took 0.6 s with merges deferred at 8,500 MB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_by_id_on_a_refused_segment_does_not_decode_the_whole_section_every_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        // The decoded size of the segment's stored section, from an index with
+        // room for everything.
+        let probe = passages(
+            &engine,
+            "get-refusal-probe",
+            SegmentHydrationBudget::new(u64::MAX),
+        )
+        .await;
+        let probe_meta = probe.store.snapshot().segments[0].clone();
+        let decoded = {
+            let reader = probe.store.open_segment_arc(&probe_meta.id).unwrap();
+            let raw = reader.section(SectionType::Stored).unwrap().unwrap();
+            xerj_storage::stored_codec::decode_stored(raw)
+                .unwrap()
+                .len() as u64
+        };
+        assert!(
+            decoded > 2 * probe_meta.size_bytes,
+            "fixture: stored JSON compresses ({decoded} decoded, {} on disk)",
+            probe_meta.size_bytes
+        );
+        // Room for the segment's file and its `_id` index, not for its
+        // decoded section.
+        let limit = (probe_meta.size_bytes + decoded) / 2;
+        let idx = passages(&engine, "get-refusal", SegmentHydrationBudget::new(limit)).await;
+        idx.release_memory();
+        let meta = idx.store.snapshot().segments[0].clone();
+        let decodes = || idx.whole_stored_decodes.load(Ordering::Relaxed);
+        let id_of = |doc: &Option<Value>| {
+            doc.as_ref()
+                .and_then(|d| d.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let first = idx.get_document("p7").await.unwrap();
+        assert_eq!(id_of(&first).as_deref(), Some("p7"));
+        assert!(
+            !idx.stored_slices_cache.contains_key(meta.id.as_str()),
+            "precondition: the budget ({limit} B) refuses the decoded section ({decoded} B)"
+        );
+        let after_first = decodes();
+        assert!(
+            after_first >= 1,
+            "fixture: the first GET decodes the section"
+        );
+        let second = idx.get_document("p2999").await.unwrap();
+        assert_eq!(id_of(&second).as_deref(), Some("p2999"));
+        assert_eq!(
+            decodes(),
+            after_first,
+            "a second GET by _id on the same refused segment decoded its whole stored section \
+             again ({} more whole decodes)",
+            decodes() - after_first
+        );
+    }
+
+    /// With no room left in the budget for the segment's file, a GET by `_id`
+    /// decodes no stored section, not even on its first call:
+    /// `stored_slices_cannot_be_kept` already says that the decoded section
+    /// would be refused. The documents are those an index with room returns.
+    ///
+    /// FAIL-BEFORE: every one of the 30 GETs decoded the whole section.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_by_id_with_no_room_for_the_segment_decodes_no_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        let warm = passages(
+            &engine,
+            "no-room-probe",
+            SegmentHydrationBudget::new(u64::MAX),
+        )
+        .await;
+        let probe_meta = warm.store.snapshot().segments[0].clone();
+        // Half the segment file: the budget has no room for the file itself.
+        let limit = probe_meta.size_bytes / 2;
+        let idx = passages(&engine, "no-room", SegmentHydrationBudget::new(limit)).await;
+        idx.release_memory();
+        let meta = idx.store.snapshot().segments[0].clone();
+        assert!(
+            idx.stored_slices_cannot_be_kept(&meta.id, meta.size_bytes),
+            "precondition: no room for the segment file ({limit} B budget, {} B file)",
+            meta.size_bytes
+        );
+        let decodes = || idx.whole_stored_decodes.load(Ordering::Relaxed);
+        let before = decodes();
+        for i in (0..3000).step_by(100) {
+            let id = format!("p{i}");
+            let expected = warm.get_document(&id).await.unwrap();
+            assert!(expected.is_some(), "{id} exists");
+            assert_eq!(
+                serde_json::to_string(&idx.get_document(&id).await.unwrap()).unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            decodes() - before,
+            0,
+            "30 GETs by _id decoded {} whole stored sections",
+            decodes() - before
+        );
+    }
+
+    /// Documents of the value shapes a stored row must give back exactly:
+    /// keywords, negative and large integers, floats whose text form is not
+    /// trivial, a field echoing the id, nested objects and arrays, quotes,
+    /// backslashes, control characters and non-ASCII text, and an optional
+    /// field that is an explicit null, absent, or an integer.
+    fn varied(i: usize) -> Value {
+        let mut doc = json!({
+            "id": format!("v{i}"),
+            "kind": (["alpha", "beta", "gamma"][i % 3]),
+            "n": i as i64 - 1_500,
+            "schema": 7,
+            "code": ([200, 404, 500][i % 3]),
+            "ratio": i as f64 / 7.0,
+            "echo": format!("v{i}"),
+            "body": {
+                "text": format!(
+                    "row {i}: \"quoted\" back\\slash caf\u{e9} \u{1F600} tab\t {}",
+                    "filler ".repeat(i % 17)
+                ),
+                "tags": ["t", format!("tag-{}", i % 50), "z"],
+                "deep": {"x": [1.5, -0.0, 1e23, 5e-324, 3.0e38, 0.1, 0.30000000000000004]},
+            },
+        });
+        if i.is_multiple_of(7) {
+            doc["maybe"] = Value::Null;
+        } else if !i.is_multiple_of(5) {
+            doc["maybe"] = json!(i % 11);
+        }
+        if i.is_multiple_of(13) {
+            doc["big"] = json!(9_007_199_254_740_993_i64);
+        }
+        doc
+    }
+
+    /// GETs on a refused segment answer from the document's row, and return
+    /// exactly what the slice path returns where the budget keeps the slices:
+    /// the same JSON text once serialised (field order included), across the
+    /// value shapes of `varied`, for documents updated into a second segment
+    /// and for deleted and unknown ids. The index with room never reads a row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_by_id_on_a_refused_segment_returns_the_slice_path_documents() {
+        const N: usize = 3_000;
+        async fn load(
+            engine: &crate::Engine,
+            name: &str,
+            budget: Arc<SegmentHydrationBudget>,
+        ) -> Arc<Index> {
+            TEST_INDEX_HYDRATION_BUDGET.with(|slot| *slot.borrow_mut() = Some(budget));
+            let mut schema = Schema::empty();
+            schema
+                .add_field(FieldConfig::new("id", FieldType::Keyword))
+                .unwrap();
+            engine.create_index(name, schema).unwrap();
+            TEST_INDEX_HYDRATION_BUDGET.with(|slot| slot.borrow_mut().take());
+            let idx = engine.get_index(name).unwrap();
+            for i in 0..N {
+                idx.index_document(Some(format!("v{i}")), varied(i))
+                    .await
+                    .unwrap();
+            }
+            idx.flush().await.unwrap();
+            // A second segment: 30 updated documents; and 10 deleted ones.
+            for i in 0..30 {
+                let mut doc = varied(i);
+                doc["kind"] = json!("updated");
+                idx.index_document(Some(format!("v{i}")), doc)
+                    .await
+                    .unwrap();
+            }
+            for i in 100..110 {
+                assert!(idx.delete_document(&format!("v{i}")).await.unwrap());
+            }
+            idx.flush().await.unwrap();
+            idx.release_memory();
+            idx
+        }
+        let biggest = |idx: &Index| {
+            idx.store
+                .snapshot()
+                .segments
+                .iter()
+                .max_by_key(|meta| meta.doc_count)
+                .unwrap()
+                .clone()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        let warm = load(&engine, "rows-warm", SegmentHydrationBudget::new(u64::MAX)).await;
+        let big = biggest(&warm);
+        let decoded = {
+            let reader = warm.store.open_segment_arc(&big.id).unwrap();
+            let raw = reader.section(SectionType::Stored).unwrap().unwrap();
+            xerj_storage::stored_codec::decode_stored(raw)
+                .unwrap()
+                .len() as u64
+        };
+        assert!(
+            decoded > 2 * big.size_bytes,
+            "fixture: stored JSON compresses ({decoded} decoded, {} on disk)",
+            big.size_bytes
+        );
+        // Room for the big segment's file and `_id` index, not for its
+        // decoded section.
+        let cold = load(
+            &engine,
+            "rows-cold",
+            SegmentHydrationBudget::new((big.size_bytes + decoded) / 2),
+        )
+        .await;
+        // Every value shape, the updated and the deleted documents, and an
+        // unknown id.
+        let sampled: Vec<usize> = (0..N)
+            .filter(|&i| i % 5 == 0 || i % 7 == 0 || i < 35 || (98..112).contains(&i) || i == N - 1)
+            .collect();
+        let ids = sampled
+            .iter()
+            .map(|i| format!("v{i}"))
+            .chain(["missing".to_string()]);
+        let mut found = 0;
+        for id in ids {
+            let expected = warm.get_document(&id).await.unwrap();
+            found += usize::from(expected.is_some());
+            assert_eq!(
+                serde_json::to_string(&cold.get_document(&id).await.unwrap()).unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "{id}"
+            );
+        }
+        let deleted = sampled.iter().filter(|i| (100..110).contains(*i)).count();
+        assert_eq!(deleted, 10);
+        assert_eq!(
+            found,
+            sampled.len() - deleted,
+            "every document but the deleted ones"
+        );
+        // Live documents of the big (refused) segment: neither updated nor
+        // deleted.
+        let on_big = sampled
+            .iter()
+            .filter(|&&i| i >= 30 && !(100..110).contains(&i))
+            .count();
+        let cold_big = biggest(&cold);
+        assert!(
+            !cold.stored_slices_cache.contains_key(cold_big.id.as_str()),
+            "precondition: the budget refused the big segment's slices"
+        );
+        let row_gets = cold.refused_segment_row_gets.load(Ordering::Relaxed);
+        assert!(
+            row_gets + 3 >= on_big as u64,
+            "{row_gets} GETs read a row; {on_big} GETs were on the refused segment"
+        );
+        assert!(
+            cold.whole_stored_decodes.load(Ordering::Relaxed) <= 4,
+            "{} whole stored decodes",
+            cold.whole_stored_decodes.load(Ordering::Relaxed)
+        );
+        assert_eq!(warm.refused_segment_row_gets.load(Ordering::Relaxed), 0);
+    }
+
+    /// A refused segment whose decoded stored section a search left in
+    /// `decoded_stored_cache` answers GETs from that section through cached
+    /// row offsets: the documents of an index with room, no whole decode, no
+    /// row read, and no attempt to copy the section into slices that the
+    /// budget would refuse (the slice path copied the resident section and
+    /// walked it on every GET).
+    ///
+    /// FAIL-BEFORE (the resident-section read and its refusal check removed):
+    /// the first GET copies the section into slices, the budget refuses them
+    /// (`stored_slices_refused`), and no GET is served from the section.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_by_id_on_a_refused_segment_reads_its_resident_decoded_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        config.engine.ingest_shards = 1;
+        let engine = crate::Engine::new(config).unwrap();
+        let warm = passages(
+            &engine,
+            "resident-probe",
+            SegmentHydrationBudget::new(u64::MAX),
+        )
+        .await;
+        let decoded_len = {
+            let meta = warm.store.snapshot().segments[0].clone();
+            let reader = warm.store.open_segment_arc(&meta.id).unwrap();
+            let raw = reader.section(SectionType::Stored).unwrap().unwrap();
+            xerj_storage::stored_codec::decode_stored(raw)
+                .unwrap()
+                .len() as u64
+        };
+        // Room for the decoded section once (as a search keeps it), its `_id`
+        // index and its row offsets; not for a second copy of the section.
+        let limit = decoded_len + decoded_len / 2;
+        let idx = passages(&engine, "resident", SegmentHydrationBudget::new(limit)).await;
+        idx.release_memory();
+        let meta = idx.store.snapshot().segments[0].clone();
+        let decoded = {
+            let reader = idx.store.open_segment_arc(&meta.id).unwrap();
+            let raw = reader.section(SectionType::Stored).unwrap().unwrap();
+            let mut decoded = xerj_storage::stored_codec::decode_stored(raw).unwrap();
+            // The budget charges the decode's capacity, and its spare part
+            // depends on the width of the process's rayon pool (the row
+            // assembly sizes its output after the first wave of row chunks),
+            // which the first engine or parallel iterator of the test process
+            // fixes. In the whole xerj-engine suite the section held 1,679,952
+            // bytes for 1,240,564 of text, and after the `_id` index the
+            // budget had 23 kB left for 24 kB of row offsets. Charge the
+            // length, as `limit` assumes.
+            decoded.shrink_to_fit();
+            decoded
+        };
+        let charge = crate::segment_cache_estimates::decoded_stored_bytes(
+            &meta.id,
+            std::mem::size_of::<CacheResident<Vec<u8>>>(),
+            decoded.capacity(),
+        );
+        let resident = idx.publish_current(
+            &idx.decoded_stored_cache,
+            &meta.id,
+            meta.id.clone(),
+            SegmentCacheCategory::DecodedStored,
+            charge,
+            decoded,
+        );
+        assert!(
+            resident.is_cached(),
+            "precondition: the decoded section is resident"
+        );
+        drop(resident);
+        let decodes = || idx.whole_stored_decodes.load(Ordering::Relaxed);
+        let before = decodes();
+        for i in (0..3000).step_by(100) {
+            let id = format!("p{i}");
+            let expected = warm.get_document(&id).await.unwrap();
+            assert!(expected.is_some(), "{id} exists");
+            assert_eq!(
+                serde_json::to_string(&idx.get_document(&id).await.unwrap()).unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "{id}"
+            );
+        }
+        assert!(
+            !idx.stored_slices_refused.contains_key(meta.id.as_str()),
+            "a GET copied the resident section into slices the budget refused"
+        );
+        assert_eq!(decodes(), before, "no GET decoded the stored section");
+        assert_eq!(
+            idx.refused_segment_resident_gets.load(Ordering::Relaxed),
+            30,
+            "every GET read the resident section"
+        );
+        assert_eq!(idx.refused_segment_row_gets.load(Ordering::Relaxed), 0);
+        assert!(
+            idx.decoded_row_offsets.contains_key(meta.id.as_str()),
+            "the row offsets are kept for the next GET ({limit} B budget: {:?})",
+            idx.segment_hydration_budget.snapshot()
+        );
+        assert!(!idx.stored_slices_cache.contains_key(meta.id.as_str()));
     }
 }

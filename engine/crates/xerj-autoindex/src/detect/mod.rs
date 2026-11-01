@@ -95,6 +95,12 @@ pub fn validate_brain(brain: &str) -> std::result::Result<(), String> {
     if brain.ends_with("-edges") {
         return Err("namespace suffix '-edges' is reserved for graph edge indices".into());
     }
+    // The facts store keeps namespace `kb`'s facts in `.xerj-memory-kb-facts`, which is also brain `kb-facts`'s
+    // default nodes index: refused like `-edges`, in builds with the facts store only (feature `facts`; the same
+    // rule as `xerj_api::authz::FACTS_SUFFIX_RESERVED`).
+    if cfg!(feature = "facts") && brain.ends_with("-facts") {
+        return Err("namespace suffix '-facts' is reserved for facts indices".into());
+    }
     Ok(())
 }
 
@@ -1047,6 +1053,21 @@ mod tests {
         assert_eq!(a, edge_id("a", "t", "b", 1));
         assert_ne!(a, edge_id("a", "t", "b", 2));
         assert_ne!(a, edge_id("a", "u", "b", 1));
+    }
+
+    /// Brain `kb-facts` would collide with facts namespace `kb`'s index: refused when the facts store is built in.
+    #[test]
+    fn brain_names_reserve_the_facts_suffix_in_facts_builds() {
+        let r = validate_brain("kb-facts");
+        if cfg!(feature = "facts") {
+            assert_eq!(
+                r.unwrap_err(),
+                "namespace suffix '-facts' is reserved for facts indices"
+            );
+        } else {
+            assert!(r.is_ok(), "{r:?}");
+        }
+        assert!(validate_brain("kb-factsheet").is_ok());
     }
 
     #[test]

@@ -16861,6 +16861,7 @@ mod bulk_pipe_tests {
             first_server_error: None,
             throttled_out: 0,
             exhausted_after: None,
+            breaker_held: None,
         }
     }
 

@@ -19,6 +19,8 @@ members = [
     "crates/xerj-console-api",
     "crates/xerj-autoindex",
     "crates/xerj-hub",
+    # SPIKE (local branch spike/facts-68m, never pushed): XERJ-R facts + compiler
+    "crates/xerj-facts",
     "tests/es-compat-yaml",
 ]
 
@@ -255,3 +257,11 @@ codegen-units = 16
 inherits = "release"
 debug = 1
 strip = false
+
+# SPIKE (local branch spike/facts-e2, never pushed): the E2 frozen-model check runs the 68M inside the debug test build of
+# the facts harness; its runtime and the engine tokenizer are optimized so a decision takes release time, not debug time.
+[profile.dev.package.xerj-infer]
+opt-level = 3
+
+[profile.dev.package.tokenizers]
+opt-level = 3

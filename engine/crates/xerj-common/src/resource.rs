@@ -870,6 +870,17 @@ pub fn describe() -> String {
 mod tests {
     use super::*;
 
+    /// `/proc/self/statm`'s resident count in bytes: `VmRSS`, file-backed
+    /// pages included.
+    #[cfg(target_os = "linux")]
+    fn statm_resident_bytes() -> Option<u64> {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        // SAFETY: `sysconf` reads a system constant.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        Some(pages.saturating_mul(if page > 0 { page as u64 } else { 4096 }))
+    }
+
     #[test]
     fn env_override_beats_the_os_and_a_bad_value_is_reported() {
         assert_eq!(resolve_cores(Some("6"), None, Some(64)), (6, None));
@@ -1123,6 +1134,63 @@ mod tests {
                 cfg!(any(target_os = "linux", target_os = "windows"))
             );
         }
+    }
+
+    /// Clean file-backed pages are not this process's memory to give back:
+    /// mapping and reading 64 MiB of a file grows `VmRSS` (`RssFile`) by
+    /// 64 MiB and must not grow the probe the memory breaker reads. Before,
+    /// the probe was `VmRSS`, so a node's mapped segments counted against its
+    /// watermark (2.4 GB of a 15.9 GB peak on a 10 GB bulk load).
+    ///
+    /// Compared as a difference of deltas, so another test allocating on a
+    /// parallel thread moves both readings and cannot fail this one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rss_probe_leaves_out_clean_file_backed_pages() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        const LEN: usize = 64 * MIB as usize;
+        let mut file = tempfile::tempfile().expect("tempfile");
+        let chunk = vec![7u8; 1 << 20];
+        for _ in 0..(LEN >> 20) {
+            file.write_all(&chunk).expect("write");
+        }
+        file.flush().expect("flush");
+        // SAFETY: maps LEN readable bytes of a file this test owns and
+        // unmaps them below; the pointer is read only inside the mapping.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                LEN,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(addr, libc::MAP_FAILED, "mmap");
+        let vm_before = statm_resident_bytes().expect("statm");
+        let probe_before = current_rss_bytes().expect("probe");
+        let mut sum = 0u64;
+        for offset in (0..LEN).step_by(4096) {
+            // SAFETY: `offset < LEN`, inside the read-only mapping above.
+            sum += u64::from(unsafe { *(addr as *const u8).add(offset) });
+        }
+        let probe_after = current_rss_bytes().expect("probe");
+        let vm_after = statm_resident_bytes().expect("statm");
+        // SAFETY: unmaps exactly the mapping created above.
+        unsafe { libc::munmap(addr, LEN) };
+        assert_eq!(sum, 7 * (LEN as u64 / 4096));
+        let vm_grew = vm_after.saturating_sub(vm_before);
+        let probe_grew = probe_after.saturating_sub(probe_before);
+        assert!(
+            vm_grew >= 48 * MIB,
+            "precondition: touching the mapping must make it resident (VmRSS +{vm_grew})"
+        );
+        assert!(
+            vm_grew.saturating_sub(probe_grew) >= 48 * MIB,
+            "the probe must leave out the {vm_grew} bytes of clean file pages; it grew {probe_grew}"
+        );
     }
 
     #[test]

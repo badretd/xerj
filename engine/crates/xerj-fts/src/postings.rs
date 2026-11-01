@@ -375,6 +375,33 @@ impl PostingsWriter {
     /// are serialised.  See the module docs' "Skip-list acceleration: NOT
     /// implemented" note.
     pub fn encode_term(&self, term: &str, output: &mut Vec<u8>) -> Option<(u64, Vec<SkipEntry>)> {
+        self.encode_term_inner(term, output, None)
+            .map(|(offset, skips, _)| (offset, skips))
+    }
+
+    /// [`Self::encode_term`] plus the term's block-index entry (see
+    /// [`BlockIndex`]): for a term with at least one full block, every
+    /// block's last doc id, its byte offset inside the term's encoded bytes
+    /// and its competitive `(tf, norm byte)` pairs, plus the term's own
+    /// competitive pairs.  `norm_of(doc_id)` returns the document's stored
+    /// norm byte for this field.  The encoded bytes are identical to
+    /// [`Self::encode_term`]'s.
+    pub fn encode_term_indexed(
+        &self,
+        term: &str,
+        output: &mut Vec<u8>,
+        norm_of: &dyn Fn(u32) -> u8,
+    ) -> Option<(u64, Option<TermBlockData>)> {
+        self.encode_term_inner(term, output, Some(norm_of))
+            .map(|(offset, _, blocks)| (offset, blocks))
+    }
+
+    fn encode_term_inner(
+        &self,
+        term: &str,
+        output: &mut Vec<u8>,
+        norm_of: Option<&dyn Fn(u32) -> u8>,
+    ) -> Option<(u64, Vec<SkipEntry>, Option<TermBlockData>)> {
         let postings = self.postings.get(term)?;
 
         let start_offset = output.len() as u64;
@@ -382,6 +409,31 @@ impl PostingsWriter {
         let mut block_count = 0usize;
         let mut i = 0usize;
         let n = postings.len();
+        // The block index covers terms with at least one full block: a
+        // residual-only list is one short decode, nothing to skip.
+        let mut blocks = match norm_of {
+            Some(_) if n >= BLOCK_SIZE => Some(TermBlockData::default()),
+            _ => None,
+        };
+        let mut impacts = ImpactBuilder::default();
+        // the frequency a reader will score with: docs-only fields store none
+        // and synthesise 1
+        let store_positions = self.store_positions;
+        let scored_tf = |p: &RawPosting| if store_positions { p.term_freq } else { 1 };
+        let record = |blocks: &mut Option<TermBlockData>,
+                      impacts: &mut ImpactBuilder,
+                      run: &[RawPosting],
+                      offset: usize| {
+            if let (Some(b), Some(norm_of)) = (blocks.as_mut(), norm_of) {
+                b.last_doc.push(run[run.len() - 1].doc_id);
+                b.offset.push(offset as u32);
+                for p in run {
+                    impacts.add(scored_tf(p), norm_of(p.doc_id));
+                }
+                impacts.drain_into(&mut b.impacts, MAX_BLOCK_IMPACTS);
+                b.impact_end.push(b.impacts.len() as u32);
+            }
+        };
         // Term-frequency elision: df positive integers summing to df iff
         // every one of them is 1.  The reader re-derives this SAME predicate
         // from the `.meta` record (ttf == df), so the decision costs no
@@ -397,11 +449,12 @@ impl PostingsWriter {
         while i + BLOCK_SIZE <= n {
             // Full block
             let block = &postings[i..i + BLOCK_SIZE];
+            let block_offset = output.len() - start_offset as usize;
 
             if block_count.is_multiple_of(SKIP_INTERVAL) {
                 skip_table.push(SkipEntry {
                     max_doc_id: block[BLOCK_SIZE - 1].doc_id,
-                    byte_offset: (output.len() - start_offset as usize) as u32,
+                    byte_offset: block_offset as u32,
                 });
             }
 
@@ -415,6 +468,7 @@ impl PostingsWriter {
             // docs-only mode: emit nothing after the packed doc-id block.
             // The reader is told about the mode via the field meta and
             // skips the freq/position decode paths entirely.
+            record(&mut blocks, &mut impacts, block, block_offset);
 
             prev_block_last_doc_id = block[BLOCK_SIZE - 1].doc_id;
             i += BLOCK_SIZE;
@@ -425,6 +479,7 @@ impl PostingsWriter {
         // block's final doc_id as well.
         if i < n {
             let residual = &postings[i..];
+            let block_offset = output.len() - start_offset as usize;
             encode_residual(
                 residual,
                 output,
@@ -432,9 +487,16 @@ impl PostingsWriter {
                 self.store_positions,
                 freq_omitted,
             );
+            record(&mut blocks, &mut impacts, residual, block_offset);
         }
 
-        Some((start_offset, skip_table))
+        if let (Some(b), Some(norm_of)) = (blocks.as_mut(), norm_of) {
+            for p in postings {
+                impacts.add(scored_tf(p), norm_of(p.doc_id));
+            }
+            impacts.drain_into(&mut b.term_impacts, MAX_TERM_IMPACTS);
+        }
+        Some((start_offset, skip_table, blocks))
     }
 
     pub fn terms(&self) -> impl Iterator<Item = &str> {
@@ -725,6 +787,8 @@ pub fn uvarint_decode(cursor: &mut Cursor<&[u8]>) -> io::Result<u64> {
 /// Decode one document's position group — a vbyte count followed by that
 /// many delta-encoded positions.
 fn decode_position_group(cursor: &mut Cursor<&[u8]>) -> io::Result<Vec<u32>> {
+    #[cfg(test)]
+    POSITION_GROUPS_MATERIALISED.with(|c| c.set(c.get() + 1));
     let count = vbyte_decode(cursor)? as usize;
     let mut positions = Vec::with_capacity(count);
     let mut prev = 0u32;
@@ -734,6 +798,924 @@ fn decode_position_group(cursor: &mut Cursor<&[u8]>) -> io::Result<Vec<u32>> {
         positions.push(prev);
     }
     Ok(positions)
+}
+
+/// [`decode_position_group`] into a caller-owned buffer (cleared first), so
+/// a cursor reading the positions of many documents allocates once.
+fn decode_position_group_into(cursor: &mut Cursor<&[u8]>, out: &mut Vec<u32>) -> io::Result<()> {
+    #[cfg(test)]
+    POSITION_GROUPS_MATERIALISED.with(|c| c.set(c.get() + 1));
+    out.clear();
+    let count = vbyte_decode(cursor)? as usize;
+    out.reserve(count);
+    let mut prev = 0u32;
+    for _ in 0..count {
+        let delta = vbyte_decode(cursor)?;
+        prev += delta;
+        out.push(prev);
+    }
+    Ok(())
+}
+
+/// Step over one document's position group — the same vbyte count and
+/// deltas [`decode_position_group`] reads — without materialising it.
+///
+/// A vbyte ends at the byte whose high bit is set ([`vbyte_encode`]), so the
+/// deltas are skipped by counting terminator bytes. A delta longer than the
+/// five bytes a `u32` needs is the same `vbyte overflow` error the decoder
+/// reports.
+fn skip_position_group(cursor: &mut Cursor<&[u8]>) -> io::Result<()> {
+    let count = vbyte_decode(cursor)? as usize;
+    let data: &[u8] = cursor.get_ref();
+    let mut pos = cursor.position() as usize;
+    let mut remaining = count;
+    let mut run = 0u32;
+    while remaining > 0 {
+        let Some(&byte) = data.get(pos) else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "postings positions truncated",
+            ));
+        };
+        pos += 1;
+        if byte & 0x80 != 0 {
+            remaining -= 1;
+            run = 0;
+        } else {
+            run += 1;
+            if run >= 5 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "vbyte overflow"));
+            }
+        }
+    }
+    cursor.set_position(pos as u64);
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many per-document position groups were decoded into a `Vec`.
+    /// A scorer that reads only `(doc_id, term_freq)` must leave this at 0.
+    pub(crate) static POSITION_GROUPS_MATERIALISED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+// ── Block index: skip offsets + competitive impacts (ZBM1) ───────────────────
+//
+// A field's `.post` envelope is `"ZPS2" | u32 uncompressed_len | zstd frame`.
+// Writers that know the block index put it in a zstd SKIPPABLE frame between
+// the length and the postings frame.  zstd decoders skip such frames by
+// specification, so every reader that hands the bytes after the header to
+// `zstd::bulk::decompress` (all readers before this one) still gets exactly
+// the postings, and `uncompressed_len` keeps describing the postings frame
+// alone.  Readers that know the frame parse it once at open.
+//
+// Per term with at least one full block, the index stores every block's
+// last doc id and byte offset inside the term's encoded bytes — a block is
+// then decodable on its own (doc-id deltas are relative to the previous
+// block's last doc, and the doc and freq frames come first, so positions
+// are never touched) — and its competitive `(tf, norm byte)` pairs: the
+// pairs no other posting of the block dominates (tf' >= tf with norm'
+// <= norm).  BM25's `tf_norm` grows with tf and falls with the document
+// length, and the length is a non-decreasing function of the norm byte, so
+// the block's best `tf_norm` under ANY k1, b and avgdl is the best over its
+// pairs: an exact block upper bound that survives the per-request,
+// index-wide statistics (#188).  Lucene keeps per-block "competitive
+// impacts" for the same reason (re-derived here, no code taken).
+
+/// zstd skippable-frame magic (`0x184D2A50..=0x184D2A5F`) of the block-index
+/// frame inside a ZPS2 `.post` envelope.
+pub const BLOCK_INDEX_FRAME_MAGIC: u32 = 0x184D_2A5B;
+const ZBM1_MAGIC: &[u8; 4] = b"ZBM1";
+const ZBM1_VERSION: u8 = 1;
+/// Competitive pairs kept per block; a longer frontier is folded (see
+/// [`ImpactBuilder::drain_into`]), which keeps it an upper bound.
+pub const MAX_BLOCK_IMPACTS: usize = 4;
+/// Competitive pairs kept per term.
+pub const MAX_TERM_IMPACTS: usize = 8;
+
+/// One competitive `(term frequency, norm byte)` pair.  `tf == 255` means
+/// "255 or more": a bound computed from it must use the `tf -> inf` limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Impact {
+    pub tf: u8,
+    pub norm: u8,
+}
+
+impl Impact {
+    pub const TF_SATURATED: u8 = 255;
+}
+
+/// Accumulates `(tf, norm)` observations and emits their competitive
+/// frontier: ascending norm, strictly ascending tf.
+#[derive(Default)]
+struct ImpactBuilder {
+    /// max tf seen per norm byte (0 = none)
+    best: Vec<u32>,
+    touched: Vec<u8>,
+}
+
+impl ImpactBuilder {
+    #[inline]
+    fn add(&mut self, tf: u32, norm: u8) {
+        if self.best.is_empty() {
+            self.best.resize(256, 0);
+        }
+        let slot = &mut self.best[norm as usize];
+        if *slot == 0 {
+            self.touched.push(norm);
+        }
+        *slot = (*slot).max(tf.max(1));
+    }
+
+    /// Append the frontier of everything added since the last drain to
+    /// `out`, at most `cap` pairs, and reset.  Folding merges the two
+    /// neighbours with the smallest tf gap into (the larger tf, the smaller
+    /// norm), a pair that dominates both, so the result still bounds every
+    /// posting.
+    fn drain_into(&mut self, out: &mut Vec<Impact>, cap: usize) {
+        self.touched.sort_unstable();
+        let start = out.len();
+        let mut run = 0u8;
+        for &norm in &self.touched {
+            let code = self.best[norm as usize].min(Impact::TF_SATURATED as u32) as u8;
+            if code > run {
+                out.push(Impact { tf: code, norm });
+                run = code;
+            }
+            self.best[norm as usize] = 0;
+        }
+        self.touched.clear();
+        while out.len() - start > cap.max(1) {
+            let frontier = &out[start..];
+            let i = (0..frontier.len() - 1)
+                .min_by_key(|&i| frontier[i + 1].tf - frontier[i].tf)
+                .unwrap_or(0);
+            let merged = Impact {
+                tf: frontier[i + 1].tf,
+                norm: frontier[i].norm,
+            };
+            out[start + i] = merged;
+            out.remove(start + i + 1);
+        }
+    }
+}
+
+/// One term's block-index entry as the writer produces it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TermBlockData {
+    /// last doc id of every block (full blocks, then the residual)
+    pub last_doc: Vec<u32>,
+    /// byte offset of every block inside the term's encoded bytes
+    pub offset: Vec<u32>,
+    /// `impacts[impact_end[b - 1]..impact_end[b]]` are block `b`'s pairs
+    pub impact_end: Vec<u32>,
+    pub impacts: Vec<Impact>,
+    /// the term's own competitive pairs (over every posting)
+    pub term_impacts: Vec<Impact>,
+}
+
+/// Collects one field's [`TermBlockData`] and serialises the block-index
+/// frame.
+#[derive(Default)]
+pub struct BlockIndexBuilder {
+    keys: Vec<u64>,
+    first_block: Vec<u32>,
+    term_imp_end: Vec<u32>,
+    last_doc: Vec<u32>,
+    offset: Vec<u32>,
+    blk_imp_end: Vec<u32>,
+    term_imps: Vec<Impact>,
+    blk_imps: Vec<Impact>,
+}
+
+impl BlockIndexBuilder {
+    /// Add a term; `postings_offset` (the term's `TermPostings::postings_offset`)
+    /// must increase from call to call.
+    pub fn add(&mut self, postings_offset: u64, t: &TermBlockData) {
+        debug_assert!(self.keys.last().is_none_or(|&k| k < postings_offset));
+        debug_assert_eq!(t.last_doc.len(), t.offset.len());
+        debug_assert_eq!(t.last_doc.len(), t.impact_end.len());
+        self.keys.push(postings_offset);
+        self.first_block.push(self.last_doc.len() as u32);
+        self.term_imps.extend_from_slice(&t.term_impacts);
+        self.term_imp_end.push(self.term_imps.len() as u32);
+        let base = self.blk_imps.len() as u32;
+        self.last_doc.extend_from_slice(&t.last_doc);
+        self.offset.extend_from_slice(&t.offset);
+        self.blk_imp_end
+            .extend(t.impact_end.iter().map(|&e| base + e));
+        self.blk_imps.extend_from_slice(&t.impacts);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The complete skippable frame (magic, size, payload); empty when no
+    /// term was added, so a field without long lists keeps the old bytes.
+    pub fn finish(self, zstd_level: i32) -> io::Result<Vec<u8>> {
+        if self.keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut raw: Vec<u8> = Vec::with_capacity(
+            16 + self.keys.len() * 16
+                + self.last_doc.len() * 12
+                + (self.term_imps.len() + self.blk_imps.len()) * 2,
+        );
+        for n in [
+            self.keys.len(),
+            self.last_doc.len(),
+            self.term_imps.len(),
+            self.blk_imps.len(),
+        ] {
+            raw.extend_from_slice(&(n as u32).to_le_bytes());
+        }
+        for k in &self.keys {
+            raw.extend_from_slice(&k.to_le_bytes());
+        }
+        for col in [
+            &self.first_block,
+            &self.term_imp_end,
+            &self.last_doc,
+            &self.offset,
+            &self.blk_imp_end,
+        ] {
+            for v in col.iter() {
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        for imp in self.term_imps.iter().chain(&self.blk_imps) {
+            raw.push(imp.tf);
+            raw.push(imp.norm);
+        }
+        let compressed = zstd::bulk::compress(&raw, zstd_level)?;
+        let payload_len = 4 + 4 + 4 + compressed.len();
+        let mut out = Vec::with_capacity(8 + payload_len);
+        out.extend_from_slice(&BLOCK_INDEX_FRAME_MAGIC.to_le_bytes());
+        out.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        out.extend_from_slice(ZBM1_MAGIC);
+        out.extend_from_slice(&[ZBM1_VERSION, BLOCK_SIZE as u8, 0, 0]);
+        out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        Ok(out)
+    }
+}
+
+/// If `body` (a ZPS2 envelope after its 8-byte header) starts with the
+/// block-index frame, return `(frame payload, rest)`.
+pub fn split_block_index_frame(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    if body.len() < 8 || u32::from_le_bytes(body[..4].try_into().ok()?) != BLOCK_INDEX_FRAME_MAGIC {
+        return None;
+    }
+    let size = u32::from_le_bytes(body[4..8].try_into().ok()?) as usize;
+    let end = 8usize.checked_add(size)?;
+    (end <= body.len()).then(|| (&body[8..end], &body[end..]))
+}
+
+/// One field's parsed block index (see the section notes above).
+#[derive(Debug, Default)]
+pub struct BlockIndex {
+    keys: Vec<u64>,
+    first_block: Vec<u32>,
+    term_imp_end: Vec<u32>,
+    last_doc: Vec<u32>,
+    offset: Vec<u32>,
+    blk_imp_end: Vec<u32>,
+    term_imps: Vec<Impact>,
+    blk_imps: Vec<Impact>,
+}
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("block index: {msg}"))
+}
+
+impl BlockIndex {
+    /// Parse a frame payload produced by [`BlockIndexBuilder::finish`]
+    /// (without the 8-byte skippable-frame header).  Every structural
+    /// invariant the cursor relies on is checked here.
+    pub fn parse(payload: &[u8]) -> io::Result<Self> {
+        if payload.len() < 12 || &payload[..4] != ZBM1_MAGIC {
+            return Err(invalid("bad magic"));
+        }
+        if payload[4] != ZBM1_VERSION || payload[5] as usize != BLOCK_SIZE {
+            return Err(invalid("unsupported version or block size"));
+        }
+        let raw_len = u32::from_le_bytes(payload[8..12].try_into().unwrap()) as usize;
+        let raw = zstd::bulk::decompress(&payload[12..], raw_len)?;
+        if raw.len() != raw_len || raw.len() < 16 {
+            return Err(invalid("length mismatch"));
+        }
+        let rd = |i: usize| u32::from_le_bytes(raw[4 * i..4 * i + 4].try_into().unwrap()) as usize;
+        let (n_terms, n_blocks, n_timps, n_bimps) = (rd(0), rd(1), rd(2), rd(3));
+        let expect = 16usize
+            .checked_add(
+                n_terms
+                    .checked_mul(8 + 4 + 4)
+                    .ok_or_else(|| invalid("overflow"))?,
+            )
+            .and_then(|v| v.checked_add(n_blocks.checked_mul(12)?))
+            .and_then(|v| v.checked_add((n_timps.checked_add(n_bimps)?).checked_mul(2)?))
+            .ok_or_else(|| invalid("overflow"))?;
+        if expect != raw.len() {
+            return Err(invalid("section sizes do not add up"));
+        }
+        let mut pos = 16usize;
+        let take_u64 = |n: usize, pos: &mut usize| -> Vec<u64> {
+            let v = raw[*pos..*pos + 8 * n]
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            *pos += 8 * n;
+            v
+        };
+        let keys = take_u64(n_terms, &mut pos);
+        let take_u32 = |n: usize, pos: &mut usize| -> Vec<u32> {
+            let v = raw[*pos..*pos + 4 * n]
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            *pos += 4 * n;
+            v
+        };
+        let first_block = take_u32(n_terms, &mut pos);
+        let term_imp_end = take_u32(n_terms, &mut pos);
+        let last_doc = take_u32(n_blocks, &mut pos);
+        let offset = take_u32(n_blocks, &mut pos);
+        let blk_imp_end = take_u32(n_blocks, &mut pos);
+        let imps = |n: usize, pos: &mut usize| -> Vec<Impact> {
+            let v = raw[*pos..*pos + 2 * n]
+                .chunks_exact(2)
+                .map(|c| Impact {
+                    tf: c[0],
+                    norm: c[1],
+                })
+                .collect();
+            *pos += 2 * n;
+            v
+        };
+        let term_imps = imps(n_timps, &mut pos);
+        let blk_imps = imps(n_bimps, &mut pos);
+        let ix = BlockIndex {
+            keys,
+            first_block,
+            term_imp_end,
+            last_doc,
+            offset,
+            blk_imp_end,
+            term_imps,
+            blk_imps,
+        };
+        ix.validate()?;
+        Ok(ix)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        let ascending = |v: &[u32], max: usize| {
+            v.windows(2).all(|w| w[0] <= w[1]) && v.last().is_none_or(|&x| x as usize <= max)
+        };
+        if !self.keys.windows(2).all(|w| w[0] < w[1]) {
+            return Err(invalid("keys not strictly ascending"));
+        }
+        if !ascending(&self.first_block, self.last_doc.len())
+            || self.first_block.first().is_some_and(|&f| f != 0)
+        {
+            return Err(invalid("block ranges"));
+        }
+        // every term and every block owns at least one pair: an empty range
+        // would read as a zero bound and prune real matches
+        let strictly = |v: &[u32], max: usize| {
+            v.first().is_none_or(|&x| x > 0)
+                && v.windows(2).all(|w| w[0] < w[1])
+                && v.last().is_none_or(|&x| x as usize <= max)
+        };
+        if !strictly(&self.term_imp_end, self.term_imps.len())
+            || !strictly(&self.blk_imp_end, self.blk_imps.len())
+        {
+            return Err(invalid("impact ranges"));
+        }
+        for t in 0..self.keys.len() {
+            let (b0, b1) = self.block_range(t);
+            if b1 <= b0 {
+                return Err(invalid("term without blocks"));
+            }
+            if !self.last_doc[b0..b1].windows(2).all(|w| w[0] < w[1])
+                || !self.offset[b0..b1].windows(2).all(|w| w[0] < w[1])
+            {
+                return Err(invalid("block docs / offsets not ascending"));
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn block_range(&self, t: usize) -> (usize, usize) {
+        let b0 = self.first_block[t] as usize;
+        let b1 = self
+            .first_block
+            .get(t + 1)
+            .map_or(self.last_doc.len(), |&b| b as usize);
+        (b0, b1)
+    }
+
+    /// The entry of the term whose postings start at `postings_offset`.
+    pub fn term(&self, postings_offset: u64) -> Option<TermBlocks<'_>> {
+        let t = self.keys.binary_search(&postings_offset).ok()?;
+        let (b0, b1) = self.block_range(t);
+        let ti0 = if t == 0 {
+            0
+        } else {
+            self.term_imp_end[t - 1] as usize
+        };
+        let ti1 = self.term_imp_end[t] as usize;
+        let imp_base = if b0 == 0 { 0 } else { self.blk_imp_end[b0 - 1] };
+        Some(TermBlocks {
+            last_doc: &self.last_doc[b0..b1],
+            offset: &self.offset[b0..b1],
+            imp_end: &self.blk_imp_end[b0..b1],
+            imp_base,
+            impacts: &self.blk_imps,
+            term_impacts: &self.term_imps[ti0..ti1],
+        })
+    }
+
+    pub fn terms(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn blocks(&self) -> usize {
+        self.last_doc.len()
+    }
+
+    /// Heap bytes held by the parsed index (segment-cache accounting).
+    pub fn heap_bytes(&self) -> u64 {
+        (self.keys.len() * 8
+            + (self.first_block.len()
+                + self.term_imp_end.len()
+                + self.last_doc.len()
+                + self.offset.len()
+                + self.blk_imp_end.len())
+                * 4
+            + (self.term_imps.len() + self.blk_imps.len()) * 2) as u64
+    }
+}
+
+/// A term's view into its field's [`BlockIndex`].
+#[derive(Clone, Copy, Debug)]
+pub struct TermBlocks<'a> {
+    /// last doc id per block (strictly ascending)
+    pub last_doc: &'a [u32],
+    /// byte offset per block inside the term's encoded bytes
+    pub offset: &'a [u32],
+    imp_end: &'a [u32],
+    imp_base: u32,
+    impacts: &'a [Impact],
+    /// competitive pairs over the whole list
+    pub term_impacts: &'a [Impact],
+}
+
+impl<'a> TermBlocks<'a> {
+    pub fn len(&self) -> usize {
+        self.last_doc.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.last_doc.is_empty()
+    }
+
+    /// Competitive pairs of block `b`.
+    #[inline]
+    pub fn block_impacts(&self, b: usize) -> &'a [Impact] {
+        let start = if b == 0 {
+            self.imp_base
+        } else {
+            self.imp_end[b - 1]
+        } as usize;
+        &self.impacts[start..self.imp_end[b] as usize]
+    }
+}
+
+// ── BlockCursor: positions-free, block-skipping posting cursor ─────────────
+
+/// Step over one packed 128-value frame (either framing) without unpacking it.
+fn skip_u32_block(codec: PostCodec, data: &[u8], cur: &mut Cursor<&[u8]>) -> io::Result<()> {
+    let num_bits = cur.read_u8()?;
+    let len = match codec {
+        PostCodec::V1 => cur.read_u32::<LittleEndian>()? as usize,
+        PostCodec::V2 { .. } => {
+            vbyte_decode(cur)?;
+            if num_bits > 32 {
+                return Err(invalid("invalid bit width"));
+            }
+            BLOCK_SIZE * num_bits as usize / 8
+        }
+    };
+    let end = cur.position() as usize + len;
+    if end > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "postings data truncated",
+        ));
+    }
+    cur.set_position(end as u64);
+    Ok(())
+}
+
+/// First index `i >= from` with `v[i] >= target` (exponential search, then
+/// binary search): cheap for the short forward hops cursors make.
+#[inline]
+pub(crate) fn gallop(v: &[u32], from: usize, target: u32) -> usize {
+    let n = v.len();
+    if from >= n || v[from] >= target {
+        return from.min(n);
+    }
+    let mut lo = from;
+    let mut step = 1usize;
+    let mut hi = from + 1;
+    while hi < n && v[hi] < target {
+        lo = hi;
+        step *= 2;
+        hi = from + step;
+    }
+    let hi = hi.min(n);
+    lo + 1 + v[lo + 1..hi].partition_point(|&d| d < target)
+}
+
+const NO_BLOCK: usize = usize::MAX;
+
+/// Cursor over one term's postings that yields `(doc_id, term_freq)` and
+/// never decodes positions.
+///
+/// With a [`TermBlocks`] entry every block is reached through its stored
+/// offset, so [`Self::advance`] jumps over whole blocks without reading
+/// them, and the position stream is not even scanned.  Without one (a
+/// segment written before the block index, or a residual-only list) blocks
+/// are decoded in order and position bytes are stepped over, which is the
+/// positions-free [`PostingsReader`] walk.  `doc == u32::MAX` once the list
+/// is exhausted (or its bytes fail to decode, as `PostingsReader::next`
+/// stops on error).
+pub struct BlockCursor<'a> {
+    data: &'a [u8],
+    df: u32,
+    has_positions: bool,
+    freq_omitted: bool,
+    codec: PostCodec,
+    blocks: Option<TermBlocks<'a>>,
+    nfull: usize,
+    nblocks: usize,
+    /// `false`: full blocks' frequency frames are not unpacked (`tf()` reads 1)
+    want_tf: bool,
+    /// sequential mode: where the next block starts, and its delta base
+    next_pos: usize,
+    prev_last: u32,
+    blk: usize,
+    docs: [u32; BLOCK_SIZE],
+    tfs: [u32; BLOCK_SIZE],
+    len: usize,
+    i: usize,
+    /// current document (`u32::MAX` when exhausted)
+    pub doc: u32,
+    /// work counters: blocks and postings decoded
+    pub blocks_decoded: u64,
+    pub postings_decoded: u64,
+    /// Where the decoded FULL block's position groups start (one group per
+    /// document, in document order), when the frames before them were read
+    /// or stepped over (`pos_known`); see [`Self::positions`].
+    pos_base: usize,
+    pos_known: bool,
+    /// The next unread group of the decoded full block: its index and byte
+    /// offset, so a forward walk through one block steps over each group once.
+    pos_next: (usize, usize),
+    /// The residual block's group offset per document (its groups are
+    /// interleaved with the doc deltas and frequencies).
+    res_pos: [u32; BLOCK_SIZE],
+}
+
+impl<'a> BlockCursor<'a> {
+    /// `codec` / `has_positions` as [`PostingsReader::new_with_codec`] takes
+    /// them; `blocks` = the term's block-index entry when the segment has one.
+    /// The cursor starts on the first posting.
+    pub fn new(
+        data: &'a [u8],
+        doc_frequency: u32,
+        has_positions: bool,
+        codec: PostCodec,
+        blocks: Option<TermBlocks<'a>>,
+    ) -> Self {
+        Self::with_frequencies(data, doc_frequency, has_positions, codec, blocks, true)
+    }
+
+    /// [`Self::new`], optionally without unpacking the frequency frames of
+    /// full blocks (`want_tf == false`: document ids only, `tf()` reads 1 —
+    /// counting passes).
+    pub fn with_frequencies(
+        data: &'a [u8],
+        doc_frequency: u32,
+        has_positions: bool,
+        codec: PostCodec,
+        blocks: Option<TermBlocks<'a>>,
+        want_tf: bool,
+    ) -> Self {
+        let nfull = doc_frequency as usize / BLOCK_SIZE;
+        let nblocks = nfull + usize::from(!(doc_frequency as usize).is_multiple_of(BLOCK_SIZE));
+        let freq_omitted = match codec {
+            PostCodec::V1 => !has_positions,
+            PostCodec::V2 { freq_omitted } => freq_omitted || !has_positions,
+        };
+        // an index entry that does not describe this list is ignored
+        let blocks = blocks.filter(|b| {
+            b.len() == nblocks && b.offset.last().is_none_or(|&o| (o as usize) < data.len())
+        });
+        let mut c = BlockCursor {
+            data,
+            df: doc_frequency,
+            has_positions,
+            freq_omitted,
+            codec,
+            blocks,
+            nfull,
+            nblocks,
+            want_tf,
+            next_pos: 0,
+            prev_last: 0,
+            blk: NO_BLOCK,
+            docs: [0; BLOCK_SIZE],
+            tfs: [0; BLOCK_SIZE],
+            len: 0,
+            i: 0,
+            doc: u32::MAX,
+            blocks_decoded: 0,
+            postings_decoded: 0,
+            pos_base: 0,
+            pos_known: false,
+            pos_next: (0, 0),
+            res_pos: [0; BLOCK_SIZE],
+        };
+        if nblocks > 0 {
+            c.decode(0);
+        }
+        c
+    }
+
+    /// The current document's positions, ascending, decoded into `out`
+    /// (cleared first) — the values [`PostingsReader`] yields for it.
+    ///
+    /// `Ok(false)` when this cursor cannot read them: a docs-only field, the
+    /// legacy ZPS1 framing (its full blocks keep positions in one
+    /// length-prefixed run), or a cursor built without frequencies on a
+    /// segment with a block index (the frequency frame was not stepped over,
+    /// so the positions' start is unknown). Callers fall back to a
+    /// [`PostingsReader`] then.
+    ///
+    /// Only the groups up to the current document are touched: within a
+    /// full block the cursor remembers the next unread group, so walking a
+    /// block forward steps over every group once.
+    pub fn positions(&mut self, out: &mut Vec<u32>) -> io::Result<bool> {
+        out.clear();
+        if self.doc == u32::MAX || !self.has_positions {
+            return Ok(false);
+        }
+        let mut cur = Cursor::new(self.data);
+        if self.blk < self.nfull {
+            if !self.pos_known {
+                return Ok(false);
+            }
+            let (mut idx, off) = if self.pos_next.0 <= self.i {
+                self.pos_next
+            } else {
+                (0, self.pos_base)
+            };
+            cur.set_position(off as u64);
+            while idx < self.i {
+                skip_position_group(&mut cur)?;
+                idx += 1;
+            }
+            decode_position_group_into(&mut cur, out)?;
+            self.pos_next = (self.i + 1, cur.position() as usize);
+        } else {
+            cur.set_position(u64::from(self.res_pos[self.i]));
+            decode_position_group_into(&mut cur, out)?;
+        }
+        Ok(true)
+    }
+
+    /// The term's block-index entry, if the cursor uses one.
+    pub fn blocks(&self) -> Option<&TermBlocks<'a>> {
+        self.blocks.as_ref()
+    }
+
+    pub fn doc_frequency(&self) -> u32 {
+        self.df
+    }
+
+    /// Number of blocks (full blocks + the residual).
+    pub fn num_blocks(&self) -> usize {
+        self.nblocks
+    }
+
+    /// Index of the decoded block (the one holding `doc`).
+    pub fn block(&self) -> usize {
+        self.blk
+    }
+
+    /// The decoded block's documents and frequencies.
+    pub fn block_postings(&self) -> (&[u32], &[u32]) {
+        (&self.docs[..self.len], &self.tfs[..self.len])
+    }
+
+    #[inline]
+    pub fn tf(&self) -> u32 {
+        self.tfs[self.i]
+    }
+
+    fn exhaust(&mut self) {
+        self.doc = u32::MAX;
+        self.i = 0;
+        self.len = 0;
+    }
+
+    /// Decode block `b` (a later block than the current one); on corrupt
+    /// bytes the cursor is exhausted.
+    fn decode(&mut self, b: usize) {
+        if self.decode_inner(b).is_err() || self.len == 0 {
+            self.exhaust();
+            return;
+        }
+        self.blk = b;
+        self.i = 0;
+        self.doc = self.docs[0];
+        self.prev_last = self.docs[self.len - 1];
+        self.blocks_decoded += 1;
+        self.postings_decoded += self.len as u64;
+        self.pos_next = (0, self.pos_base);
+    }
+
+    fn decode_inner(&mut self, b: usize) -> io::Result<()> {
+        let (pos, base) = match &self.blocks {
+            Some(t) => (
+                t.offset[b] as usize,
+                if b == 0 { 0 } else { t.last_doc[b - 1] },
+            ),
+            None => {
+                if b != self.blk.wrapping_add(1) {
+                    return Err(invalid("sequential cursor asked to jump"));
+                }
+                (self.next_pos, self.prev_last)
+            }
+        };
+        if pos > self.data.len() {
+            return Err(invalid("block offset past the term's bytes"));
+        }
+        let mut cur = Cursor::new(self.data);
+        cur.set_position(pos as u64);
+        if b < self.nfull {
+            let mut deltas = [0u32; BLOCK_SIZE];
+            match self.codec {
+                PostCodec::V1 => unpack_u32_block_v1(self.data, &mut cur, &mut deltas)?,
+                PostCodec::V2 { .. } => unpack_u32_block_v2(self.data, &mut cur, &mut deltas)?,
+            }
+            let mut prev = base;
+            for (d, &delta) in self.docs.iter_mut().zip(deltas.iter()) {
+                prev = prev.wrapping_add(delta);
+                *d = prev;
+            }
+            if self.has_positions && !self.freq_omitted && self.want_tf {
+                match self.codec {
+                    PostCodec::V1 => unpack_u32_block_v1(self.data, &mut cur, &mut self.tfs)?,
+                    PostCodec::V2 { .. } => {
+                        unpack_u32_block_v2(self.data, &mut cur, &mut self.tfs)?
+                    }
+                }
+            } else {
+                if self.has_positions && !self.freq_omitted && self.blocks.is_none() {
+                    // sequential mode still has to step over the frame
+                    skip_u32_block(self.codec, self.data, &mut cur)?;
+                }
+                self.tfs = [1; BLOCK_SIZE];
+            }
+            // The position groups follow the frames read (or stepped over)
+            // above — known unless a frequency frame was left unread.
+            self.pos_known = self.has_positions
+                && !matches!(self.codec, PostCodec::V1)
+                && (self.freq_omitted || self.want_tf || self.blocks.is_none());
+            self.pos_base = cur.position() as usize;
+            if self.blocks.is_none() && self.has_positions {
+                // sequential mode must find the next block: step over positions
+                match self.codec {
+                    PostCodec::V1 => {
+                        let len = cur.read_u32::<LittleEndian>()? as u64;
+                        cur.set_position(cur.position() + len);
+                    }
+                    PostCodec::V2 { .. } => {
+                        for _ in 0..BLOCK_SIZE {
+                            skip_position_group(&mut cur)?;
+                        }
+                    }
+                }
+            }
+            self.len = BLOCK_SIZE;
+        } else {
+            let count = cur.read_u8()? as usize;
+            if count == 0
+                || count >= BLOCK_SIZE
+                || count != self.df as usize - self.nfull * BLOCK_SIZE
+            {
+                return Err(invalid("residual count"));
+            }
+            let mut prev = base;
+            for k in 0..count {
+                prev = prev.wrapping_add(vbyte_decode(&mut cur)?);
+                self.docs[k] = prev;
+                self.tfs[k] = if self.has_positions {
+                    let tf = if self.freq_omitted {
+                        1
+                    } else {
+                        vbyte_decode(&mut cur)?
+                    };
+                    self.res_pos[k] = cur.position() as u32;
+                    skip_position_group(&mut cur)?;
+                    tf
+                } else {
+                    1
+                };
+            }
+            self.len = count;
+        }
+        self.next_pos = cur.position() as usize;
+        Ok(())
+    }
+
+    /// Move to the next posting.
+    #[inline]
+    pub fn next(&mut self) {
+        if self.doc == u32::MAX {
+            return;
+        }
+        self.i += 1;
+        if self.i < self.len {
+            self.doc = self.docs[self.i];
+        } else if self.blk + 1 < self.nblocks {
+            self.decode(self.blk + 1);
+        } else {
+            self.exhaust();
+        }
+    }
+
+    /// Move to the first posting with `doc >= target` (no-op when already
+    /// there).  With a block index, blocks whose last doc is below `target`
+    /// are jumped over without being read.
+    pub fn advance(&mut self, target: u32) {
+        if self.doc >= target {
+            return;
+        }
+        if self.docs[self.len - 1] < target {
+            let next = match &self.blocks {
+                Some(t) => gallop(t.last_doc, self.blk + 1, target),
+                None => {
+                    // sequential: decode forward until a block reaches target
+                    loop {
+                        if self.blk + 1 >= self.nblocks {
+                            self.exhaust();
+                            return;
+                        }
+                        self.decode(self.blk + 1);
+                        if self.doc == u32::MAX {
+                            return;
+                        }
+                        if self.docs[self.len - 1] >= target {
+                            break;
+                        }
+                    }
+                    self.blk
+                }
+            };
+            if next >= self.nblocks {
+                self.exhaust();
+                return;
+            }
+            if next != self.blk {
+                self.decode(next);
+                if self.doc == u32::MAX {
+                    return;
+                }
+            }
+        }
+        let j = self.i + self.docs[self.i..self.len].partition_point(|&d| d < target);
+        self.i = j;
+        self.doc = self.docs[j];
+    }
+
+    /// Index of the block that would hold `target` (the first block, from
+    /// the decoded one on, whose last doc is `>= target`), without decoding;
+    /// `num_blocks()` when every remaining block ends before `target`.
+    /// Needs the block index (returns the decoded block otherwise).
+    #[inline]
+    pub fn shallow_block(&self, target: u32) -> usize {
+        match &self.blocks {
+            Some(t) => gallop(t.last_doc, self.blk.min(self.nblocks), target),
+            None => self.blk,
+        }
+    }
 }
 
 // ── PostingsReader ────────────────────────────────────────────────────────────
@@ -800,6 +1782,9 @@ pub struct PostingsReader<'a> {
     has_positions: bool,
     /// Inner block framing (ZPS1 legacy vs ZPS2) + freq-elision marker.
     codec: PostCodec,
+    /// `false` after [`Self::without_positions`]: the position stream is
+    /// stepped over, not decoded, and postings come back with no positions.
+    positions_wanted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -858,21 +1843,30 @@ impl<'a> PostingsReader<'a> {
             last_doc_id: 0,
             has_positions,
             codec,
+            positions_wanted: true,
         }
     }
 
-    /// Advance to the next posting. Returns `None` when exhausted.
+    /// Stop materialising positions.
     ///
-    /// An inherent cursor method rather than an `Iterator` impl: decoding
-    /// borrows the reader's internal buffers, which doesn't fit `Iterator`'s
-    /// `Item` lifetime, so `next` stays inherent by design.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<DecodedPosting> {
+    /// The reader still walks the position stream — the block layout is
+    /// positions-dependent, so it cannot be ignored — but steps over its
+    /// bytes instead of building one `Vec<u32>` per posting, and every
+    /// posting comes back with empty `positions`. For callers that read only
+    /// `(doc_id, term_freq)`, such as BM25 over a disjunction of terms: on a
+    /// `match` of a question against 1 M Wikipedia passages the per-posting
+    /// `Vec` allocate/clone/free was a third of the query's CPU.
+    pub fn without_positions(mut self) -> Self {
+        self.positions_wanted = false;
+        self
+    }
+
+    /// Load the next block (or the residual) when the current one is used up.
+    /// `None` when the list is exhausted or the bytes do not decode.
+    fn ensure_loaded(&mut self) -> Option<()> {
         if self.docs_read >= self.doc_frequency {
             return None;
         }
-
-        // Need to load the next block?
         if !self.in_residual && self.block_idx >= self.block_docs.len() {
             if self.blocks_processed < self.num_full_blocks {
                 self.decode_next_full_block().ok()?;
@@ -882,11 +1876,22 @@ impl<'a> PostingsReader<'a> {
                 self.in_residual = true;
             }
         }
+        if self.in_residual && self.residual_idx >= self.residual.len() {
+            return None;
+        }
+        Some(())
+    }
+
+    /// Advance to the next posting. Returns `None` when exhausted.
+    ///
+    /// An inherent cursor method rather than an `Iterator` impl: decoding
+    /// borrows the reader's internal buffers, which doesn't fit `Iterator`'s
+    /// `Item` lifetime, so `next` stays inherent by design.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<DecodedPosting> {
+        self.ensure_loaded()?;
 
         if self.in_residual {
-            if self.residual_idx >= self.residual.len() {
-                return None;
-            }
             let posting = self.residual[self.residual_idx].clone();
             self.residual_idx += 1;
             self.docs_read += 1;
@@ -895,7 +1900,11 @@ impl<'a> PostingsReader<'a> {
 
         let doc_id = self.block_docs[self.block_idx];
         let term_freq = self.block_freqs[self.block_idx];
-        let positions = self.block_positions[self.block_idx].clone();
+        let positions = if self.positions_wanted {
+            self.block_positions[self.block_idx].clone()
+        } else {
+            Vec::new()
+        };
         self.block_idx += 1;
         self.docs_read += 1;
 
@@ -906,6 +1915,29 @@ impl<'a> PostingsReader<'a> {
         })
     }
 
+    /// Advance to the next posting and return only its `(doc_id, term_freq)`.
+    ///
+    /// Same walk as [`Self::next`] without building a [`DecodedPosting`];
+    /// together with [`Self::without_positions`] a step allocates nothing.
+    pub fn next_doc(&mut self) -> Option<(u32, u32)> {
+        self.ensure_loaded()?;
+
+        let step = if self.in_residual {
+            let posting = &self.residual[self.residual_idx];
+            self.residual_idx += 1;
+            (posting.doc_id, posting.term_freq)
+        } else {
+            let step = (
+                self.block_docs[self.block_idx],
+                self.block_freqs[self.block_idx],
+            );
+            self.block_idx += 1;
+            step
+        };
+        self.docs_read += 1;
+        Some(step)
+    }
+
     fn decode_next_full_block(&mut self) -> io::Result<()> {
         // Read doc_id deltas
         let mut deltas = [0u32; BLOCK_SIZE];
@@ -914,45 +1946,76 @@ impl<'a> PostingsReader<'a> {
             PostCodec::V2 { .. } => unpack_u32_block_v2(self.data, &mut self.cursor, &mut deltas)?,
         }
 
-        // Reconstruct absolute doc IDs
-        let mut doc_ids = vec![0u32; BLOCK_SIZE];
-        doc_ids[0] = self.last_doc_id + deltas[0];
-        for j in 1..BLOCK_SIZE {
-            doc_ids[j] = doc_ids[j - 1] + deltas[j];
+        // Reconstruct absolute doc IDs, into the reader's own buffer: a block
+        // is decoded once per 128 postings, and allocating fresh `Vec`s for
+        // it on every block was measurable on million-posting stopwords.
+        self.block_docs.resize(BLOCK_SIZE, 0);
+        let mut doc = self.last_doc_id;
+        for (slot, delta) in self.block_docs.iter_mut().zip(deltas) {
+            doc += delta;
+            *slot = doc;
         }
-        self.last_doc_id = doc_ids[BLOCK_SIZE - 1];
+        self.last_doc_id = doc;
 
         // A positioned term whose freq stream was elided (ttf == df) or a
         // docs-only field: every frequency is 1 by construction, so the
         // block's freq bytes simply are not there.
         let freq_stored = self.has_positions && !self.freq_omitted();
-        let (freqs, positions) = if self.has_positions {
-            let freqs = if freq_stored {
-                let mut freqs = [0u32; BLOCK_SIZE];
-                match self.codec {
-                    PostCodec::V1 => unpack_u32_block_v1(self.data, &mut self.cursor, &mut freqs)?,
-                    PostCodec::V2 { .. } => {
-                        unpack_u32_block_v2(self.data, &mut self.cursor, &mut freqs)?
-                    }
+        self.block_freqs.resize(BLOCK_SIZE, 1);
+        if freq_stored {
+            let mut freqs = [0u32; BLOCK_SIZE];
+            match self.codec {
+                PostCodec::V1 => unpack_u32_block_v1(self.data, &mut self.cursor, &mut freqs)?,
+                PostCodec::V2 { .. } => {
+                    unpack_u32_block_v2(self.data, &mut self.cursor, &mut freqs)?
                 }
-                freqs.to_vec()
-            } else {
-                vec![1u32; BLOCK_SIZE]
-            };
-            (freqs, self.decode_block_positions()?)
+            }
+            self.block_freqs.copy_from_slice(&freqs);
         } else {
-            // Docs-only mode: synthesise freq=1 and empty positions.
-            let freqs = vec![1u32; BLOCK_SIZE];
-            let positions: Vec<Vec<u32>> = vec![Vec::new(); BLOCK_SIZE];
-            (freqs, positions)
-        };
+            self.block_freqs.fill(1);
+        }
 
-        self.block_docs = doc_ids.to_vec();
-        self.block_freqs = freqs;
-        self.block_positions = positions;
+        if self.has_positions {
+            if self.positions_wanted {
+                self.block_positions = self.decode_block_positions()?;
+            } else {
+                self.skip_block_positions()?;
+                self.block_positions.clear();
+            }
+        } else if self.positions_wanted {
+            // Docs-only mode: synthesise empty positions.
+            self.block_positions = vec![Vec::new(); BLOCK_SIZE];
+        } else {
+            self.block_positions.clear();
+        }
+
         self.block_idx = 0;
         self.blocks_processed += 1;
 
+        Ok(())
+    }
+
+    /// Step over one block's position stream — the bytes
+    /// [`Self::decode_block_positions`] would decode — without building it.
+    fn skip_block_positions(&mut self) -> io::Result<()> {
+        match self.codec {
+            PostCodec::V1 => {
+                let pos_byte_len = self.cursor.read_u32::<LittleEndian>()? as usize;
+                let pos_end = self.cursor.position() as usize + pos_byte_len;
+                if pos_end > self.data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "postings positions truncated",
+                    ));
+                }
+                self.cursor.set_position(pos_end as u64);
+            }
+            PostCodec::V2 { .. } => {
+                for _ in 0..BLOCK_SIZE {
+                    skip_position_group(&mut self.cursor)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1019,15 +2082,20 @@ impl<'a> PostingsReader<'a> {
                 } else {
                     vbyte_decode(&mut self.cursor)?
                 };
-                let pos_count = vbyte_decode(&mut self.cursor)? as usize;
-                let mut positions = Vec::with_capacity(pos_count);
-                let mut prev_pos = 0u32;
-                for _ in 0..pos_count {
-                    let delta = vbyte_decode(&mut self.cursor)?;
-                    prev_pos += delta;
-                    positions.push(prev_pos);
+                if !self.positions_wanted {
+                    skip_position_group(&mut self.cursor)?;
+                    (term_freq, Vec::new())
+                } else {
+                    let pos_count = vbyte_decode(&mut self.cursor)? as usize;
+                    let mut positions = Vec::with_capacity(pos_count);
+                    let mut prev_pos = 0u32;
+                    for _ in 0..pos_count {
+                        let delta = vbyte_decode(&mut self.cursor)?;
+                        prev_pos += delta;
+                        positions.push(prev_pos);
+                    }
+                    (term_freq, positions)
                 }
-                (term_freq, positions)
             } else {
                 (1u32, Vec::new())
             };
@@ -1215,6 +2283,108 @@ mod tests {
         assert_eq!(count, 128);
     }
 
+    /// `without_positions` + `next_doc` must walk exactly the `(doc_id,
+    /// term_freq)` sequence the positions-decoding `next` walks — across full
+    /// blocks and the residual, for varying and freq-elided (ttf == df) terms —
+    /// and must not decode a single position group into a `Vec`.
+    #[test]
+    fn without_positions_walks_the_same_docs_and_freqs() {
+        for n in [1usize, 127, 128, 129, 300, 1000] {
+            for tf_one in [false, true] {
+                let mut writer = PostingsWriter::new();
+                let mut expected: Vec<(u32, u32)> = Vec::new();
+                for i in 0..n as u32 {
+                    let doc = i * 3 + 1;
+                    let tf = if tf_one { 1 } else { 1 + i % 5 };
+                    for p in 0..tf {
+                        writer.add_occurrence("t", doc, p * 7 + i % 3);
+                    }
+                    expected.push((doc, tf));
+                }
+                let mut data = Vec::new();
+                writer.encode_term("t", &mut data);
+                let ttf: u64 = expected.iter().map(|&(_, tf)| tf as u64).sum();
+
+                let mut full = v2_reader(&data, n as u32, ttf);
+                let mut decoded = Vec::new();
+                while let Some(p) = full.next() {
+                    assert_eq!(p.positions.len() as u32, p.term_freq);
+                    decoded.push((p.doc_id, p.term_freq));
+                }
+                assert_eq!(decoded, expected, "next(), n={n} tf_one={tf_one}");
+
+                POSITION_GROUPS_MATERIALISED.with(|c| c.set(0));
+                let mut lean = v2_reader(&data, n as u32, ttf).without_positions();
+                let mut walked = Vec::new();
+                while let Some(step) = lean.next_doc() {
+                    walked.push(step);
+                }
+                assert_eq!(walked, expected, "next_doc(), n={n} tf_one={tf_one}");
+                assert_eq!(
+                    POSITION_GROUPS_MATERIALISED.with(|c| c.get()),
+                    0,
+                    "a positions-free walk must not build position Vecs"
+                );
+
+                // `next` on a positions-free reader: same docs, no positions.
+                let mut lean_next = v2_reader(&data, n as u32, ttf).without_positions();
+                let mut seen = Vec::new();
+                while let Some(p) = lean_next.next() {
+                    assert!(p.positions.is_empty());
+                    seen.push((p.doc_id, p.term_freq));
+                }
+                assert_eq!(seen, expected, "next() without positions, n={n}");
+            }
+        }
+    }
+
+    /// The legacy ZPS1 framing prefixes each block's position stream with its
+    /// byte length; a positions-free reader jumps over it and lands on the
+    /// next block exactly where the decoding reader does.
+    #[test]
+    fn without_positions_steps_over_a_zps1_position_stream() {
+        let block = |data: &mut Vec<u8>| {
+            // doc-id deltas: lane 0 = 0 (gap from the previous block's last
+            // doc), lanes 1..=127 = 1; 1-bit lanes, 16-byte payload.
+            data.push(1u8);
+            data.extend_from_slice(&16u32.to_le_bytes());
+            data.push(0xFE);
+            data.extend(std::iter::repeat_n(0xFFu8, 15));
+            // freqs: every lane 1.
+            data.push(1u8);
+            data.extend_from_slice(&16u32.to_le_bytes());
+            data.extend(std::iter::repeat_n(0xFFu8, 16));
+            // positions: u32 byte length, then 128 groups of (count 1, delta 0).
+            data.extend_from_slice(&256u32.to_le_bytes());
+            for _ in 0..BLOCK_SIZE {
+                data.push(0x81);
+                data.push(0x80);
+            }
+        };
+        let mut data: Vec<u8> = Vec::new();
+        block(&mut data);
+        block(&mut data);
+
+        let collect = |mut r: PostingsReader<'_>| {
+            let mut out = Vec::new();
+            while let Some(step) = r.next_doc() {
+                out.push(step);
+            }
+            out
+        };
+        let decoded = collect(PostingsReader::new_with_positions(&data, 256, true));
+        let lean =
+            collect(PostingsReader::new_with_positions(&data, 256, true).without_positions());
+        assert_eq!(decoded.len(), 256);
+        assert_eq!(decoded[127], (127, 1));
+        assert_eq!(
+            decoded[128],
+            (127, 1),
+            "second block's lane 0 is a zero gap"
+        );
+        assert_eq!(lean, decoded);
+    }
+
     /// A ZPS2 constant block — dense doc IDs, so every delta is 1 — encodes
     /// to `[width 0][vbyte 1]` and nothing else, where ZPS1 paid
     /// 5 header/payload-formality bytes plus a 16-byte payload.
@@ -1387,5 +2557,277 @@ mod tests {
             assert_eq!(p.term_freq, if i == 5 { 2 } else { 1 });
         }
         assert!(reader.next().is_none());
+    }
+
+    // ── block index + BlockCursor ──────────────────────────────────────────
+
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    /// One term's list: `(doc, tf)` per posting, written through a writer
+    /// with or without positions; returns (encoded bytes, block-index entry,
+    /// expected `(doc, scored tf)` walk, df, ttf).
+    type IndexedList = (Vec<u8>, Option<TermBlockData>, Vec<(u32, u32)>, u32, u64);
+
+    fn indexed_list(
+        n: usize,
+        positions: bool,
+        tf_one: bool,
+        seed: u64,
+        norm_of: &dyn Fn(u32) -> u8,
+    ) -> IndexedList {
+        let mut rng = Lcg(seed);
+        let mut writer = if positions {
+            PostingsWriter::new()
+        } else {
+            PostingsWriter::new_no_positions()
+        };
+        let mut doc = rng.next() as u32 % 50;
+        let mut expected = Vec::with_capacity(n);
+        let mut ttf = 0u64;
+        for _ in 0..n {
+            // gaps 1..=40, occasionally huge (sparse lists, wide blocks)
+            doc += 1
+                + (rng.next() % 40) as u32
+                + if rng.next().is_multiple_of(97) {
+                    100_000
+                } else {
+                    0
+                };
+            let tf = if tf_one {
+                1
+            } else if rng.next().is_multiple_of(50) {
+                256 + (rng.next() % 300) as u32 // saturating impacts
+            } else {
+                1 + (rng.next() % 4) as u32
+            };
+            for p in 0..tf {
+                writer.add_occurrence("t", doc, p * 3);
+            }
+            ttf += tf as u64;
+            expected.push((doc, if positions { tf } else { 1 }));
+        }
+        let mut data = Vec::new();
+        let (off, blocks) = writer.encode_term_indexed("t", &mut data, norm_of).unwrap();
+        assert_eq!(off, 0);
+        // identical bytes to the plain encoder
+        let mut plain = Vec::new();
+        writer.encode_term("t", &mut plain);
+        assert_eq!(
+            plain, data,
+            "encode_term_indexed must not change the encoding"
+        );
+        (data, blocks, expected, n as u32, ttf)
+    }
+
+    fn parsed(blocks: &TermBlockData) -> BlockIndex {
+        let mut b = BlockIndexBuilder::default();
+        b.add(0, blocks);
+        let frame = b.finish(3).unwrap();
+        let (payload, rest) = split_block_index_frame(&frame).expect("frame header");
+        assert!(rest.is_empty());
+        BlockIndex::parse(payload).unwrap()
+    }
+
+    fn walk(mut c: BlockCursor<'_>) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        while c.doc != u32::MAX {
+            out.push((c.doc, c.tf()));
+            c.next();
+        }
+        out
+    }
+
+    #[test]
+    fn block_cursor_walks_and_advances_like_the_linear_reader() {
+        let norm_of = |d: u32| (d.wrapping_mul(2654435761) >> 24) as u8;
+        let mut case = 0u64;
+        for n in [1usize, 5, 127, 128, 129, 255, 256, 257, 1000, 5003] {
+            for (positions, tf_one) in [(true, false), (true, true), (false, false)] {
+                case += 1;
+                let (data, blocks, expected, df, ttf) =
+                    indexed_list(n, positions, tf_one, case, &norm_of);
+                assert_eq!(
+                    blocks.is_some(),
+                    n >= BLOCK_SIZE,
+                    "n={n}: index only for full blocks"
+                );
+                let codec = PostCodec::v2_for(positions, ttf, df);
+                // the reader this crate had: positions-free linear walk
+                let mut reader =
+                    PostingsReader::new_with_codec(&data, df, positions, codec).without_positions();
+                let mut linear = Vec::new();
+                while let Some(step) = reader.next_doc() {
+                    linear.push(step);
+                }
+                assert_eq!(linear, expected, "n={n} positions={positions}");
+                let index = blocks.as_ref().map(parsed);
+                let term = index.as_ref().map(|ix| ix.term(0).unwrap());
+                for tb in [term, None] {
+                    let label = format!(
+                        "n={n} positions={positions} tf_one={tf_one} indexed={}",
+                        tb.is_some()
+                    );
+                    assert_eq!(
+                        walk(BlockCursor::new(&data, df, positions, codec, tb)),
+                        expected,
+                        "{label}: walk"
+                    );
+                    // document ids only: the same documents
+                    let docs_only: Vec<u32> = walk(BlockCursor::with_frequencies(
+                        &data, df, positions, codec, tb, false,
+                    ))
+                    .into_iter()
+                    .map(|(d, _)| d)
+                    .collect();
+                    let docs: Vec<u32> = expected.iter().map(|&(d, _)| d).collect();
+                    assert_eq!(docs_only, docs, "{label}: docs-only walk");
+                    // advance: single jumps from a fresh cursor, and a rising sequence
+                    let mut rng = Lcg(case * 31 + 7);
+                    let max = expected.last().unwrap().0 + 10;
+                    let mut targets: Vec<u32> = (0..60).map(|_| rng.next() as u32 % max).collect();
+                    targets.extend(expected.iter().step_by(37).map(|e| e.0));
+                    for &t in &targets {
+                        let mut c = BlockCursor::new(&data, df, positions, codec, tb);
+                        c.advance(t);
+                        match expected.iter().find(|e| e.0 >= t) {
+                            Some(&(d, tf)) => {
+                                assert_eq!((c.doc, c.tf()), (d, tf), "{label}: advance({t})")
+                            }
+                            None => {
+                                assert_eq!(c.doc, u32::MAX, "{label}: advance({t}) past the end")
+                            }
+                        }
+                    }
+                    targets.sort_unstable();
+                    let mut c = BlockCursor::new(&data, df, positions, codec, tb);
+                    for &t in &targets {
+                        c.advance(t);
+                        let want = expected.iter().find(|e| e.0 >= t).map_or(u32::MAX, |e| e.0);
+                        assert_eq!(c.doc, want, "{label}: rising advance({t})");
+                    }
+                }
+                // impacts: every posting is dominated by a stored pair of its block and of its term
+                if let (Some(tb), Some(ix)) = (blocks.as_ref(), index.as_ref()) {
+                    let t = ix.term(0).unwrap();
+                    assert_eq!(t.len(), n.div_ceil(BLOCK_SIZE));
+                    assert!(t.term_impacts.len() <= MAX_TERM_IMPACTS && !t.term_impacts.is_empty());
+                    let dominated = |pairs: &[Impact], tf: u32, norm: u8| {
+                        pairs
+                            .iter()
+                            .any(|p| p.tf as u32 >= tf.min(255) && p.norm <= norm)
+                    };
+                    for (b, chunk) in expected.chunks(BLOCK_SIZE).enumerate() {
+                        let pairs = t.block_impacts(b);
+                        assert!(!pairs.is_empty() && pairs.len() <= MAX_BLOCK_IMPACTS);
+                        assert_eq!(t.last_doc[b], chunk.last().unwrap().0);
+                        for &(d, tf) in chunk {
+                            assert!(
+                                dominated(pairs, tf, norm_of(d)),
+                                "block {b} misses ({tf}, {})",
+                                norm_of(d)
+                            );
+                            assert!(
+                                dominated(t.term_impacts, tf, norm_of(d)),
+                                "term misses ({tf}, {})",
+                                norm_of(d)
+                            );
+                        }
+                    }
+                    assert_eq!(tb.last_doc.len(), t.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn impact_frontier_is_minimal_saturates_and_folds() {
+        // a 10-point staircase: tf 1..=10 at norms 10, 20, ..., 100, plus dominated noise
+        let mut b = ImpactBuilder::default();
+        for k in 1..=10u32 {
+            b.add(k, (k * 10) as u8);
+            b.add(k, (k * 10 + 5) as u8); // dominated by (k, k*10)
+        }
+        let mut full = Vec::new();
+        b.drain_into(&mut full, 64);
+        assert_eq!(full.len(), 10);
+        assert!(full
+            .windows(2)
+            .all(|w| w[0].tf < w[1].tf && w[0].norm < w[1].norm));
+        let mut b = ImpactBuilder::default();
+        for k in 1..=10u32 {
+            b.add(k, (k * 10) as u8);
+        }
+        let mut folded = Vec::new();
+        b.drain_into(&mut folded, 4);
+        assert_eq!(folded.len(), 4);
+        for k in 1..=10u32 {
+            assert!(
+                folded
+                    .iter()
+                    .any(|p| p.tf as u32 >= k && p.norm as u32 <= k * 10),
+                "fold lost ({k}, {})",
+                k * 10
+            );
+        }
+        // tf >= 255 saturates; a later 255 at a larger norm is dominated
+        let mut b = ImpactBuilder::default();
+        b.add(300, 7);
+        b.add(1000, 9);
+        b.add(2, 1);
+        let mut sat = Vec::new();
+        b.drain_into(&mut sat, 4);
+        assert_eq!(
+            sat,
+            vec![Impact { tf: 2, norm: 1 }, Impact { tf: 255, norm: 7 }]
+        );
+        // the builder resets between drains
+        let mut b2 = Vec::new();
+        b.add(3, 3);
+        b.drain_into(&mut b2, 4);
+        assert_eq!(b2, vec![Impact { tf: 3, norm: 3 }]);
+    }
+
+    #[test]
+    fn block_index_parse_rejects_damage() {
+        let norm_of = |_d: u32| 9u8;
+        let (_, blocks, _, _, _) = indexed_list(700, true, false, 99, &norm_of);
+        let blocks = blocks.unwrap();
+        let mut builder = BlockIndexBuilder::default();
+        builder.add(40, &blocks);
+        let frame = builder.finish(3).unwrap();
+        let (payload, _) = split_block_index_frame(&frame).unwrap();
+        assert!(BlockIndex::parse(payload).is_ok());
+        assert!(
+            BlockIndex::parse(&payload[..payload.len() - 3]).is_err(),
+            "truncated"
+        );
+        let mut bad = payload.to_vec();
+        bad[0] = b'X';
+        assert!(BlockIndex::parse(&bad).is_err(), "magic");
+        let mut bad = payload.to_vec();
+        bad[4] = 2;
+        assert!(BlockIndex::parse(&bad).is_err(), "version");
+        // a block without impacts would read as a zero bound: refused
+        let mut hollow = blocks.clone();
+        hollow.impact_end[1] = hollow.impact_end[0];
+        let mut builder = BlockIndexBuilder::default();
+        builder.add(40, &hollow);
+        let frame = builder.finish(3).unwrap();
+        let (payload, _) = split_block_index_frame(&frame).unwrap();
+        assert!(BlockIndex::parse(payload).is_err(), "empty impact range");
+        // a frame header claiming more bytes than present is not a frame
+        let mut short = frame.clone();
+        short.truncate(frame.len() - 1);
+        assert!(split_block_index_frame(&short).is_none());
+        assert!(split_block_index_frame(b"ZPS2abcd").is_none());
     }
 }

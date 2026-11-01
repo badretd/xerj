@@ -441,6 +441,25 @@ impl VersionMap {
         }
     }
 
+    /// The partition of `doc_id` among `parts` threads that rebuild this map
+    /// in parallel (`XERJ_VERSION_MAP_THREADS`): the key's shard in the map
+    /// (dashmap 6's rule: the top bits of its hash below the 7 bits it keeps
+    /// for the table tag), modulo `parts`. A function of the key alone, so a
+    /// rebuild that runs each partition on one thread keeps every key's
+    /// writes in their order; and when `parts` divides the shard count the
+    /// threads never share a shard lock.
+    pub fn partition_of(&self, doc_id: &str, parts: usize) -> usize {
+        let shards = xerj_common::resource::per_index_map_shards().max(1);
+        let shift = usize::BITS - shards.trailing_zeros();
+        let hash = self.inner.hash_usize(&doc_id);
+        let shard = if shift >= usize::BITS {
+            0
+        } else {
+            (hash << 7) >> shift
+        };
+        shard % parts.max(1)
+    }
+
     /// Return the current version entry for `doc_id`, if any.
     pub fn get(&self, doc_id: &str) -> Option<VersionEntry> {
         self.inner

@@ -25,6 +25,12 @@ build = "build.rs"
 #   AEAD for connection-secrets crypt) that have no business in the engine's
 #   ES-compat layer.
 
+[features]
+# Reserve the `-facts` suffix in brain names: the facts store (`/_facts/{ns}`) keeps namespace `kb`'s facts in
+# `.xerj-memory-kb-facts`, brain `kb-facts`'s default nodes index. Off by default (no existing name changes); the
+# engine turns it on with its own `facts` feature (xerj-api / xerj-server).
+facts = []
+
 [dependencies]
 # Engine-side deps are used by the bundled `xerj-local` adapter, the
 # bootstrap helpers, and the cluster/info handler. When this crate is

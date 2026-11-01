@@ -241,6 +241,12 @@ impl<T> CacheResident<T> {
     pub fn value(&self) -> &T {
         &self.value
     }
+
+    /// Whether the budget admitted this value into a cache; an uncached one
+    /// lives only as long as its callers hold it.
+    pub fn is_cached(&self) -> bool {
+        self._charge.is_some()
+    }
 }
 
 impl<T> std::ops::Deref for CacheResident<T> {

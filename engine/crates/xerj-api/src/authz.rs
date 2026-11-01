@@ -267,6 +267,46 @@ pub fn authorize_brain(
     authorize_index(principal, &brain_edges_index(brain), privilege)
 }
 
+/// Suffix of the index that holds a facts namespace (`/_facts/{ns}` → `.xerj-memory-{ns}-facts`, design §2.1).
+pub const FACTS_INDEX_SUFFIX: &str = "-facts";
+
+/// Does this build reserve [`FACTS_INDEX_SUFFIX`] in memory-namespace and brain names, as `-edges` is reserved?
+///
+/// Brain or namespace `kb` and facts namespace `kb` share the `.xerj-memory-kb` prefix, so a memory namespace or a
+/// brain named `kb-facts` would read and write `.xerj-memory-kb-facts`, the facts index of namespace `kb`. The
+/// reservation is on in builds with the facts store (feature `facts`), where that index can exist. In the default
+/// build it is off, so no existing `*-facts` namespace or brain changes behaviour: making it unconditional is a
+/// breaking change with a release note, as `-edges` was, and that decision is the owner's.
+pub const FACTS_SUFFIX_RESERVED: bool = cfg!(feature = "facts");
+
+/// The reserved index behind `/_facts/{ns}`: inside the `.xerj-memory-` prefix, so every existing door (both
+/// authorization layers, snapshot rules, aliases, templates, `_mapping` pruning) covers it with no new rule, and one
+/// grant family names a namespace's three indices (`.xerj-memory-{ns}`, `-edges`, `-facts`).
+pub fn facts_index(ns: &str) -> String {
+    format!("{RESERVED_INDEX_PREFIX}{ns}{FACTS_INDEX_SUFFIX}")
+}
+
+/// The privilege a `/_facts/{ns}[/…]` request needs on the namespace's facts index: `_ask` and `_lookup` read,
+/// `_world`, `_bulk` and DELETE of a fact write, DELETE of the namespace manages. The read ops are recognized only in
+/// their own position (`/_facts/{ns}/_ask`), never anywhere in the path: `POST /_facts/_ask/_bulk` is a write.
+fn facts_privilege(method: &Method, segs: &[String]) -> Privilege {
+    if method == Method::GET || method == Method::HEAD {
+        return Privilege::ReadIndex;
+    }
+    if method == Method::POST {
+        let op = segs.get(2).map(String::as_str);
+        return if segs.len() == 3 && matches!(op, Some("_ask" | "_lookup")) {
+            Privilege::ReadIndex
+        } else {
+            Privilege::WriteIndex
+        };
+    }
+    if method == Method::DELETE && segs.len() <= 2 {
+        return Privilege::AdminIndex;
+    }
+    Privilege::WriteIndex
+}
+
 /// Authorize `principal` for `privilege` on agent-memory namespace `ns`.
 pub fn authorize_memory_namespace(
     principal: &Principal,
@@ -386,6 +426,10 @@ enum Target {
     Memory(String),
     /// `/_memory` (namespace listing)
     MemoryRoot,
+    /// `/_facts/{namespace}[/…]` (index `.xerj-memory-{ns}-facts`, [`facts_index`])
+    Facts(String),
+    /// `/_facts` (the listing, filtered in the handler to what the caller may read)
+    FactsRoot,
     /// One or more index expressions, plus where the op segment starts.
     Indices(Vec<String>, usize),
     /// A cluster/global endpoint whose path names no index: `/_cat/*`,
@@ -523,6 +567,10 @@ fn classify(path: &str) -> Target {
         "_memory" => match segs.get(1) {
             Some(ns) => Target::Memory(ns.clone()),
             None => Target::MemoryRoot,
+        },
+        "_facts" => match segs.get(1) {
+            Some(ns) => Target::Facts(ns.clone()),
+            None => Target::FactsRoot,
         },
         // Native router (`build_native_router`, :8080). Same engine, same
         // indices, different spelling — and therefore the same boundary:
@@ -1450,7 +1498,11 @@ fn guest_route_allowed(
     let is_read_verb = is_get || method == Method::POST;
     match target {
         Target::Exempt => true,
-        Target::Cluster | Target::Memory(_) | Target::MemoryRoot => false,
+        Target::Cluster
+        | Target::Memory(_)
+        | Target::MemoryRoot
+        | Target::Facts(_)
+        | Target::FactsRoot => false,
         Target::Brain(_) => {
             is_get
                 && segs.len() == 3
@@ -1568,6 +1620,10 @@ fn decide(
             authorize_memory_namespace(principal, ns, reserved_api_privilege(method, segs))
         }
         Target::MemoryRoot => Ok(()),
+        Target::Facts(ns) => {
+            authorize_index(principal, &facts_index(ns), facts_privilege(method, segs))
+        }
+        Target::FactsRoot => Ok(()),
         Target::Indices(expressions, op_start) => {
             let privilege = required_privilege(method, segs, *op_start);
             for expr in expressions {
@@ -2401,6 +2457,85 @@ mod tests {
         );
         assert_eq!(classify("/v1/dashboard/summary"), Target::Cluster);
         assert_eq!(classify("/v1/indices"), Target::Cluster);
+    }
+
+    /// `/_facts/{ns}` (design §5.4, layer 1): classified to the namespace's facts index, with each op's privilege.
+    #[test]
+    fn facts_routes_are_classified_and_privileged() {
+        assert_eq!(
+            classify("/_facts/alpha/_ask"),
+            Target::Facts("alpha".into())
+        );
+        assert_eq!(classify("/_facts/alpha"), Target::Facts("alpha".into()));
+        assert_eq!(classify("/_facts"), Target::FactsRoot);
+        assert_eq!(facts_index("alpha"), ".xerj-memory-alpha-facts");
+        assert!(is_reserved_index(&facts_index("alpha")));
+        let p = |m: Method, path: &str| facts_privilege(&m, &segments(path));
+        assert_eq!(p(Method::POST, "/_facts/a/_ask"), Privilege::ReadIndex);
+        assert_eq!(p(Method::POST, "/_facts/a/_lookup"), Privilege::ReadIndex);
+        assert_eq!(p(Method::GET, "/_facts/a"), Privilege::ReadIndex);
+        assert_eq!(p(Method::HEAD, "/_facts/a"), Privilege::ReadIndex);
+        assert_eq!(p(Method::POST, "/_facts/a/_bulk"), Privilege::WriteIndex);
+        assert_eq!(p(Method::POST, "/_facts/a/_world"), Privilege::WriteIndex);
+        assert_eq!(p(Method::DELETE, "/_facts/a/f1"), Privilege::WriteIndex);
+        assert_eq!(p(Method::DELETE, "/_facts/a"), Privilege::AdminIndex);
+        // a read op counts only in its own position: these are writes
+        assert_eq!(p(Method::POST, "/_facts/_ask/_bulk"), Privilege::WriteIndex);
+        assert_eq!(
+            p(Method::POST, "/_facts/a/_bulk/_ask"),
+            Privilege::WriteIndex
+        );
+    }
+
+    /// A grant on a namespace's facts index decides `/_facts/{ns}` and the raw index alike; grants on the memory
+    /// namespace or the edges index do not reach it, and neither does an unscoped key or a share-link guest.
+    #[test]
+    fn facts_grants_decide_the_facts_routes() {
+        let reader = scoped(&[".xerj-memory-alice-facts"], &[Privilege::ReadIndex]);
+        assert!(check(&reader, Method::POST, "/_facts/alice/_ask", "{}"));
+        assert!(check(&reader, Method::POST, "/_facts/alice/_lookup", "{}"));
+        assert!(check(&reader, Method::GET, "/_facts/alice", ""));
+        assert!(!check(&reader, Method::POST, "/_facts/alice/_bulk", "{}"));
+        assert!(!check(&reader, Method::POST, "/_facts/alice/_world", "{}"));
+        assert!(!check(&reader, Method::DELETE, "/_facts/alice/f1", ""));
+        assert!(!check(&reader, Method::DELETE, "/_facts/alice", ""));
+        assert!(!check(&reader, Method::POST, "/_facts/bob/_ask", "{}"));
+        assert!(check(
+            &reader,
+            Method::POST,
+            "/.xerj-memory-alice-facts/_search",
+            "{}"
+        ));
+        let writer = scoped(
+            &[".xerj-memory-alice-facts"],
+            &[Privilege::ReadIndex, Privilege::WriteIndex],
+        );
+        assert!(check(&writer, Method::POST, "/_facts/alice/_bulk", "{}"));
+        assert!(check(&writer, Method::DELETE, "/_facts/alice/f1", ""));
+        assert!(
+            !check(&writer, Method::DELETE, "/_facts/alice", ""),
+            "dropping a namespace is manage"
+        );
+        let memory = scoped(
+            &[".xerj-memory-alice", ".xerj-memory-alice-edges"],
+            &[
+                Privilege::ReadIndex,
+                Privilege::WriteIndex,
+                Privilege::AdminIndex,
+            ],
+        );
+        for (m, path) in [
+            (Method::POST, "/_facts/alice/_ask"),
+            (Method::GET, "/_facts/alice"),
+            (Method::POST, "/.xerj-memory-alice-facts/_search"),
+        ] {
+            assert!(!check(&memory, m.clone(), path, "{}"), "{m} {path}");
+            assert!(!check(&unscoped(), m.clone(), path, "{}"), "{m} {path}");
+            assert!(!guest_check(m, path, "{}"), "{path}");
+        }
+        // the listing is open to every authenticated key (the handler filters it) but not to a guest
+        assert!(check(&reader, Method::GET, "/_facts", ""));
+        assert!(!guest_check(Method::GET, "/_facts", ""));
     }
 
     /// Every route that can take an index name from its body must be mapped to

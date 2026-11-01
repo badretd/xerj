@@ -28,6 +28,9 @@ pub struct Es {
     /// How long a bulk that has not had a single item accepted keeps
     /// re-asking a parent memory breaker (see [`ZERO_PROGRESS_PATIENCE`]).
     zero_progress_patience: Duration,
+    /// How long the whole run may be held by a parent memory breaker, summed
+    /// over its bulks (see [`BREAKER_RUN_PATIENCE`]).
+    breaker_run_patience: Duration,
     /// Most actions this client puts in one `_bulk` request before the server
     /// has said anything about it. See [`BULK_MAX_ACTIONS`]; tests shrink it.
     bulk_max_actions: usize,
@@ -647,6 +650,22 @@ pub(crate) fn is_query_allocation_refusal(reason: &str) -> bool {
     reason.contains("would exceed limits.max_query_memory_mb")
 }
 
+/// How long one RUN may spend, summed over all its bulks, re-offering records
+/// the parent memory circuit breaker rejected, before it stops and names the
+/// node's memory cap.
+///
+/// [`THROTTLE_PATIENCE`] bounds one bulk, not a run whose node lets each bulk
+/// through after a long hold. The 10 GB JSONL autoindex on rc.98 (the build host,
+/// 2026-10-23) is that shape: 31 holds of up to 591 s — 5,617 s of an 8,644 s
+/// run spent waiting while the node's RSS sat at up to 2.7× its 15.6 GB
+/// watermark — then exit 1 with 14 % indexed. Fifteen minutes of holds is
+/// past every drain the per-bulk patience is sized for (#944 held 57 s), and
+/// says within the first hour what a rerun would otherwise repeat for hours:
+/// the node's cap is too small for this corpus. The holds of concurrent
+/// workers add up separately, so N workers held together reach it in about
+/// 1/N of the wall time.
+pub const BREAKER_RUN_PATIENCE: Duration = Duration::from_secs(15 * 60);
+
 /// The parent memory breaker, as opposed to a disk flood-stage 429 or a
 /// thread-pool rejection. Both of its reasons carry one of these phrases.
 pub(crate) fn is_parent_memory_breaker(reason: &str) -> bool {
@@ -673,11 +692,13 @@ pub(crate) fn backpressure_exhausted(
     items: u64,
     patience: Duration,
     reason: &str,
+    breaker_held: Option<Duration>,
 ) -> BackpressureExhausted {
     BackpressureExhausted {
         items,
         patience,
         reason: memory_cap_hint(reason),
+        breaker_held,
     }
 }
 
@@ -768,6 +789,10 @@ struct ThrottleLedger {
     reissues: AtomicU64,
     /// Items re-sent, summed over every re-send.
     items_reissued: AtomicU64,
+    /// Milliseconds this run's bulks have spent held by a parent memory
+    /// breaker — each such round and the backoff after it — summed over
+    /// every bulk and worker (see [`BREAKER_RUN_PATIENCE`]).
+    breaker_held_ms: AtomicU64,
 }
 
 /// How the server said a whole `_bulk` request was too large (#955).
@@ -803,10 +828,28 @@ pub struct BackpressureExhausted {
     pub items: u64,
     pub patience: Duration,
     pub reason: String,
+    /// Set when the run-wide [`BREAKER_RUN_PATIENCE`] stopped the run: how
+    /// long its bulks had been held by the parent memory breaker in total.
+    pub breaker_held: Option<Duration>,
 }
 
 impl std::fmt::Display for BackpressureExhausted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(held) = self.breaker_held {
+            return write!(
+                f,
+                "the server's memory circuit breaker has held this run's writes for {}s in \
+                 total, across its bulks: {}. The node takes writes again only once its \
+                 memory is back under the breaker's watermark, and a node whose cap is too \
+                 small for this corpus keeps refusing them for hours. Nothing from this bulk \
+                 ({} item(s)) was journaled applied; raise the node's memory cap and restart \
+                 it, then rerun the same command and the run resumes from its last committed \
+                 operation",
+                held.as_secs(),
+                self.reason,
+                self.items
+            );
+        }
         write!(
             f,
             "the server kept rejecting {} of a prepared bulk's items after {}s of \
@@ -1077,6 +1120,9 @@ pub struct BulkOutcome {
     /// `None` until a bulk gives up. The full [`THROTTLE_PATIENCE`] once any
     /// item was accepted; [`ZERO_PROGRESS_PATIENCE`] when none was (#2238).
     pub exhausted_after: Option<Duration>,
+    /// Set when the run-wide [`BREAKER_RUN_PATIENCE`] ended this bulk: how
+    /// long the run's bulks had been held by the parent memory breaker.
+    pub breaker_held: Option<Duration>,
 }
 
 impl BulkOutcome {
@@ -1094,6 +1140,9 @@ impl BulkOutcome {
         }
         if self.exhausted_after.is_none() {
             self.exhausted_after = other.exhausted_after;
+        }
+        if self.breaker_held.is_none() {
+            self.breaker_held = other.breaker_held;
         }
     }
 }
@@ -1285,6 +1334,7 @@ impl Es {
             admission: Arc::new(BulkAdmission::off()),
             throttle_patience: THROTTLE_PATIENCE,
             zero_progress_patience: ZERO_PROGRESS_PATIENCE,
+            breaker_run_patience: BREAKER_RUN_PATIENCE,
             bulk_max_actions: BULK_MAX_ACTIONS,
             request_size: Arc::new(RequestSizeLedger::default()),
             throttle_ledger: Arc::new(ThrottleLedger::default()),
@@ -1316,6 +1366,14 @@ impl Es {
     #[cfg(test)]
     fn with_zero_progress_patience(mut self, patience: Duration) -> Self {
         self.zero_progress_patience = patience;
+        self
+    }
+
+    /// How long the whole run may be held by a parent memory breaker (tests
+    /// shrink it).
+    #[cfg(test)]
+    fn with_breaker_run_patience(mut self, patience: Duration) -> Self {
+        self.breaker_run_patience = patience;
         self
     }
 
@@ -1981,6 +2039,7 @@ impl Es {
         let mut delay = self.retry_initial_delay;
         let mut last_notice: Option<Instant> = None;
         loop {
+            let round_started = Instant::now();
             let round = self.bulk_round(body.clone())?;
             if let Some(dimension) = round.too_large {
                 return self.halve_refused_request(body, dimension, round.outcome);
@@ -2029,6 +2088,20 @@ impl Es {
                 outcome.exhausted_after = Some(limit);
                 return Ok(SentWindow::Done(outcome));
             }
+            // Run-wide: a node whose breaker lets each bulk through only after
+            // a long hold never exhausts the per-bulk patience, so its holds
+            // are summed over the run and stop it at `breaker_run_patience`.
+            if parent {
+                let held = Duration::from_millis(
+                    self.throttle_ledger.breaker_held_ms.load(Ordering::Relaxed),
+                );
+                if held >= self.breaker_run_patience {
+                    outcome.throttled_out = round.throttled.len() as u64;
+                    outcome.exhausted_after = Some(limit);
+                    outcome.breaker_held = Some(held);
+                    return Ok(SentWindow::Done(outcome));
+                }
+            }
             // A response whose item count does not match the body cannot be
             // mapped back onto it; guessing would re-send the wrong records.
             let Some(retry) = select_bulk_items(&body, &round.throttled, round.items) else {
@@ -2059,6 +2132,12 @@ impl Es {
                 .fetch_add(round.throttled.len() as u64, Ordering::Relaxed);
             body = retry;
             self.backoff(delay);
+            if parent {
+                self.throttle_ledger.breaker_held_ms.fetch_add(
+                    u64::try_from(round_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
             delay = (delay * 2).min(self.retry_max_delay);
         }
     }
@@ -4631,9 +4710,96 @@ mod tests {
         );
     }
 
+    /// A node whose breaker lets every bulk through after a hold never runs a
+    /// bulk out of patience, so a run against it crawls for hours: the 10 GB
+    /// autoindex on rc.98 spent 5,617 s of an 8,644 s run in 31 such holds and
+    /// then failed anyway. The holds are summed over the run, and once they
+    /// pass `breaker_run_patience` the next held bulk stops with the cap named.
+    ///
+    /// FAIL-BEFORE: every bulk lands after its hold and nothing stops the run.
+    #[test]
+    fn breaker_holds_summed_over_a_run_stop_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        // Two actions: `a` lands, `b` is held by the breaker. `b` re-offered
+        // alone is held three more times, then lands.
+        let server = std::thread::spawn(move || {
+            let mut holds = 0;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let request = read_request(&mut stream);
+                        let lines = request_body(&request)
+                            .iter()
+                            .filter(|&&byte| byte == b'\n')
+                            .count();
+                        if lines >= 4 {
+                            holds = 0;
+                            respond_json(
+                                &mut stream,
+                                &items_response(
+                                    &[item("a", 201, None), item("b", 429, Some(BREAKER))],
+                                    true,
+                                ),
+                            );
+                        } else if holds < 3 {
+                            holds += 1;
+                            items_answered(&mut stream, &[429]);
+                        } else {
+                            items_answered(&mut stream, &[201]);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            }
+        });
+        let es = client(address, 4)
+            .with_throttle_patience(Duration::from_secs(5))
+            .with_breaker_run_patience(Duration::from_millis(100));
+        let mut landed = 0;
+        let mut stopped = None;
+        for _ in 0..20 {
+            let outcome = es.bulk([pair("a"), pair("b")].concat()).unwrap();
+            if outcome.throttled_out > 0 {
+                stopped = Some(outcome);
+                break;
+            }
+            assert_eq!(outcome.server_errors, 0, "{outcome:?}");
+            landed += 1;
+        }
+        stop.store(true, Ordering::SeqCst);
+        server.join().unwrap();
+        let outcome = stopped.expect("held bulks adding up past the run budget must stop the run");
+        assert!(landed >= 1, "the first held bulks still land: {landed}");
+        let held = outcome.breaker_held.expect("stopped by the run budget");
+        assert!(held >= Duration::from_millis(100), "{held:?}");
+        let rendered = super::backpressure_exhausted(
+            outcome.server_errors,
+            es.throttle_patience(),
+            outcome.first_server_error.as_deref().unwrap_or(BREAKER),
+            outcome.breaker_held,
+        )
+        .to_string();
+        assert!(rendered.contains("in total"), "{rendered}");
+        assert!(
+            rendered.contains("limits.max_process_memory_mb"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn backpressure_exhausted_names_the_process_memory_cap_once() {
-        let error = super::backpressure_exhausted(4, Duration::from_secs(90), BREAKER);
+        let error = super::backpressure_exhausted(4, Duration::from_secs(90), BREAKER, None);
         let rendered = error.to_string();
         assert!(rendered.contains("after 90s"), "{rendered}");
         assert!(rendered.contains("circuit breaker"), "{rendered}");
@@ -5256,6 +5422,7 @@ mod tests {
             items: 12,
             patience: super::THROTTLE_PATIENCE,
             reason: "{\"type\":\"engine_exception\"}".into(),
+            breaker_held: None,
         };
         assert_eq!(
             error.to_string(),

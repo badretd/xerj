@@ -172,6 +172,11 @@ fn validate_brain(brain: &str) -> Result<(), String> {
     if brain.ends_with("-edges") {
         return Err("namespace suffix '-edges' is reserved for graph edge indices".into());
     }
+    // A brain's default nodes index is `.xerj-memory-{brain}`: brain `kb-facts` would read facts namespace `kb`'s
+    // index as its nodes (`memory_api::validate_namespace` has the same rule; `authz::FACTS_SUFFIX_RESERVED`).
+    if crate::authz::FACTS_SUFFIX_RESERVED && brain.ends_with(crate::authz::FACTS_INDEX_SUFFIX) {
+        return Err(crate::memory_api::FACTS_SUFFIX_REASON.into());
+    }
     Ok(())
 }
 
@@ -1610,6 +1615,21 @@ mod tests {
         assert!(validate_brain("").is_err());
         assert!(validate_brain("Notes").is_err());
         assert!(validate_brain("a..b").is_err());
+    }
+
+    /// Brain `kb-facts` would read facts namespace `kb`'s index as its nodes: refused in builds with the facts store.
+    #[test]
+    fn brain_validation_reserves_the_facts_suffix_in_facts_builds() {
+        let r = validate_brain("kb-facts");
+        if cfg!(feature = "facts") {
+            assert_eq!(
+                r.unwrap_err(),
+                "namespace suffix '-facts' is reserved for facts indices"
+            );
+        } else {
+            assert!(r.is_ok(), "{r:?}");
+        }
+        assert!(validate_brain("kb-factsheet").is_ok());
     }
 
     /// §4.1: link creates (201) with the pinned edge_id; a re-assert of the

@@ -141,8 +141,19 @@ pub(crate) fn validate_namespace(ns: &str) -> Result<(), String> {
     if ns.ends_with("-edges") {
         return Err("namespace suffix '-edges' is reserved for graph edge indices".into());
     }
+    // Same guard for the facts store: namespace `N`'s facts live in `.xerj-memory-{N}-facts`
+    // (`authz::facts_index`), so a memory namespace ending in `-facts` would write memories into
+    // another namespace's facts index. On in builds with the facts store only — see
+    // `authz::FACTS_SUFFIX_RESERVED`.
+    if crate::authz::FACTS_SUFFIX_RESERVED && ns.ends_with(crate::authz::FACTS_INDEX_SUFFIX) {
+        return Err(FACTS_SUFFIX_REASON.into());
+    }
     Ok(())
 }
+
+/// Why a `*-facts` namespace or brain name is refused (the same sentence in every copy of the rule).
+pub(crate) const FACTS_SUFFIX_REASON: &str =
+    "namespace suffix '-facts' is reserved for facts indices";
 
 /// A memory write that failed because the data-dir disk is at the flood-stage
 /// watermark (#2284).
@@ -1681,6 +1692,29 @@ mod tests {
             validate_namespace("kb-edges").unwrap_err(),
             "namespace suffix '-edges' is reserved for graph edge indices"
         );
+    }
+
+    /// Facts-store collision guard: `POST /_memory/kb-facts` would write memories into facts namespace `kb`'s index
+    /// (`.xerj-memory-kb-facts`). Refused in builds with the facts store; the default build is unchanged.
+    #[test]
+    fn namespace_validation_reserves_the_facts_suffix_in_facts_builds() {
+        let r = validate_namespace("kb-facts");
+        if cfg!(feature = "facts") {
+            assert_eq!(
+                r.unwrap_err(),
+                "namespace suffix '-facts' is reserved for facts indices"
+            );
+        } else {
+            assert!(
+                r.is_ok(),
+                "the default build keeps every existing name: {r:?}"
+            );
+        }
+        // only the exact suffix
+        assert!(validate_namespace("facts").is_ok());
+        assert!(validate_namespace("kb-factsheet").is_ok());
+        assert!(validate_namespace("kb-facts-2").is_ok());
+        assert!(validate_namespace("kb_facts").is_ok());
     }
 
     /// #2284: the flood-stage block is a nested `cluster_block_exception`

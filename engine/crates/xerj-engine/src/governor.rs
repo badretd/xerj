@@ -2272,11 +2272,14 @@ fn build(config: &Config) -> ResourceGovernor {
 // System probes (Linux; best-effort with safe fallbacks elsewhere)
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Current resident set size of this process, in bytes, via
-/// [`xerj_common::resource::current_rss_bytes`] (`/proc/self/statm` on Linux,
-/// the physical footprint from `proc_pid_rusage` on macOS). Returns 0 where the platform
-/// exposes no probe — the RSS watermark then never trips, which is safe but
-/// means no admission control, so [`build`] says so out loud at startup.
+/// The memory the breaker counts as this process's RSS, in bytes, via
+/// [`xerj_common::resource::current_rss_bytes`]: on Linux the anonymous and
+/// shared-memory resident pages (`RssAnon + RssShmem` from `/proc/self/status`;
+/// clean file-backed pages, which the kernel reclaims on its own, are left
+/// out), on macOS the physical footprint from `proc_pid_rusage`. Returns 0
+/// where the platform exposes no probe — the RSS watermark then never trips,
+/// which is safe but means no admission control, so [`build`] says so out loud
+/// at startup.
 ///
 /// Until #240 this returned a hardcoded 0 on *every* non-Linux platform, so
 /// the watermark was dead on macOS however much memory the process took.
