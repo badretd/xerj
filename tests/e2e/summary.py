@@ -11,5 +11,5 @@ for f in sorted(glob.glob(os.path.join(d, "pulled", "func", "t?.json"))):
 p = os.path.join(d, "score", "bench_compare.json")
 if os.path.exists(p):
     print("t6 gate", json.load(open(p))["gate"].get("pass"))
-for f in sorted(glob.glob(os.path.join(d, "pulled", "bench", "latency.*.json"))):
+for f in sorted(glob.glob(os.path.join(d, "pulled", "bench", "latency.*.t?.json"))):
     r = json.load(open(f)); print(os.path.basename(f), {k: round(v) for k, v in r["decline_v2"].items()}, r["rss_decline_v2"])
