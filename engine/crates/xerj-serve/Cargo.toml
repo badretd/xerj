@@ -1,0 +1,56 @@
+[package]
+name = "xerj-serve"
+description = "XERJ-R end to end in Rust: store + linker + manifest + 17M int8 compiler (xerj-infer) + exact executor + verify, one JSON-lines binary (xerj-ask) for tests and the XERJ Lab"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+
+[dependencies]
+xerj-store = { path = "../xerj-store" }
+xerj-index = { path = "../xerj-index" }
+xerj-exec = { path = "../xerj-exec" }
+# default-features off so a host that brings its own TextEncoder (the XERJ engine spike) builds without tokenizers 0.22 + onig
+xerj-infer = { path = "../xerj-infer", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+smallvec = { version = "1.15", features = ["const_generics", "union"] }
+
+[features]
+default = ["tokenizer"]
+# the HF reference tokenizer inside xerj-infer (ModelSlot::load and the binaries need it)
+tokenizer = ["xerj-infer/tokenizer"]
+
+[[bin]]
+name = "xerj-ask"
+path = "src/bin/xerj-ask.rs"
+required-features = ["tokenizer"]
+
+[[bin]]
+name = "xerj-corpus"
+path = "src/bin/xerj-corpus.rs"
+required-features = ["tokenizer"]
+
+# research tools (e2e1): the Rust decline policy v2 on recorded rows and on the Python oracle's random strings; never served
+[[example]]
+name = "decline_parity"
+path = "examples/decline_parity.rs"
+
+[[example]]
+name = "decline_fuzz"
+path = "examples/decline_fuzz.rs"
+
+[[example]]
+name = "decline_smoke"
+path = "examples/decline_smoke.rs"
+required-features = ["tokenizer"]
+
+# research tool (round 3, 54_verifier3): the verify-rule options judged on development data; never served
+[[example]]
+name = "verify_options"
+path = "examples/verify_options.rs"
+required-features = ["tokenizer"]
+
+# research tool (round 3, 54_verifier3): the verify-rule options on the parity fixtures' wrong programs; never served
+[[example]]
+name = "verify_stress"
+path = "examples/verify_stress.rs"

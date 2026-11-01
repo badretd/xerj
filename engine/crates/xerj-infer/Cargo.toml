@@ -1,0 +1,29 @@
+[package]
+name = "xerj-infer"
+description = "CPU inference engine for the 17M XERJ-R executor models (rrt memory path, external_executor text path): exact f32 path and int8 SIMD fast path"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+publish = false
+
+[features]
+default = ["tokenizer"]
+# the Hugging Face reference tokenizer (Rust `tokenizers`, same version as the Python reference: 0.22.2). Without it the engine
+# takes token ids from the caller (kernel tests and cross-compiled ISA tests build without it).
+tokenizer = ["dep:tokenizers"]
+# Arm KleidiAI SMMLA micro-kernels (vendored C/asm, Apache-2.0, third_party/kleidiai) for the int8 GEMMs with M >= 16 on
+# FEAT_I8MM CPUs; needs a C compiler. Selected at run time (Kernels::kleidi), the pure-Rust kernels remain available.
+kleidiai = ["dep:cc"]
+
+[dependencies]
+memmap2 = "0.9"
+serde_json = "1"
+tokenizers = { version = "=0.22.2", optional = true, default-features = false, features = ["onig"] }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[[bin]]
+name = "xerj-infer"
+path = "src/bin/xerj-infer.rs"
+required-features = ["tokenizer"]

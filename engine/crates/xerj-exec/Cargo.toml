@@ -1,0 +1,26 @@
+[package]
+name = "xerj-exec"
+description = "XERJ-R connected memory: exact stack-v1/v2 executor, result rendering, verify rule, parity tests and benchmarks"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+
+[dependencies]
+xerj-store = { path = "../xerj-store" }
+xerj-index = { path = "../xerj-index" }
+smallvec = { version = "1.15", features = ["const_generics", "union"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "3"
+
+[[bench]]
+name = "scale"
+harness = false
+
+[[bench]]
+name = "micro"
+harness = false
