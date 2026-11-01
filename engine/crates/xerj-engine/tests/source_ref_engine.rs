@@ -39,7 +39,7 @@ fn stored_text_bytes(dir: &std::path::Path) -> usize {
             let Some(raw) = reader.section(SectionType::Stored).unwrap() else {
                 continue;
             };
-            let bytes = decode_stored_preserving_derived(&raw).unwrap();
+            let bytes = decode_stored_preserving_derived(raw).unwrap();
             let docs: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
             total += docs
                 .iter()
