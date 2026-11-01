@@ -3928,6 +3928,13 @@ where
         // delivery frees one — backpressure, exactly like the per-file code
         // blocking inside its own bulk send.
         let job = loop {
+            // Another worker took the buffer while this one was parked: its
+            // bytes are on their way and there is nothing left to ship here.
+            // With every wire slot busy this is the normal case in sender
+            // mode, and waiting for `take_job` would park forever.
+            if st.buf.len() < self.bulk_cut && st.docs < self.doc_cap {
+                return;
+            }
             if let Some(job) = self.take_job(&mut st) {
                 break job;
             }
@@ -17795,6 +17802,63 @@ mod bulk_pipe_tests {
             returned_at_settle, 2,
             "a settled while one of its bulks was still on the wire"
         );
+    }
+
+    /// Two workers cross the cut while every sender slot is busy. One of them
+    /// takes the buffer; the other must leave `submit` when it wakes, not wait
+    /// for a job that no longer exists.
+    #[test]
+    fn a_worker_parked_on_a_full_wire_leaves_when_another_takes_the_buffer() {
+        let rejected = AtomicU64::new(0);
+        let finished = std::sync::atomic::AtomicBool::new(false);
+        let bodies = Mutex::new(Vec::new());
+        let pipe = BulkPipe::new(
+            {
+                let bodies = &bodies;
+                move |body| {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    bodies.lock().unwrap().push(body);
+                    Ok(outcome())
+                }
+            },
+            64,
+            5000,
+            &rejected,
+            3,
+        );
+        pipe.use_senders(1);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for _ in 0..600 {
+                    if finished.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                eprintln!("a worker stayed parked in submit");
+                std::process::abort();
+            });
+            s.spawn(|| pipe.sender_loop());
+            let workers: Vec<_> = (0..3)
+                .map(|_| {
+                    s.spawn(|| {
+                        let t = pipe.token();
+                        for _ in 0..40 {
+                            pipe.submit(t, vec![b'x'; 100], 1);
+                        }
+                        let settled = pipe.settle(t);
+                        pipe.retire();
+                        settled
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap().expect("accepted");
+            }
+            finished.store(true, Ordering::SeqCst);
+        });
+        let sent: usize = bodies.into_inner().unwrap().iter().map(Vec::len).sum();
+        assert_eq!(sent, 3 * 40 * 100, "every byte was sent once");
     }
 
     /// Sender mode keeps a file's failure sticky: the first of its bulks
