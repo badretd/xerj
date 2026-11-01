@@ -331,7 +331,7 @@ fn match_walk_parity_on_the_elias_fano_ac_codec() {
         dir.path(),
         "seg-e",
         4_000,
-        0x0dd_ba11,
+        0x00dd_ba11,
         xerj_fts::postings::BlockCodec::EliasFanoAc,
     );
     let post = std::fs::read(dir.path().join("seg-e.body.post")).unwrap();
@@ -339,7 +339,7 @@ fn match_walk_parity_on_the_elias_fano_ac_codec() {
     let reader = FtsIndexReader::open(dir.path(), "seg-e", &["body", "title", "tags"]).unwrap();
     assert!(reader.block_index("body").is_some());
     drop(reader);
-    let qs = queries(0xe1a5_f0, 25);
+    let qs = queries(0x00e1_a5f0, 25);
     check(&searcher(dir.path(), "seg-e"), &qs, "ZPS3");
 }
 
@@ -351,11 +351,11 @@ fn match_walk_parity_without_position_counts() {
         dir.path(),
         "seg-n",
         4_000,
-        0x0dd_ba11,
+        0x00dd_ba11,
         xerj_fts::postings::BlockCodec::PackedNoCounts,
     );
     let post = std::fs::read(dir.path().join("seg-n.body.post")).unwrap();
     assert_eq!(&post[..4], b"ZPS4");
-    let qs = queries(0xe1a5_f0, 25);
+    let qs = queries(0x00e1_a5f0, 25);
     check(&searcher(dir.path(), "seg-n"), &qs, "ZPS4");
 }

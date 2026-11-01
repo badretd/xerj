@@ -1083,13 +1083,13 @@ fn attrib(a: &HashMap<String, String>) {
             gaps_all.clear();
             // The group's gaps without its count, and the same split by first or later in the doc.
             let group = |pos: &mut usize,
-                             counts: usize,
-                             gaps: usize,
-                             c: &mut Vec<Class>,
-                             tf: Option<u64>,
-                             st: &mut (u64, u64, u64, u64, u64),
-                             ga: &mut Vec<u32>,
-                             out: &mut Vec<u8>| {
+                         counts: usize,
+                         gaps: usize,
+                         c: &mut Vec<Class>,
+                         tf: Option<u64>,
+                         st: &mut (u64, u64, u64, u64, u64),
+                         ga: &mut Vec<u32>,
+                         out: &mut Vec<u8>| {
                 let s = *pos;
                 let n = vbyte_at(data, pos);
                 c[counts].raw.extend_from_slice(&data[s..*pos]);

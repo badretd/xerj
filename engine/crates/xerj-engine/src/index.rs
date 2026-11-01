@@ -82,6 +82,17 @@ fn transient_read_permit(
     }
 }
 
+/// Postings codec of new segments. This crate's unit tests stay on ZPS2: many
+/// of them assert exact data-directory versions, and the fence for the compact
+/// codecs has its own tests (`tests/post_codec_fence.rs`).
+fn post_block_codec() -> xerj_fts::postings::BlockCodec {
+    if cfg!(test) {
+        xerj_fts::postings::BlockCodec::Packed
+    } else {
+        xerj_fts::postings::default_block_codec()
+    }
+}
+
 /// How long a rayon worker polls a segment's stored-decode flight lock
 /// before decoding on its own (#2427).
 const STORED_FLIGHT_WORKER_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
@@ -17071,7 +17082,8 @@ impl Index {
                             merged_meta.id.as_str(),
                             Arc::clone(&registry_for_task),
                         )
-                        .with_zstd_level(merge_zstd_level);
+                        .with_zstd_level(merge_zstd_level)
+                        .with_block_codec(post_block_codec());
                         for (field_name, cfg) in &field_configs_for_task {
                             fts_writer.configure_field(field_name.clone(), cfg.clone());
                         }
@@ -17110,6 +17122,16 @@ impl Index {
                                             Ordering::Relaxed,
                                         );
                                         fts_writer.add_documents_parallel(&fts_input)
+                                    }
+                                }
+                                if post_block_codec() != xerj_fts::postings::BlockCodec::Packed {
+                                    if let Err(e) = store_for_task.ensure_compact_codecs_format() {
+                                        return degrade_fts_publish(
+                                            &segments_dir_for_task,
+                                            merged_meta.id.as_str(),
+                                            &format!("{e:#}"),
+                                        )
+                                        .map_err(|error| error.to_string());
                                     }
                                 }
                                 if fts_writer
@@ -40389,7 +40411,8 @@ async fn do_flush_shard(
                     &segments_dir,
                     meta.id.as_str(),
                     Arc::clone(&registry_for_build),
-                );
+                )
+                .with_block_codec(post_block_codec());
                 for (field_name, cfg) in &field_configs {
                     fts_writer.configure_field(field_name.clone(), cfg.clone());
                 }
@@ -40402,6 +40425,9 @@ async fn do_flush_shard(
                 // documents uncommitted: a retry then writes the marker and
                 // the encoded side-cars. Publishing a no-FTS segment here
                 // would clear the memtable and skip that recovery.
+                if post_block_codec() != xerj_fts::postings::BlockCodec::Packed {
+                    store_for_warm.ensure_compact_codecs_format()?;
+                }
                 let case_distinguished =
                     fts_writer.uses_case_distinguished_field_filename_components();
                 let encoded =

@@ -783,6 +783,24 @@ pub enum BlockCodec {
     PackedNoCounts,
 }
 
+/// The codec a new segment's postings use: ZPS4, or ZPS2 with
+/// `XERJ_FTS_POST_CODEC=packed` (read once). A writer that gets anything but
+/// [`BlockCodec::Packed`] must pass the data-directory compact-codecs fence.
+pub fn default_block_codec() -> BlockCodec {
+    static CODEC: std::sync::OnceLock<BlockCodec> = std::sync::OnceLock::new();
+    *CODEC.get_or_init(|| {
+        match std::env::var("XERJ_FTS_POST_CODEC")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "packed" | "zps2" => BlockCodec::Packed,
+            _ => BlockCodec::PackedNoCounts,
+        }
+    })
+}
+
 /// Doc ids of one full block (absolute), any codec. `prev_last` is the
 /// previous block's last doc (0 before the first block).
 #[inline]
@@ -1948,9 +1966,7 @@ impl<'a> BlockCursor<'a> {
             PostCodec::V1 => !has_positions,
             PostCodec::V2 { freq_omitted }
             | PostCodec::V3 { freq_omitted }
-            | PostCodec::V4 { freq_omitted } => {
-                freq_omitted || !has_positions
-            }
+            | PostCodec::V4 { freq_omitted } => freq_omitted || !has_positions,
         };
         // an index entry that does not describe this list is ignored
         let blocks = blocks.filter(|b| {
@@ -3430,14 +3446,8 @@ mod tests {
                 case += 1;
                 let (packed, pblocks, expected, df, ttf) =
                     indexed_list_with(n, positions, tf_one, case, &norm_of, BlockCodec::Packed);
-                let (efac, eblocks, expected2, _, _) = indexed_list_with(
-                    n,
-                    positions,
-                    tf_one,
-                    case,
-                    &norm_of,
-                    block_codec,
-                );
+                let (efac, eblocks, expected2, _, _) =
+                    indexed_list_with(n, positions, tf_one, case, &norm_of, block_codec);
                 assert_eq!(expected, expected2);
                 assert_eq!(
                     pblocks.as_ref().map(|b| &b.last_doc),
