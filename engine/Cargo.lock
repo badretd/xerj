@@ -7620,6 +7620,7 @@ dependencies = [
  "xerj-compress",
  "xerj-fts",
  "xerj-logs",
+ "xerj-pagedir",
  "xerj-query",
  "xerj-storage",
  "xerj-vector",

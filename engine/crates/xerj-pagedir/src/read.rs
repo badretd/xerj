@@ -1,9 +1,8 @@
 //! Read side: locate, read, check.
 use crate::bits::{Bits, SAMPLE};
 use crate::format::{
-    mtime_ns, read_full_at, source_identity, Header, F_ARTICLES, F_ENDS_NL, F_MTIME, KEY_MAX, MAGIC,
-    SECTION,
-    TAIL,
+    mtime_ns, read_full_at, source_identity, Header, F_ARTICLES, F_ENDS_NL, F_MTIME, KEY_MAX,
+    MAGIC, SECTION, TAIL,
 };
 use crate::{Error, Result};
 use memchr::{memchr, memchr_iter, memrchr};
@@ -338,7 +337,10 @@ impl PageDir {
             return Err(stale());
         }
         let before = memchr_iter(b'\n', &buf[..at]).count() as u64;
-        let body = buf.len().min(self.header.page_size as usize).saturating_sub(1);
+        let body = buf
+            .len()
+            .min(self.header.page_size as usize)
+            .saturating_sub(1);
         let interior = memchr_iter(b'\n', &buf[..body]).count() as u64;
         // Byte 0 starts a record exactly when the page holds one record more than its interior
         // newlines announce.
@@ -450,7 +452,13 @@ impl PageDir {
     }
 
     /// Records from `data`, which starts at a record start, reading on page by page.
-    fn collect(&self, f: &File, mut data: Vec<u8>, mut off: u64, count: u64) -> Result<Vec<Vec<u8>>> {
+    fn collect(
+        &self,
+        f: &File,
+        mut data: Vec<u8>,
+        mut off: u64,
+        count: u64,
+    ) -> Result<Vec<Vec<u8>>> {
         let pg = self.header.page_size as usize;
         let mut recs = Vec::new();
         let mut cur = 0usize;
@@ -477,7 +485,9 @@ impl PageDir {
             off += got as u64;
         }
         if (recs.len() as u64) < count {
-            return Err(Error::Stale("the file ended before the expected records".into()));
+            return Err(Error::Stale(
+                "the file ended before the expected records".into(),
+            ));
         }
         Ok(recs)
     }
@@ -563,7 +573,13 @@ impl PageDir {
     }
 
     /// All passages of article `a`, every line checked against `<key>#<0, 1, 2, ...>`.
-    pub fn read_article(&self, f: &File, a: u64, key: &str, opts: ReadOptions) -> Result<Vec<Vec<u8>>> {
+    pub fn read_article(
+        &self,
+        f: &File,
+        a: u64,
+        key: &str,
+        opts: ReadOptions,
+    ) -> Result<Vec<Vec<u8>>> {
         let (first, m) = self.article_passages(a)?;
         let loc = self.locate(first)?;
         let buf = self.read_page(f, loc, opts.prefetch)?;
@@ -598,8 +614,9 @@ impl PageDir {
             .collect();
         let mut keys = Vec::with_capacity(starts.len());
         for &s in &starts {
-            let k = jsonl_id_key(prefix(s))
-                .ok_or_else(|| Error::Stale("a line in the page does not begin like a record".into()))?;
+            let k = jsonl_id_key(prefix(s)).ok_or_else(|| {
+                Error::Stale("a line in the page does not begin like a record".into())
+            })?;
             keys.push(k);
         }
         let mut heads: Vec<usize> = (1..starts.len())
@@ -610,11 +627,17 @@ impl PageDir {
         let k0 = jsonl_id_key(prefix(0));
         if starts.is_empty() {
             if loc.count != 1 || k0.is_none() {
-                return Err(Error::Stale("article start page without a record start".into()));
+                return Err(Error::Stale(
+                    "article start page without a record start".into(),
+                ));
             }
             heads = vec![0];
         } else if rem == 1 {
-            let at = if k0.is_some() && k0 == Some(keys[0]) { 0 } else { starts[0] };
+            let at = if k0.is_some() && k0 == Some(keys[0]) {
+                0
+            } else {
+                starts[0]
+            };
             heads.insert(0, at);
         } else if rem == 2 {
             if k0.is_none() {
@@ -629,9 +652,9 @@ impl PageDir {
                 loc.count
             )));
         }
-        let s0 = *heads
-            .get(loc.rank as usize)
-            .ok_or_else(|| Error::Stale("article rank beyond the article starts in the page".into()))?;
+        let s0 = *heads.get(loc.rank as usize).ok_or_else(|| {
+            Error::Stale("article rank beyond the article starts in the page".into())
+        })?;
         let count = self.article_passages(a)?.1;
         let off = base + buf.len() as u64;
         let lines = self.collect(f, buf[s0..].to_vec(), off, count)?;

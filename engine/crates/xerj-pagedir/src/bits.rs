@@ -287,6 +287,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn queries_match_a_plain_scan() {
         let mut rng = StdRng::seed_from_u64(7);
         for density in [0.02, 0.5, 0.98] {

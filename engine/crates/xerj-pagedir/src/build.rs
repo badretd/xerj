@@ -81,9 +81,7 @@ pub fn build(source: &Path, out: &Path, opts: BuildOptions) -> Result<BuildInfo>
                 break;
             }
             let p = (pos >> shift) as usize;
-            let slot = pcount
-                .get_mut(p)
-                .ok_or(Error::ChangedDuringBuild)?;
+            let slot = pcount.get_mut(p).ok_or(Error::ChangedDuringBuild)?;
             *slot += 1;
             if with_articles {
                 let k = jsonl_id_key(&line).ok_or(Error::NoArticleKey {
@@ -193,7 +191,10 @@ pub fn build(source: &Path, out: &Path, opts: BuildOptions) -> Result<BuildInfo>
         .iter()
         .map(|s| {
             let name = s.name.iter().take_while(|&&c| c != 0).copied().collect();
-            (String::from_utf8(name).expect("ASCII"), s.payload.len() as u64)
+            (
+                String::from_utf8(name).expect("ASCII"),
+                s.payload.len() as u64,
+            )
         })
         .collect();
     let header = Header {

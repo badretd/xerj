@@ -33,9 +33,6 @@ pub const REF_FIELD: &str = "__xerj_source_ref__";
 pub const ERROR_FIELD: &str = "__xerj_source_ref_error__";
 const STRIPPED_KEY: &str = "s";
 
-/// Bytes of a stripped row's marker in canonical JSON.
-pub(super) const MARKER_BYTES: &[u8] = br#""__xerj_source_ref__""#;
-
 fn root_slot() -> &'static RwLock<Option<PathBuf>> {
     static ROOT: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -146,13 +143,13 @@ pub fn strip_source(source: &Value) -> Option<Value> {
     }
     let line = read_line(reference).ok()?;
     let names: Vec<&str> = fields(reference).collect();
-    let same = |name: &&str| {
+    let same = |name: &str| {
         matches!(
-            (obj.get(*name), line.get(*name)),
+            (obj.get(name), line.get(name)),
             (Some(a @ Value::String(_)), Some(b)) if a == b
         )
     };
-    if names.is_empty() || !names.iter().all(|name| same(name)) {
+    if names.is_empty() || !names.iter().copied().all(same) {
         return None;
     }
     let mut out = obj.clone();
@@ -276,7 +273,12 @@ mod tests {
         set_root(None);
         let kept = encode_stored_v2(&json);
         set_root(Some(f.tmp.path().to_owned()));
-        assert!(stripped.len() < kept.len(), "{} vs {}", stripped.len(), kept.len());
+        assert!(
+            stripped.len() < kept.len(),
+            "{} vs {}",
+            stripped.len(),
+            kept.len()
+        );
         // The rewrite path keeps the row stripped without opening the file.
         std::fs::remove_file(&f.file).unwrap();
         set_root(Some(f.tmp.path().to_owned()));
@@ -314,7 +316,10 @@ mod tests {
             let source = &b["_source"];
             if source.get(ERROR_FIELD).is_some() {
                 assert_eq!(source["text"], "");
-                assert!(source[ERROR_FIELD].as_str().unwrap().starts_with("stale file"));
+                assert!(source[ERROR_FIELD]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("stale file"));
             } else {
                 assert_eq!(source["text"], want["text"], "row {i}");
             }
@@ -327,7 +332,8 @@ mod tests {
         let f = fixture(300);
         // Wrong hash, a value that differs from the line, an unknown directory, a name that tries
         // to leave the root.
-        let cases: Vec<Box<dyn Fn(&mut Value)>> = vec![
+        type Edit = Box<dyn Fn(&mut Value)>;
+        let cases: Vec<Edit> = vec![
             Box::new(|d| d["_source"][REF_FIELD]["h"] = json!("0000000000000000")),
             Box::new(|d| d["_source"]["text"] = json!("not the line")),
             Box::new(|d| d["_source"][REF_FIELD]["dir"] = json!("nope")),
@@ -343,7 +349,8 @@ mod tests {
                 .collect();
             let json = serde_json::to_vec(&docs).unwrap();
             let section = encode_stored_v2(&json);
-            let back: Vec<Value> = serde_json::from_slice(&decode_stored(&section).unwrap()).unwrap();
+            let back: Vec<Value> =
+                serde_json::from_slice(&decode_stored(&section).unwrap()).unwrap();
             for (b, d) in back.iter().zip(&docs) {
                 assert_eq!(b["_source"]["text"], d["_source"]["text"]);
             }

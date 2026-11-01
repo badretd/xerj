@@ -90,8 +90,8 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 
 pub mod derived_vectors;
-pub mod source_ref;
 mod row_hydration;
+pub mod source_ref;
 pub use row_hydration::{
     decode_stored_v2_ids, decode_stored_v2_row_for_get, decode_stored_v2_rows,
     decode_stored_v2_rows_controlled, decode_stored_v2_rows_projected,

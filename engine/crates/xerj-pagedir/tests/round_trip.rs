@@ -170,7 +170,13 @@ fn edge_files() {
         })
         .collect();
     assert!(aligned.iter().all(|x| x.len() == 64));
-    check(t.path(), "aligned", &aligned, &[16, 32, 64, 128, 4096], false);
+    check(
+        t.path(),
+        "aligned",
+        &aligned,
+        &[16, 32, 64, 128, 4096],
+        false,
+    );
     // Records of several pages: long runs of zeros in the passage bitvector.
     let big = gen_random(&mut rng, 60, &[(9000, 40000)]);
     check(t.path(), "big", &big, &[16, 4096, 65536], false);
@@ -205,7 +211,13 @@ fn a_line_without_a_key_stops_an_article_build() {
     fs::write(&p, b"{\"id\": \"1#0\"}\nplain text\n").unwrap();
     let out = t.path().join("x.pgdir");
     let e = build(&p, &out, BuildOptions::default()).unwrap_err();
-    assert!(matches!(e, Error::NoArticleKey { record: 1, offset: 14 }));
+    assert!(matches!(
+        e,
+        Error::NoArticleKey {
+            record: 1,
+            offset: 14
+        }
+    ));
     assert!(!out.exists());
     let opts = BuildOptions {
         article_key: ArticleKey::None,
@@ -306,7 +318,10 @@ fn an_edited_file_gives_errors_never_wrong_text() {
         assert_eq!(wrong, 0, "insert {ins} at {frac}");
         assert!(stale > 0);
     }
-    assert!(wrong_without_check > 0, "the check must have something to catch");
+    assert!(
+        wrong_without_check > 0,
+        "the check must have something to catch"
+    );
 
     // The same-size edit: size and the hashes of the first and last MiB are unchanged, so nothing
     // but the per-read check can see it. The file must exceed 2 MiB for this to hold.
@@ -331,8 +346,12 @@ fn an_edited_file_gives_errors_never_wrong_text() {
     assert_eq!(e.len(), data.len());
     fs::write(&p, &e).unwrap();
     let f = File::open(&p).unwrap();
-    d.check_source(&f).expect("this edit passes the identity check");
-    assert!(sweep(&d, &f, &big, Check::None).2 > 0, "unchecked reads go wrong");
+    d.check_source(&f)
+        .expect("this edit passes the identity check");
+    assert!(
+        sweep(&d, &f, &big, Check::None).2 > 0,
+        "unchecked reads go wrong"
+    );
     let (_, stale, wrong) = sweep(&d, &f, &big, Check::Id);
     assert!(wrong <= 2, "{wrong}");
     assert!(stale > 0);
