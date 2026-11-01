@@ -12,6 +12,7 @@ members = [
     "crates/xerj-api",
     "crates/xerj-ai",
     "crates/xerj-compress",
+    "crates/xerj-pagedir",
     "crates/xerj-engine",
     "crates/xerj-mcp",
     "crates/xerj-wasm",

@@ -15,6 +15,7 @@ facts = []
 [dependencies]
 # The machine-resource policy (cores, memory safe zone, thread priority) is
 # shared with the server: one policy, one place (#240).
+xerj-pagedir = { path = "../xerj-pagedir" }
 xerj-common = { path = "../xerj-common" }
 # Session exports use the same native PII redactor as ingest pipelines.
 xerj-wasm = { path = "../xerj-wasm" }

@@ -1184,7 +1184,11 @@ where
     // #1122/#2433: a row whose derived semantic vectors were stripped gets
     // them rebuilt from its text when the projection wants them, so decode
     // every column for it and trim back to the projection afterwards.
-    let wants_derived = {
+    let has_source_ref = directory
+        .columns
+        .iter()
+        .any(|column| column.name == source_ref::REF_FIELD);
+    let wants_derived = has_source_ref || {
         let mut targets = directory
             .columns
             .iter()
@@ -1314,6 +1318,7 @@ where
             }
         }
         if wants_derived {
+            source_ref::rehydrate_source_map(&mut source);
             derived_vectors::rehydrate_source_map(&mut source);
             if let Some(allowed) = allowed.as_ref() {
                 source.retain(|name, _| allowed.contains(name));

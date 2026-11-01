@@ -89,6 +89,7 @@ refresh-test-hook = []
 lock-test-hook = []
 
 [dev-dependencies]
+xerj-pagedir = { path = "../xerj-pagedir" }
 xerj-storage = { path = "../xerj-storage", features = ["test-hooks"] }
 # `raw-api` exposes `DashMap::shards()`, which is the only way to assert what
 # #873 fixed: that a per-index cache's shard array is capped rather than sized

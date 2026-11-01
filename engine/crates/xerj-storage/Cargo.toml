@@ -11,6 +11,7 @@ default = []
 test-hooks = []
 
 [dependencies]
+xerj-pagedir = { path = "../xerj-pagedir" }
 xerj-common = { path = "../xerj-common" }
 # Default features only (no candle/ort): the lexical semantic_text recipe the
 # stored codec uses to regenerate derived vectors (#1122, #2433).

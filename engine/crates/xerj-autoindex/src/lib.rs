@@ -54,6 +54,7 @@ pub mod sessions;
 pub mod skills;
 pub mod sniff;
 pub mod source;
+mod source_ref;
 mod stage;
 pub mod staleness;
 pub mod state;
@@ -3477,6 +3478,25 @@ static PHASE_B_START_HOOK: Mutex<Option<PhaseBStartHook>> = Mutex::new(None);
 pub(crate) fn arm_phase_b_start_hook(state_dir: &Path, action: impl FnOnce() + Send + 'static) {
     *PHASE_B_START_HOOK.lock().unwrap_or_else(|p| p.into_inner()) =
         Some((state_dir.to_path_buf(), Box::new(action)));
+}
+
+/// A JSONL file's page directory when references are on (see [`source_ref`]). A failure leaves the
+/// file's text in the index, which is always correct.
+fn source_ref_for(path: &Path, family: Family, gzip: bool) -> Option<source_ref::Prepared> {
+    if family != Family::Jsonl || gzip {
+        return None;
+    }
+    let root = source_ref::root_from_env()?;
+    match source_ref::Prepared::open(&root, path) {
+        Ok(prepared) => Some(prepared),
+        Err(error) => {
+            eprintln!(
+                "xerj: no page directory for {}, keeping its text in the index: {error:#}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -11820,6 +11840,7 @@ fn run_index_report_inner(
             // the staged records are sent, below).
             let read_position = extract::ReadPosition::new();
             let split = extract_percent(sn.family);
+            let source_ref_file = source_ref_for(&f.path, sn.family, sn.gzip);
             {
                 let mut sink = |rec: extract::RawRecord| -> bool {
                     let Some(slug) = asg.get(&rec.group).or_else(|| asg.get(&None)) else {
@@ -11885,6 +11906,13 @@ fn run_index_report_inner(
                     // `_source` include of path/start_line/end_line locates
                     // the record that gets indexed.
                     align_hit_locators(&mut fields, &f.rel);
+                    if let Some(file) = source_ref_file.as_ref() {
+                        if let Some(offset) = rec.locator.strip_prefix('b') {
+                            if let Ok(offset) = offset.parse() {
+                                file.attach(&mut fields, offset);
+                            }
+                        }
+                    }
                     // `--label` (#1062): decide the record BEFORE it is
                     // staged — after coerce, which would drop fields
                     // the plan does not describe, and before the bulk
