@@ -7,7 +7,7 @@
 set -u
 TAG=${1:-main}
 HERE=$(cd "$(dirname "$0")" && pwd); PROD=$(cd "$HERE/../.." && pwd); MEM=$(cd "$PROD/../xerj_mem" && pwd)
-MVP=${MVP:?the research tree}
+MVP=${MVP:?set MVP to the research tree}
 RUN_HOST=${RUN_HOST:?ssh host that runs the tests}; BUILD_HOST=${BUILD_HOST:?ssh host that builds}; CPUS=${CPUS:-12-19}
 BASE='xerj-extractor/engine_e2e1'; RD=$BASE/e2e/$TAG
 MODEL=${MODEL:-xerj-extractor/engine_e2e1/s1/export/x68_cC_s29}
