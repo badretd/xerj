@@ -17423,8 +17423,8 @@ impl Index {
         doc_as_upsert: bool,
     ) -> Result<Option<IndexResponse>> {
         let publication_guard = self.write_publication.lock(id.to_string()).await;
-        match self.get_document(id).await? {
-            Some(existing) => {
+        match self.get_document_for_update(id).await? {
+            Some((existing, stored)) => {
                 // Document exists — merge partial_doc on top.
                 let merged = if let Some(patch) = partial_doc {
                     match &existing {
@@ -17459,13 +17459,16 @@ impl Index {
                         result: "noop".to_string(),
                     }));
                 }
+                let (merged, embeddings_prepared) = self
+                    .prepare_semantic_update(stored.as_ref(), Some(&existing), merged)
+                    .await?;
                 let resp = self
                     .index_document_with_version_inner_guarded(
                         Some(id.to_string()),
                         merged,
                         None,
                         None,
-                        false,
+                        embeddings_prepared,
                         Some(publication_guard),
                         false,
                         None,
@@ -17550,13 +17553,21 @@ impl Index {
         F: FnOnce(Value) -> std::result::Result<Value, E>,
     {
         let publication_guard = self.write_publication.lock(id.to_string()).await;
-        let (source, created) = match self.get_document(id).await? {
-            Some(existing) => match transform(existing) {
-                Ok(transformed) => (transformed, false),
-                Err(error) => return Ok(Err(error)),
-            },
+        let (source, created, embeddings_prepared) = match self.get_document_for_update(id).await? {
+            Some((existing, stored)) => {
+                let base = stored.as_ref().map(|_| existing.clone());
+                match transform(existing) {
+                    Ok(transformed) => {
+                        let (source, prepared) = self
+                            .prepare_semantic_update(stored.as_ref(), base.as_ref(), transformed)
+                            .await?;
+                        (source, false, prepared)
+                    }
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
             None => match upsert {
-                Some(source) => (source, true),
+                Some(source) => (source, true, false),
                 None => return Ok(Ok(None)),
             },
         };
@@ -17566,7 +17577,7 @@ impl Index {
                 source,
                 None,
                 None,
-                false,
+                embeddings_prepared,
                 Some(publication_guard),
                 false,
                 None,
@@ -22708,6 +22719,17 @@ impl Index {
     /// reflects the true ES `get.total` counter (which includes
     /// missing + exists).
     pub async fn get_document(&self, id: &str) -> Result<Option<Value>> {
+        self.get_document_view(id, true).await
+    }
+
+    /// [`Self::get_document`] with the choice of view. `client_view == true`
+    /// is what GET answers: XERJ's internal passage metadata stripped and
+    /// packed embeddings expanded to number arrays. `false` is the source as
+    /// stored, for a read-modify-write that has to tell generated semantic
+    /// companions (stored with their passage offsets) from caller-supplied
+    /// ones and must be able to keep them byte-identical. Admission, retry and
+    /// GET metrics are the same for both.
+    async fn get_document_view(&self, id: &str, client_view: bool) -> Result<Option<Value>> {
         use crate::collection_publication::ReadAdmission;
 
         let get_started = std::time::Instant::now();
@@ -22732,11 +22754,10 @@ impl Index {
                 ReadAdmission::WriterActive => continue,
             }
         };
-        if let Ok(Some(source)) = &mut res {
-            strip_internal_passage_metadata(source);
-            // The stored source keeps embeddings packed (#1940). GET returns
-            // the number array callers already see.
-            xerj_common::packed_f32::expand_packed_f32_values(source);
+        if client_view {
+            if let Ok(Some(source)) = &mut res {
+                client_source_view_in_place(source);
+            }
         }
         match &res {
             Ok(Some(_)) => {
@@ -23135,6 +23156,119 @@ impl Index {
         })
     }
 
+    /// `(field, target)` of every `semantic_text` field: the field whose text
+    /// is embedded and the companion its pooled vector is stored under
+    /// (`<target>_chunks` and the passage offsets derive from `target`). The
+    /// same derivation as [`Self::apply_semantic_embeddings_batch`].
+    async fn semantic_field_targets(&self) -> Vec<(String, String)> {
+        let schema = self.schema.read().await;
+        schema
+            .schema
+            .fields
+            .iter()
+            .filter_map(|fc| {
+                fc.embedding.as_ref().map(|emb| {
+                    let target = emb
+                        .target_field
+                        .clone()
+                        .unwrap_or_else(|| format!("{}_vector", fc.name));
+                    (fc.name.clone(), target)
+                })
+            })
+            .collect()
+    }
+
+    /// The current document for a read-modify-write update: the GET view the
+    /// update merges into or hands to a script, and, on an index with
+    /// `semantic_text` fields, the source as stored, which
+    /// [`Self::prepare_semantic_update`] needs. One read either way.
+    async fn get_document_for_update(&self, id: &str) -> Result<Option<(Value, Option<Value>)>> {
+        if self.semantic_field_targets().await.is_empty() {
+            return Ok(self.get_document(id).await?.map(|view| (view, None)));
+        }
+        Ok(self
+            .get_document_view(id, false)
+            .await?
+            .map(|stored| (client_source_view(&stored), Some(stored))))
+    }
+
+    /// The source a read-modify-write update indexes, and whether its
+    /// semantic embeddings are already prepared.
+    ///
+    /// `stored` is the document as stored and `base` the GET view the update
+    /// started from (both `None` on an index without `semantic_text` fields:
+    /// `updated` is indexed as is, as before). Each semantic field follows
+    /// [`plan_semantic_update`]: kept fields get their stored companions back
+    /// byte-identical, passage offsets included; re-embedded fields lose
+    /// their stale companions and are embedded like a fresh index of the
+    /// document; everything else is embedded exactly as an index would. Only
+    /// the non-kept fields reach the embedder, so a kept field costs nothing
+    /// and is never refused as a caller-supplied vector.
+    async fn prepare_semantic_update(
+        &self,
+        stored: Option<&Value>,
+        base: Option<&Value>,
+        mut updated: Value,
+    ) -> Result<(Value, bool)> {
+        let (Some(stored), Some(base)) = (
+            stored.and_then(Value::as_object),
+            base.and_then(Value::as_object),
+        ) else {
+            return Ok((updated, false));
+        };
+        let specs = self.semantic_field_targets().await;
+        if specs.is_empty() || !updated.is_object() {
+            return Ok((updated, false));
+        }
+        let lexical = !self.embedder.read().await.is_active();
+        let actions = match updated.as_object() {
+            Some(updated_obj) => plan_semantic_update(&specs, lexical, stored, base, updated_obj),
+            None => Vec::new(),
+        };
+        let mut working = updated.clone();
+        if let Some(working_obj) = working.as_object_mut() {
+            for ((field, target), action) in specs.iter().zip(&actions) {
+                match action {
+                    SemanticUpdateAction::Keep => {
+                        working_obj.shift_remove(field);
+                        working_obj.shift_remove(target);
+                        working_obj.shift_remove(&format!("{target}_chunks"));
+                    }
+                    SemanticUpdateAction::Reembed => {
+                        working_obj.shift_remove(target);
+                        working_obj.shift_remove(&format!("{target}_chunks"));
+                    }
+                    SemanticUpdateAction::AsIndexed => {}
+                }
+            }
+        }
+        let embedded = self.apply_semantic_embeddings(working).await?;
+        if let (Some(out), Some(embedded)) = (updated.as_object_mut(), embedded.as_object()) {
+            for ((_, target), action) in specs.iter().zip(&actions) {
+                let from = if *action == SemanticUpdateAction::Keep {
+                    stored
+                } else {
+                    embedded
+                };
+                for key in [
+                    target.clone(),
+                    format!("{target}_chunks"),
+                    passage_metadata_field(target),
+                ] {
+                    match from.get(&key) {
+                        Some(value) => {
+                            out.insert(key, value.clone());
+                        }
+                        None => {
+                            out.shift_remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+        Ok((updated, true))
+    }
+
     /// Update a document by merging a partial document into the existing source.
     ///
     /// Fetches the current document, merges the provided `partial_doc` fields
@@ -23147,10 +23281,11 @@ impl Index {
     ) -> Result<Option<IndexResponse>> {
         let publication_guard = self.write_publication.lock(id.to_string()).await;
         // Fetch existing document source.
-        let existing = match self.get_document(id).await? {
-            Some(src) => src,
+        let (existing, stored) = match self.get_document_for_update(id).await? {
+            Some(found) => found,
             None => return Ok(None),
         };
+        let base = stored.as_ref().map(|_| existing.clone());
 
         // Merge: start from existing, overlay partial_doc fields.
         let merged = match existing {
@@ -23172,6 +23307,9 @@ impl Index {
             }
         };
 
+        let (merged, embeddings_prepared) = self
+            .prepare_semantic_update(stored.as_ref(), base.as_ref(), merged)
+            .await?;
         // Re-index with the same ID (upsert-style).
         let resp = self
             .index_document_with_version_inner_guarded(
@@ -23179,7 +23317,7 @@ impl Index {
                 merged,
                 None,
                 None,
-                false,
+                embeddings_prepared,
                 Some(publication_guard),
                 false,
                 None,
@@ -46010,6 +46148,189 @@ fn passage_chunk_fields_from_schema(schema: &Schema) -> HashSet<String> {
 
 fn passage_metadata_field(target: &str) -> String {
     format!("{PASSAGE_METADATA_PREFIX}{target}")
+}
+
+/// What GET answers for a stored source: XERJ's internal passage metadata
+/// stripped, and the packed embeddings the stored source keeps (#1940)
+/// expanded to the number arrays callers see.
+fn client_source_view_in_place(source: &mut Value) {
+    strip_internal_passage_metadata(source);
+    xerj_common::packed_f32::expand_packed_f32_values(source);
+}
+
+/// [`client_source_view_in_place`] on a copy of `stored`.
+fn client_source_view(stored: &Value) -> Value {
+    let mut view = stored.clone();
+    client_source_view_in_place(&mut view);
+    view
+}
+
+/// What a read-modify-write update does with one `semantic_text` field's
+/// derived companions: the pooled vector `<target>`, `<target>_chunks` and
+/// the passage offsets stored with generated vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticUpdateAction {
+    /// Keep the stored companions byte-identical: the text is unchanged, or
+    /// the vectors are caller-supplied on a non-lexical embedder.
+    Keep,
+    /// The text changed under companions the update only read back: drop
+    /// them so the write embeds the new text, as indexing the document does.
+    Reembed,
+    /// Treat the field exactly as an index of the updated document would:
+    /// the update wrote or removed the companions itself, or there were none.
+    AsIndexed,
+}
+
+/// Decide, for each semantic field `(field, target)` in `specs`, what an
+/// update that turned `base` (the GET view the update read) into `updated`
+/// does with the companions of `stored` (the same document as stored).
+///
+/// The update read the companions back with the text, so they reach the
+/// write looking caller-supplied; the embedding step skips a field whose
+/// `<target>` is present, and would keep the OLD text's vectors for the NEW
+/// text. Generated companions (stored with their passage offsets) are
+/// stale when the text changes, and so is anything under the lexical
+/// embedder, which derives its vectors from the text alone. Vectors a caller
+/// supplied under another embedder carry no offsets; they stay the caller's.
+fn plan_semantic_update(
+    specs: &[(String, String)],
+    lexical: bool,
+    stored: &serde_json::Map<String, Value>,
+    base: &serde_json::Map<String, Value>,
+    updated: &serde_json::Map<String, Value>,
+) -> Vec<SemanticUpdateAction> {
+    specs
+        .iter()
+        .map(|(field, target)| {
+            let chunks = format!("{target}_chunks");
+            if !base.contains_key(target) && !base.contains_key(&chunks) {
+                return SemanticUpdateAction::AsIndexed;
+            }
+            let companions_untouched = updated.get(target) == base.get(target)
+                && updated.get(&chunks) == base.get(&chunks);
+            if !companions_untouched {
+                return SemanticUpdateAction::AsIndexed;
+            }
+            if updated.get(field) == base.get(field) {
+                return SemanticUpdateAction::Keep;
+            }
+            if lexical || stored.contains_key(&passage_metadata_field(target)) {
+                SemanticUpdateAction::Reembed
+            } else {
+                SemanticUpdateAction::Keep
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod semantic_update_plan_tests {
+    use super::{plan_semantic_update, SemanticUpdateAction as A};
+    use serde_json::{json, Map, Value};
+
+    fn obj(value: Value) -> Map<String, Value> {
+        value.as_object().cloned().expect("object")
+    }
+
+    fn specs() -> Vec<(String, String)> {
+        vec![("sem".to_string(), "sem_vector".to_string())]
+    }
+
+    /// `(stored, base)` of a document whose `sem` holds `text`, with
+    /// companions; `generated` ones carry their passage offsets.
+    fn doc(text: &str, generated: bool) -> (Map<String, Value>, Map<String, Value>) {
+        let base = json!({
+            "sem": text,
+            "tag": "x",
+            "sem_vector": [0.25, 0.5],
+            "sem_vector_chunks": [[0.25, 0.5], [0.5, 0.25]]
+        });
+        let mut stored = base.clone();
+        if generated {
+            stored["__xerj_passage_meta__sem_vector"] =
+                json!({"field": "sem", "chunks": [[0, 4], [2, 6]]});
+        }
+        (obj(stored), obj(base))
+    }
+
+    fn plan(lexical: bool, generated: bool, edit: impl FnOnce(&mut Value)) -> A {
+        let (stored, base) = doc("old text", generated);
+        let mut updated = Value::Object(base.clone());
+        edit(&mut updated);
+        plan_semantic_update(&specs(), lexical, &stored, &base, &obj(updated))[0]
+    }
+
+    #[test]
+    fn changed_text_reembeds_generated_vectors_under_any_embedder() {
+        let edit = |doc: &mut Value| doc["sem"] = json!("new text");
+        assert_eq!(plan(true, true, edit), A::Reembed);
+        assert_eq!(plan(false, true, edit), A::Reembed);
+    }
+
+    #[test]
+    fn changed_text_reembeds_lexical_vectors_that_carry_no_offsets() {
+        // The lexical embedder derives its vectors from the text alone, so
+        // vectors that came in with the document (a reindex or clone copies
+        // them without offsets) are stale too.
+        assert_eq!(
+            plan(true, false, |doc| doc["sem"] = json!("new text")),
+            A::Reembed
+        );
+    }
+
+    #[test]
+    fn caller_supplied_vectors_under_a_non_lexical_embedder_are_left_alone() {
+        assert_eq!(
+            plan(false, false, |doc| doc["sem"] = json!("new text")),
+            A::Keep
+        );
+    }
+
+    #[test]
+    fn unchanged_text_keeps_the_stored_companions() {
+        for (lexical, generated) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_eq!(
+                plan(lexical, generated, |doc| doc["tag"] = json!("y")),
+                A::Keep,
+                "lexical={lexical} generated={generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_text_drops_stale_generated_vectors() {
+        let edit = |doc: &mut Value| {
+            doc.as_object_mut().unwrap().remove("sem");
+        };
+        assert_eq!(plan(true, true, edit), A::Reembed);
+    }
+
+    #[test]
+    fn companions_the_update_wrote_are_indexed_as_written() {
+        assert_eq!(
+            plan(true, true, |doc| {
+                doc["sem"] = json!("new text");
+                doc["sem_vector"] = json!([1.0, 0.0]);
+            }),
+            A::AsIndexed
+        );
+        assert_eq!(
+            plan(true, true, |doc| {
+                doc.as_object_mut().unwrap().remove("sem_vector_chunks");
+            }),
+            A::AsIndexed
+        );
+    }
+
+    #[test]
+    fn a_document_without_companions_is_embedded_as_indexed() {
+        let stored = obj(json!({"sem": "old text"}));
+        let updated = obj(json!({"sem": "new text"}));
+        assert_eq!(
+            plan_semantic_update(&specs(), true, &stored, &stored, &updated),
+            vec![A::AsIndexed]
+        );
+    }
 }
 
 fn choose_passage_winner(best: &mut Option<(f32, u32)>, score: f32, ordinal: u32) {
