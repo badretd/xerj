@@ -3676,7 +3676,17 @@ struct PipeState {
     /// are coming" signal that flushes a residual buffer.
     parked_workers: usize,
     /// Bulk bodies currently on the wire. Capped at [`MAX_IN_FLIGHT`].
+    /// In sender mode it also counts the jobs queued for a sender.
     in_flight: usize,
+    /// Jobs detached from the buffer and waiting for a sender thread
+    /// (sender mode only; see [`BulkPipe::use_senders`]).
+    queue: std::collections::VecDeque<PipeJob>,
+    /// Sender threads serving `queue`; 0 = the inline mode, where the worker
+    /// that detaches a job sends it itself.
+    senders: usize,
+    /// Set once no worker can add bytes any more: senders drain `queue` and
+    /// exit.
+    closing: bool,
 }
 
 /// How many bulk bodies may be on the wire at once. 8 matches the server
@@ -3686,6 +3696,51 @@ struct PipeState {
 /// phase B than the per-file code it replaced — extraction and sending
 /// must overlap, not alternate).
 const MAX_IN_FLIGHT: usize = 8;
+
+/// Start up to `wanted` bulk sender threads and return how many started.
+///
+/// #2428 for the senders: a refused spawn (`EAGAIN` from `pthread_create`,
+/// or the spawn gate saying no) is retried with the worker spawn's backoff
+/// ([`sync_executor::WORKER_SPAWN_ATTEMPTS`] attempts, doubling from
+/// [`sync_executor::WORKER_SPAWN_BACKOFF`]) before the set shrinks. A sender
+/// that still cannot start ends the loop: the pipe runs with the senders that
+/// did start, and with none it stays inline, as before.
+pub(crate) fn start_bulk_senders<'scope, 'env, S, G, F>(
+    scope: &xerj_common::thread_spawn::Scope<'scope, 'env>,
+    spawner: &S,
+    gate: G,
+    wanted: usize,
+    sender: F,
+    pr: &Progress,
+) -> usize
+where
+    S: xerj_common::thread_spawn::Spawn + ?Sized,
+    G: Fn() -> bool + Copy,
+    F: FnOnce() + Send + Copy + 'scope,
+{
+    let mut started = 0usize;
+    for _ in 0..wanted {
+        match crate::sync_executor::spawn_scoped_with_backoff(
+            scope,
+            spawner,
+            gate,
+            "autoindex-sender",
+            crate::sync_executor::WORKER_SPAWN_ATTEMPTS,
+            crate::sync_executor::WORKER_SPAWN_BACKOFF,
+            sender,
+        ) {
+            Ok(()) => started += 1,
+            Err(error) => {
+                pr.note(&format!(
+                    "autoindex: could not start bulk sender {} ({error}); continuing with {started}",
+                    started + 1
+                ));
+                break;
+            }
+        }
+    }
+    started
+}
 
 /// ONE bulk buffer shared by every phase-B worker (#1147).
 ///
@@ -3700,8 +3755,7 @@ const MAX_IN_FLIGHT: usize = 8;
 ///
 /// Flush triggers, in order:
 /// 1. the shared buffer crosses the cut (`--bulk-mb` bytes or the doc cap) —
-///    shipped inline by the submitting worker, exactly where the per-file
-///    code flushed (it blocks here, so a worker's own chunks stay ordered);
+///    handed to a sender, or shipped inline when there are none;
 /// 2. half the live workers are parked settling — ship what is buffered
 ///    rather than wait for a full wave: extraction and sending must OVERLAP,
 ///    not alternate (the all-parked barrier alone measured 4.7x slower on
@@ -3778,6 +3832,71 @@ where
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// Switch to sender mode: a detached job is queued for one of `senders`
+    /// threads running [`Self::sender_loop`] instead of being sent by the
+    /// worker that cut it, and at most `senders` jobs are queued or on the
+    /// wire. Call before any worker submits; 0 keeps the inline mode.
+    ///
+    /// Why: in inline mode a worker that cuts a bulk sends it and waits for
+    /// the node before it reads on, so a corpus that is ONE large file (one
+    /// worker) keeps exactly one bulk on the wire for the whole run and the
+    /// node indexes one request at a time. With senders, that worker keeps
+    /// staging while up to `senders` bulks of its file are being indexed.
+    /// Records carry deterministic per-record ids (one locator per record),
+    /// so bulks of one file landing out of order converge to the same index,
+    /// and a failure stays sticky per file exactly as in inline mode.
+    fn use_senders(&self, senders: usize) {
+        let mut st = self.lock();
+        st.senders = senders.min(MAX_IN_FLIGHT);
+        if st.senders > 0 && st.live_workers == 0 && st.buf.is_empty() {
+            st.closing = true;
+        }
+        drop(st);
+        self.ready.notify_all();
+    }
+
+    /// Body of a sender thread (sender mode): send queued jobs until every
+    /// worker retired and the queue is empty.
+    fn sender_loop(&self) {
+        let mut st = self.lock();
+        loop {
+            if let Some((body, tokens, owners)) = st.queue.pop_front() {
+                drop(st);
+                let outcome = (self.send)(body);
+                self.deliver(tokens, owners, outcome);
+                st = self.lock();
+                continue;
+            }
+            if st.closing {
+                return;
+            }
+            let (guard, _) = self
+                .ready
+                .wait_timeout(st, std::time::Duration::from_secs(30))
+                .unwrap_or_else(|p| p.into_inner());
+            st = guard;
+        }
+    }
+
+    /// Hand a detached job to the senders (sender mode) or send it on this
+    /// thread (inline mode). Takes the lock guard and returns it re-taken.
+    fn dispatch<'g>(
+        &'g self,
+        mut st: std::sync::MutexGuard<'g, PipeState>,
+        job: PipeJob,
+    ) -> std::sync::MutexGuard<'g, PipeState> {
+        if st.senders > 0 {
+            st.queue.push_back(job);
+            drop(st);
+            self.ready.notify_all();
+        } else {
+            drop(st);
+            let outcome = (self.send)(job.0);
+            self.deliver(job.1, job.2, outcome);
+        }
+        self.lock()
+    }
+
     /// Add one chunk of staged NDJSON lines to the shared buffer, flushing
     /// inline if the buffer crossed the cut. Never blocks on the network
     /// beyond that inline flush.
@@ -3820,9 +3939,7 @@ where
             st = guard;
             st.parked_workers -= 1;
         };
-        drop(st);
-        let outcome = (self.send)(job.0);
-        self.deliver(job.1, job.2, outcome);
+        drop(self.dispatch(st, job));
     }
 
     /// The server's reason when this token failed only on records over the
@@ -3844,10 +3961,7 @@ where
             }
             if buffered {
                 if let Some(job) = self.take_job(&mut st) {
-                    drop(st);
-                    let outcome = (self.send)(job.0);
-                    self.deliver(job.1, job.2, outcome);
-                    st = self.lock();
+                    st = self.dispatch(st, job);
                     continue;
                 }
             }
@@ -3888,10 +4002,7 @@ where
             let half = (st.parked_workers + 1) * 2 >= st.live_workers.max(1);
             if !st.buf.is_empty() && (all || half) {
                 if let Some(job) = self.take_job(&mut st) {
-                    drop(st);
-                    let outcome = (self.send)(job.0);
-                    self.deliver(job.1, job.2, outcome);
-                    st = self.lock();
+                    st = self.dispatch(st, job);
                     continue;
                 }
                 // Every wire slot is busy: park; a delivery will wake us.
@@ -3917,6 +4028,9 @@ where
         }
         let mut st = self.lock();
         st.live_workers = st.live_workers.saturating_sub(n);
+        if st.live_workers == 0 && st.buf.is_empty() {
+            st.closing = true;
+        }
         drop(st);
         self.ready.notify_all();
     }
@@ -3928,10 +4042,7 @@ where
         st.live_workers = st.live_workers.saturating_sub(1);
         while !st.buf.is_empty() {
             if let Some(job) = self.take_job(&mut st) {
-                drop(st);
-                let outcome = (self.send)(job.0);
-                self.deliver(job.1, job.2, outcome);
-                st = self.lock();
+                st = self.dispatch(st, job);
                 continue;
             }
             // Wire full: wait for a delivery to free a slot.
@@ -3941,6 +4052,11 @@ where
                 .unwrap_or_else(|p| p.into_inner());
             st = guard;
         }
+        // The last worker out: senders drain what is queued and stop.
+        if st.live_workers == 0 {
+            st.closing = true;
+        }
+        drop(st);
         // Live workers may have dropped to zero: anyone still parked must
         // re-check whether they are now the last one able to ship.
         self.ready.notify_all();
@@ -3949,7 +4065,12 @@ where
     /// Detach the buffer as a send job if a wire slot is free. Called with
     /// the lock held; the caller drops the lock before sending.
     fn take_job(&self, st: &mut PipeState) -> Option<PipeJob> {
-        if st.buf.is_empty() || st.in_flight >= MAX_IN_FLIGHT {
+        let limit = if st.senders > 0 {
+            st.senders
+        } else {
+            MAX_IN_FLIGHT
+        };
+        if st.buf.is_empty() || st.in_flight >= limit {
             return None;
         }
         st.in_flight += 1;
@@ -4058,13 +4179,21 @@ where
                             }
                             st.failed.insert(*t);
                             st.done.insert(*t, Err(msg));
-                        } else if !st.failed.contains(t) {
+                        } else if !st.failed.contains(t)
+                            && !st.in_flight_tokens.contains_key(t)
+                            && !st.pending.contains(t)
+                        {
                             st.done.insert(*t, Ok(()));
                         }
                     }
                 } else {
                     for t in &tokens {
-                        if !st.failed.contains(t) {
+                        // Complete only when no other piece of this file is
+                        // still queued, on the wire, or in the buffer.
+                        if !st.failed.contains(t)
+                            && !st.in_flight_tokens.contains_key(t)
+                            && !st.pending.contains(t)
+                        {
                             st.done.insert(*t, Ok(()));
                         }
                     }
@@ -12289,6 +12418,27 @@ fn run_index_report_inner(
     // #2428: a refused spawn is retried with backoff first; a transient
     // `EAGAIN` must not cost the run a worker, let alone the run.
     xerj_common::thread_spawn::scope(|scope| {
+        // Sender threads first, so the pipe is in sender mode before any
+        // worker submits: a lone worker on one large file keeps staging while
+        // up to `--workers` of its bulks are being indexed (see
+        // `BulkPipe::use_senders`). `--workers 1` keeps the inline pipe
+        // exactly as before; threads that cannot start shrink the set, and
+        // none at all leaves the pipe inline too.
+        let sender = || pipe.sender_loop();
+        let wanted_senders = if cfg.workers > 1 {
+            cfg.workers.min(MAX_IN_FLIGHT)
+        } else {
+            0
+        };
+        let senders = start_bulk_senders(
+            scope,
+            &xerj_common::thread_spawn::StdSpawn,
+            xerj_common::thread_spawn::spawn_allowed,
+            wanted_senders,
+            sender,
+            &pr,
+        );
+        pipe.use_senders(senders);
         let mut started = 0usize;
         for _ in 0..worker_count {
             match crate::sync_executor::spawn_scoped_with_backoff(
@@ -17453,6 +17603,148 @@ mod bulk_pipe_tests {
             "at least two bodies were on the wire together, peak={}",
             peak.load(Ordering::SeqCst)
         );
+    }
+
+    /// Sender mode: ONE producer (the lone worker of a one-file corpus) cuts
+    /// several bulks, and they are on the wire together instead of one at a
+    /// time; every body is sent once, the token settles Ok, and the senders
+    /// stop when the worker retires.
+    #[test]
+    fn sender_mode_overlaps_one_producers_bulks_and_stops_on_retire() {
+        let bodies = Mutex::new(Vec::new());
+        let rejected = AtomicU64::new(0);
+        let concurrent = AtomicU64::new(0);
+        let peak = AtomicU64::new(0);
+        let pipe = BulkPipe::new(
+            {
+                let (bodies, concurrent, peak) = (&bodies, &concurrent, &peak);
+                move |body| {
+                    let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    concurrent.fetch_sub(1, Ordering::SeqCst);
+                    bodies.lock().unwrap().push(body);
+                    Ok(outcome())
+                }
+            },
+            64,
+            5000,
+            &rejected,
+            1,
+        );
+        pipe.use_senders(4);
+        // Retire before asserting: a sender waits for `retire`, so a panic
+        // inside the scope would hang the test instead of failing it.
+        let settled = std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| pipe.sender_loop());
+            }
+            let t = pipe.token();
+            for chunk in 0..8u8 {
+                pipe.submit(t, vec![b'a' + chunk; 100], 1);
+            }
+            let settled = pipe.settle(t);
+            pipe.retire();
+            settled
+        });
+        settled.expect("every bulk accepted");
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "one producer's bulks never overlapped, peak={}",
+            peak.load(Ordering::SeqCst)
+        );
+        let mut bodies = bodies.into_inner().unwrap();
+        bodies.sort();
+        assert_eq!(
+            bodies,
+            (0..8u8).map(|c| vec![b'a' + c; 100]).collect::<Vec<_>>(),
+            "each cut body sent exactly once"
+        );
+    }
+
+    /// A file is complete only when EVERY bulk carrying it was accepted. In
+    /// sender mode two bulks of one file can finish out of order: the later
+    /// (fast) one must not settle the file while the earlier (slow) one is
+    /// still on the wire — that would journal the file before all its records
+    /// were accepted, and a failure of the slow bulk would then be lost.
+    #[test]
+    fn a_file_settles_only_after_all_its_bulks_return() {
+        let rejected = AtomicU64::new(0);
+        let calls = AtomicU64::new(0);
+        let returned = AtomicU64::new(0);
+        let pipe = BulkPipe::new(
+            {
+                let (calls, returned) = (&calls, &returned);
+                move |_body| {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    returned.fetch_add(1, Ordering::SeqCst);
+                    Ok(outcome())
+                }
+            },
+            64,
+            5000,
+            &rejected,
+            1,
+        );
+        pipe.use_senders(2);
+        let (settled, returned_at_settle) = std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| pipe.sender_loop());
+            }
+            let t = pipe.token();
+            pipe.submit(t, vec![b'x'; 100], 1);
+            pipe.submit(t, vec![b'y'; 100], 1);
+            let settled = pipe.settle(t);
+            let returned_at_settle = returned.load(Ordering::SeqCst);
+            pipe.retire();
+            (settled, returned_at_settle)
+        });
+        settled.expect("accepted");
+        assert_eq!(
+            returned_at_settle, 2,
+            "the file settled while one of its bulks was still on the wire"
+        );
+    }
+
+    /// Sender mode keeps a file's failure sticky: the first of its bulks
+    /// fails, later ones succeed, the file still settles Err (and is not
+    /// journaled complete).
+    #[test]
+    fn sender_mode_keeps_a_failure_sticky() {
+        let rejected = AtomicU64::new(0);
+        let attempts = AtomicU64::new(0);
+        let pipe = BulkPipe::new(
+            {
+                let attempts = &attempts;
+                move |_body| {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(anyhow::anyhow!("connection reset by peer"))
+                    } else {
+                        Ok(outcome())
+                    }
+                }
+            },
+            64,
+            5000,
+            &rejected,
+            1,
+        );
+        pipe.use_senders(2);
+        let settled = std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| pipe.sender_loop());
+            }
+            let t = pipe.token();
+            pipe.submit(t, vec![b'x'; 100], 1);
+            pipe.submit(t, vec![b'y'; 100], 1);
+            let settled = pipe.settle(t);
+            pipe.retire();
+            settled
+        });
+        let err = settled.expect_err("sticky failure");
+        assert!(err.contains("connection reset"), "{err}");
     }
 
     /// The concurrent shape phase B actually runs: many workers, many small

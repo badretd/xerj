@@ -6227,6 +6227,36 @@ mod tests {
         assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    /// #2428 for the bulk senders: the sender loop stopped at the first
+    /// refused spawn, so two refusals in a row left the pipe with none of its
+    /// four senders (inline, one bulk on the wire). Each refusal is now
+    /// retried with the worker spawn's backoff, and all four start.
+    #[test]
+    fn bulk_senders_retry_a_refused_spawn_before_the_set_shrinks() {
+        let spawner = FlakySpawn::refusing(2);
+        let ran = std::sync::atomic::AtomicUsize::new(0);
+        let ran_ref = &ran;
+        let (pr, _buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_millis(40),
+        );
+        let started = xerj_common::thread_spawn::scope(|scope| {
+            crate::start_bulk_senders(
+                scope,
+                &spawner,
+                || true,
+                4,
+                move || {
+                    ran_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+                &pr,
+            )
+        });
+        assert_eq!(started, 4);
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(spawner.calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+
     /// A backend whose Nth `apply` is the server still answering 429 after
     /// the client's patience — the one way a throttled node still ends a run.
     struct ThrottledOutBackend {

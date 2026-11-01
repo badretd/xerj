@@ -195,6 +195,14 @@ struct MockState {
     /// where a single large file spends almost all of its time. Catalog,
     /// graph and every other request answer at once.
     data_bulk_delay_ms: u64,
+    /// Opt-in: serve each connection on its own thread, so concurrent
+    /// requests are answered concurrently (the default serves one at a
+    /// time, which hides how many bulks a client keeps on the wire).
+    concurrent: bool,
+    /// Data bulks being held by `data_bulk_delay_ms` right now, and the most
+    /// at once (counted only for data bulks).
+    data_bulks_in_flight: usize,
+    peak_data_bulks_in_flight: usize,
 }
 
 struct MockEndpoint {
@@ -225,7 +233,16 @@ impl MockEndpoint {
                     // BSD/macOS: accepted sockets inherit the listener's
                     // O_NONBLOCK; the handler does blocking reads.
                     stream.set_nonblocking(false).unwrap();
-                    handle(stream, &server_state)
+                    let concurrent = server_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .concurrent;
+                    if concurrent {
+                        let state = Arc::clone(&server_state);
+                        thread::spawn(move || handle(stream, &state));
+                    } else {
+                        handle(stream, &server_state)
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if server_state
@@ -788,10 +805,18 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
     if is_data {
         // Read under the lock, slept without it: the state is shared with the
         // test thread, which must stay free to inspect it meanwhile.
-        let delay_ms = state.lock().unwrap().data_bulk_delay_ms;
+        let delay_ms = {
+            let mut locked = state.lock().unwrap();
+            locked.data_bulks_in_flight += 1;
+            locked.peak_data_bulks_in_flight = locked
+                .peak_data_bulks_in_flight
+                .max(locked.data_bulks_in_flight);
+            locked.data_bulk_delay_ms
+        };
         if delay_ms > 0 {
             thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
+        state.lock().unwrap().data_bulks_in_flight -= 1;
     }
     {
         // Checked before anything is applied and by LINES, as
@@ -1240,6 +1265,55 @@ fn a_single_large_jsonl_moves_the_index_bar_before_it_finishes() {
         "the bar must move while the only file is still being indexed, not sit at 0.0 \
          until it finishes: {in_flight:?}"
     );
+}
+
+/// One large file must not mean one bulk on the wire. Phase B used to send
+/// each bulk inline from the worker that staged it: a corpus that is ONE
+/// JSONL got one worker, so exactly one data bulk was ever in flight and the
+/// node indexed one request at a time for the whole run (the 10 GB Wikipedia
+/// JSONL spent its whole index phase like that). With `--workers 4` the
+/// sender threads keep up to four of that file's bulks in flight, every
+/// record still lands, and the run exits 0.
+#[test]
+fn a_single_large_jsonl_keeps_several_bulks_in_flight() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let text = "lorem ipsum dolor sit amet consectetur ".repeat(12);
+    let jsonl: String = (0..6_000)
+        .map(|i| format!("{{\"id\":\"p{i}\",\"title\":\"passage {i}\",\"text\":\"{text}\"}}\n"))
+        .collect();
+    fs::write(corpus.path().join("passages.jsonl"), &jsonl).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    {
+        let mut locked = endpoint.state.lock().unwrap();
+        locked.concurrent = true;
+        locked.data_bulk_delay_ms = 300;
+    }
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    // ~3.2 MB of source stages to several 1 MiB bulks, each held 300 ms.
+    config.bulk_mb = 1;
+    config.workers = 4;
+
+    let (code, _) = run_index_report(config).unwrap();
+    assert_eq!(code, 0);
+    let locked = endpoint.state.lock().unwrap();
+    assert!(
+        locked.data_bulk_number >= 3,
+        "the fixture must send the file in several bulks: {}",
+        locked.data_bulk_number
+    );
+    assert!(
+        locked.peak_data_bulks_in_flight >= 2,
+        "one file kept only {} data bulk(s) in flight with --workers 4",
+        locked.peak_data_bulks_in_flight
+    );
+    assert_eq!(data_rows(&locked).len(), 6_000, "every record landed");
 }
 
 /// One JSONL corpus run on the legacy path with this test's own staging
