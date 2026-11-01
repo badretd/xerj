@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 mod tree;
-pub use tree::tree_walk_enabled;
+pub use tree::{tree_walk_enabled, TREE_WALK_THREAD_OVERRIDE};
 
 /// Per-term phrase postings: `doc_id → (term_freq, positions)`.
 type TermPostingsMap = std::collections::HashMap<u32, (u32, Vec<u32>)>;
@@ -370,8 +370,8 @@ pub struct WalkStats {
 }
 
 /// A score floor the concurrent walks of one search's segments share while
-/// they run ([`FtsSearcher::with_shared_floor`]; the engine's opt-in
-/// `XERJ_FTS_LIVE_FLOOR`). Every walk prunes against it as against the
+/// they run ([`FtsSearcher::with_shared_floor`]; the engine's
+/// `XERJ_FTS_LIVE_FLOOR`, on by default). Every walk prunes against it as against the
 /// caller's floor of [`FtsSearcher::search_bounded_counting_floor`], and a
 /// walk whose page is full raises it to that page's worst score.
 ///
@@ -813,7 +813,7 @@ pub struct FtsSearcher {
     walk_stats: Option<Arc<WalkStats>>,
     /// Route the query trees the tree walk takes (the `tree` module: nested
     /// `bool`s of terms and phrases, e.g. `multi_match` over several fields)
-    /// through it. Off unless `XERJ_FTS_TREE_WALK` is set.
+    /// through it. On unless `XERJ_FTS_TREE_WALK` opts out.
     tree_walk_on: bool,
     /// The floor this searcher's page passes share with the walks of the
     /// other segments of the same search (`None` = none, the default).
@@ -1007,7 +1007,7 @@ impl FtsSearcher {
             if let Some(res) = self.wand_should_bool(query, cap, count_limit, floor)? {
                 return Ok(res);
             }
-            // Opt-in: nested trees (several fields, minimum should match,
+            // Nested trees (several fields, minimum should match,
             // `operator: and`, phrase legs) under the same bounds.
             if self.tree_walk_on {
                 if let Some(res) = self.tree_walk(query, cap, count_limit, floor)? {

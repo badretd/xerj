@@ -27325,7 +27325,7 @@ impl Index {
         // Cold score-ordered FTS hits whose `_source` is read only once the
         // segment loop has settled the page: `_id` -> (segment, row).
         let mut deferred_sources: HashMap<String, (String, u32, u64)> = HashMap::new();
-        // Opt-in (`XERJ_FTS_FACET_PAGE_CAP`): a request whose aggregations
+        // `XERJ_FTS_FACET_PAGE_CAP`, on by default: a request whose aggregations
         // the full-text row sets answered above (`fts_row_aggs`) takes the
         // same cap. The slack exists for the brute aggregation, which
         // aggregates the materialised hits; with `fts_row_aggs` set it never
@@ -27612,7 +27612,7 @@ impl Index {
                 });
                 v
             };
-            // Opt-in (`XERJ_FTS_OPEN_THREADS` > 1): open the query's cold FTS
+            // `XERJ_FTS_OPEN_THREADS` > 1 (the default): open the query's cold FTS
             // readers in parallel before the walk below, which opens them one
             // segment at a time. A cold reader decompresses its fields' whole
             // `.post` frames (and maps the large postings, `fts_reader_for`):
@@ -27635,7 +27635,7 @@ impl Index {
                     dbg_fts_ms += t_open.elapsed().as_millis() as u64;
                 }
             }
-            // Opt-in (`XERJ_FTS_SEGMENT_THREADS` > 1): every segment's
+            // `XERJ_FTS_SEGMENT_THREADS` > 1 (the default): every segment's
             // full-text walk, that many segments at a time, before the loop
             // below; the loop then takes each segment's `(hits, total)` from
             // here instead of walking it itself (`fts_segment_prepass`).
@@ -34394,7 +34394,7 @@ impl Index {
             std::cmp::Reverse<PrepassScore>,
         >::new());
         let out = std::sync::Mutex::new(std::collections::HashMap::new());
-        // Opt-in (`XERJ_FTS_LIVE_FLOOR`): one floor the walks share while they
+        // `XERJ_FTS_LIVE_FLOOR`, on by default: one floor the walks share while they
         // run. A walk raises it to its full page's worst score, and the merged
         // top of the finished segments below raises it too. Each such score is
         // the worst of `cap` distinct live documents competing for the one
@@ -38623,7 +38623,7 @@ impl Index {
         let field_refs: Vec<&str> = fields.iter().map(String::as_str).collect();
         let mut rows: std::collections::HashMap<String, Arc<Vec<u64>>> =
             std::collections::HashMap::new();
-        // Opt-in (`XERJ_FTS_SEGMENT_THREADS` > 1): the segments' match sets
+        // `XERJ_FTS_SEGMENT_THREADS` > 1 (the default): the segments' match sets
         // that many at a time (`fts_match_sets_parallel`, the same work per
         // segment and the same `None`); the loop then has nothing left to do.
         let threads = fts_segment_threads();
@@ -57372,47 +57372,51 @@ impl Ord for PrepassScore {
 
 /// `XERJ_FTS_SEGMENT_THREADS`: how many segments' full-text walks one
 /// search runs at once before its segment loop
-/// (`Index::fts_segment_prepass`). Unset, `0` or `1` = off: the loop walks
-/// them one by one, as before. Read once (tests: `FTS_SEGMENT_THREADS_TEST`).
+/// (`Index::fts_segment_prepass`). Unset: half the cores, four at most
+/// (`xerj_common::resource::read_threads`). `0` or `1`: the loop walks them
+/// one by one. Read once (tests: `FTS_SEGMENT_THREADS_TEST`, sequential unless
+/// set, so a test's instruments stay on its thread).
+#[cfg(not(test))]
 fn fts_segment_threads() -> usize {
-    #[cfg(test)]
-    if let Some(n) = FTS_SEGMENT_THREADS_TEST.with(|c| c.get()) {
-        return n;
-    }
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *THREADS.get_or_init(|| {
-        std::env::var("XERJ_FTS_SEGMENT_THREADS")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 64)
+        xerj_common::resource::threads_setting(
+            std::env::var("XERJ_FTS_SEGMENT_THREADS").ok().as_deref(),
+            xerj_common::resource::read_threads(),
+        )
     })
 }
 
+#[cfg(test)]
+fn fts_segment_threads() -> usize {
+    FTS_SEGMENT_THREADS_TEST.with(|c| c.get()).unwrap_or(1)
+}
+
 /// `XERJ_FTS_OPEN_THREADS`: how many cold FTS readers one search opens at
-/// once before its segment walk (`Index::open_fts_readers_parallel`). Unset,
-/// `0` or `1` = off: the walk opens them one by one, as before. Read once
-/// (tests: `FTS_OPEN_THREADS_TEST`).
+/// once before its segment walk (`Index::open_fts_readers_parallel`). Unset:
+/// half the cores, four at most. `0` or `1`: the walk opens them one by one.
+/// Read once (tests: `FTS_OPEN_THREADS_TEST`, sequential unless set).
+#[cfg(not(test))]
 fn fts_open_threads() -> usize {
-    #[cfg(test)]
-    if let Some(n) = FTS_OPEN_THREADS_TEST.with(|c| c.get()) {
-        return n;
-    }
     static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *THREADS.get_or_init(|| {
-        std::env::var("XERJ_FTS_OPEN_THREADS")
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 64)
+        xerj_common::resource::threads_setting(
+            std::env::var("XERJ_FTS_OPEN_THREADS").ok().as_deref(),
+            xerj_common::resource::read_threads(),
+        )
     })
+}
+
+#[cfg(test)]
+fn fts_open_threads() -> usize {
+    FTS_OPEN_THREADS_TEST.with(|c| c.get()).unwrap_or(1)
 }
 
 /// `XERJ_FTS_LIVE_FLOOR`: the segments' parallel walks
 /// (`XERJ_FTS_SEGMENT_THREADS` > 1) share one floor while they run
 /// (`xerj_fts::SharedFloor`), instead of taking the finished segments' floor
-/// only when they start. `1` / `true` / `on` / `yes`; off unless set. Read
-/// once (tests: `FTS_LIVE_FLOOR_TEST`).
+/// only when they start. On unless `0` / `false` / `off` / `no`. Read once
+/// (tests: `FTS_LIVE_FLOOR_TEST`).
 fn fts_live_floor() -> bool {
     #[cfg(test)]
     if let Some(on) = FTS_LIVE_FLOOR_TEST.with(|c| c.get()) {
@@ -57420,19 +57424,15 @@ fn fts_live_floor() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("XERJ_FTS_LIVE_FLOOR").is_ok_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
+        xerj_common::resource::switch_setting(std::env::var("XERJ_FTS_LIVE_FLOOR").ok().as_deref())
     })
 }
 
 /// `XERJ_FTS_FACET_PAGE_CAP`: a page whose aggregations the full-text row
 /// sets answered (`try_aggs_fast_over_fts_match`) materialises `from + size`
-/// hits instead of the 256-hit slack the brute aggregation needs. `1` /
-/// `true` / `on` / `yes`; off unless set. Read once (tests:
+/// hits instead of the 256-hit slack the brute aggregation needs. Facets come
+/// from the row sets and the total is counted apart from the page, so the cap
+/// changes neither. On unless `0` / `false` / `off` / `no`. Read once (tests:
 /// `FTS_FACET_PAGE_CAP_TEST`).
 fn fts_facet_page_cap() -> bool {
     #[cfg(test)]
@@ -57441,12 +57441,9 @@ fn fts_facet_page_cap() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("XERJ_FTS_FACET_PAGE_CAP").is_ok_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
+        xerj_common::resource::switch_setting(
+            std::env::var("XERJ_FTS_FACET_PAGE_CAP").ok().as_deref(),
+        )
     })
 }
 
@@ -68351,6 +68348,309 @@ mod residual_gate_trim_577_tests {
             peak <= 513,
             "residual survivors must stay O(page cap), not O(matches): peak={peak} (N={N})"
         );
+    }
+}
+
+#[cfg(test)]
+mod search_default_switches_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// One setting of every search switch whose default is on.
+    #[derive(Clone, Copy, Debug)]
+    struct Switches {
+        tree_walk: bool,
+        live_floor: bool,
+        segment_threads: usize,
+        open_threads: usize,
+        facet_page_cap: bool,
+    }
+
+    const OPTED_OUT: Switches = Switches {
+        tree_walk: false,
+        live_floor: false,
+        segment_threads: 1,
+        open_threads: 1,
+        facet_page_cap: false,
+    };
+
+    fn apply(s: Option<Switches>) {
+        xerj_fts::TREE_WALK_THREAD_OVERRIDE.with(|c| c.set(s.map(|s| s.tree_walk)));
+        FTS_LIVE_FLOOR_TEST.with(|c| c.set(s.map(|s| s.live_floor)));
+        FTS_SEGMENT_THREADS_TEST.with(|c| c.set(s.map(|s| s.segment_threads)));
+        FTS_OPEN_THREADS_TEST.with(|c| c.set(s.map(|s| s.open_threads)));
+        FTS_FACET_PAGE_CAP_TEST.with(|c| c.set(s.map(|s| s.facet_page_cap)));
+    }
+
+    fn bodies() -> Vec<serde_json::Value> {
+        let tree = json!({"bool": {
+            "should": [
+                {"bool": {"must": [{"match": {"title": "alpha"}}, {"match": {"body": "beta"}}]}},
+                {"match_phrase": {"body": "gamma delta"}},
+                {"multi_match": {"query": "epsilon alpha", "fields": ["title^2", "body"]}}
+            ],
+            "minimum_should_match": 1
+        }});
+        let mut out = Vec::new();
+        for query in [
+            json!({"match": {"body": "alpha beta gamma"}}),
+            json!({"match": {"body": {"query": "alpha beta", "operator": "and"}}}),
+            json!({"multi_match": {"query": "alpha gamma", "fields": ["title^3", "body"]}}),
+            json!({"bool": {"must": [{"match": {"body": "alpha"}}],
+                            "should": [{"match": {"title": "beta"}}]}}),
+            json!({"bool": {"must": [{"match": {"body": "gamma"}}],
+                            "filter": [{"term": {"cat": "c3"}}]}}),
+            json!({"match_phrase": {"body": "gamma delta"}}),
+            tree,
+        ] {
+            for (from, size) in [(0, 10), (7, 5), (0, 1)] {
+                out.push(json!({"query": query, "from": from, "size": size,
+                                "track_total_hits": true}));
+                out.push(json!({"query": query, "from": from, "size": size,
+                                "track_total_hits": true, "_source": ["cat"]}));
+                out.push(json!({"query": query, "from": from, "size": size,
+                                "track_total_hits": true,
+                                "aggs": {"cats": {"terms": {"field": "cat", "size": 20}}}}));
+            }
+        }
+        out
+    }
+
+    /// Everything a client sees: ids, score bits, sources, total, facets.
+    fn fingerprint(r: &SearchResult) -> String {
+        let hits: Vec<(String, u32, String)> = r
+            .hits
+            .iter()
+            .map(|h| (h.id.clone(), h.score.to_bits(), h.source.to_string()))
+            .collect();
+        format!(
+            "{hits:?} {} {:?} {:?}",
+            r.total.value, r.total.relation, r.aggs
+        )
+    }
+
+    async fn loaded_index(engine: &crate::Engine, name: &str) -> Arc<Index> {
+        let mut schema = Schema::empty();
+        for field in ["title", "body"] {
+            schema
+                .add_field(FieldConfig::new(field, FieldType::Text))
+                .unwrap();
+        }
+        schema
+            .add_field(FieldConfig::new("cat", FieldType::Keyword))
+            .unwrap();
+        engine.create_index(name, schema).unwrap();
+        let idx = engine.get_index(name).unwrap();
+        idx.abort_background_tasks();
+        let words = [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "filler",
+        ];
+        for seg in 0..6u32 {
+            for i in 0..700u32 {
+                let n = seg * 700 + i;
+                let word = |salt: u32| {
+                    let mixed = (n + salt * 1000).wrapping_mul(2_654_435_761) >> 20;
+                    words[(mixed % 7) as usize]
+                };
+                let mut body = format!("{} {} {}", word(31), word(37), word(41));
+                for _ in 0..(n % 11) {
+                    body.push(' ');
+                    body.push_str(word(43));
+                }
+                idx.index_document(
+                    Some(format!("d{n}")),
+                    json!({"title": word(47), "body": body, "cat": format!("c{}", n % 6)}),
+                )
+                .await
+                .unwrap();
+            }
+            idx.flush().await.unwrap();
+        }
+        idx
+    }
+
+    /// The defaults and every opt-out answer alike. Each switch alone and all
+    /// together are compared with the path that has them all off, on an index
+    /// of several segments, without and with overwritten documents (which
+    /// close the parallel walks): page, score bits, sources, totals and facets.
+    /// The tree-walk override is per thread, so with segment threads on, those
+    /// walks take the default; `XERJ_FTS_TREE_WALK=0` covers the combination.
+    #[tokio::test]
+    async fn the_defaults_and_each_opt_out_give_the_same_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let idx = loaded_index(&engine, "switches").await;
+        let all_on = Switches {
+            tree_walk: true,
+            live_floor: true,
+            segment_threads: 4,
+            open_threads: 4,
+            facet_page_cap: true,
+        };
+        let settings = [
+            all_on,
+            Switches {
+                tree_walk: true,
+                ..OPTED_OUT
+            },
+            Switches {
+                live_floor: true,
+                segment_threads: 4,
+                ..OPTED_OUT
+            },
+            Switches {
+                segment_threads: 4,
+                ..OPTED_OUT
+            },
+            Switches {
+                open_threads: 4,
+                ..OPTED_OUT
+            },
+            Switches {
+                facet_page_cap: true,
+                ..OPTED_OUT
+            },
+            Switches {
+                tree_walk: false,
+                ..all_on
+            },
+            Switches {
+                live_floor: false,
+                ..all_on
+            },
+            Switches {
+                segment_threads: 1,
+                ..all_on
+            },
+            Switches {
+                open_threads: 1,
+                ..all_on
+            },
+            Switches {
+                facet_page_cap: false,
+                ..all_on
+            },
+        ];
+        for overwritten in [false, true] {
+            if overwritten {
+                for n in (0..4200u32).step_by(17) {
+                    idx.index_document(
+                        Some(format!("d{n}")),
+                        json!({"title": "alpha", "body": "alpha beta gamma delta", "cat": "c0"}),
+                    )
+                    .await
+                    .unwrap();
+                }
+                idx.flush().await.unwrap();
+            }
+            for body in bodies() {
+                let req = xerj_query::parse_request(&body).unwrap();
+                apply(Some(OPTED_OUT));
+                idx.query_cache.clear();
+                let reference = idx.search(&req).await.unwrap();
+                let want = fingerprint(&reference);
+                assert!(!reference.hits.is_empty(), "fixture: {body} matches");
+                for setting in settings {
+                    apply(Some(setting));
+                    idx.query_cache.clear();
+                    let got = idx.search(&req).await.unwrap();
+                    apply(None);
+                    assert_eq!(
+                        fingerprint(&got),
+                        want,
+                        "{setting:?} overwritten={overwritten} {body}"
+                    );
+                }
+            }
+        }
+        apply(None);
+    }
+
+    /// Same answers with the settings a plain server resolves to, not the
+    /// test-pinned ones: the switches' parsers open the same paths.
+    #[test]
+    fn unset_settings_resolve_to_the_parallel_defaults() {
+        assert!(xerj_common::resource::switch_setting(None));
+        let auto = xerj_common::resource::read_threads();
+        assert_eq!(xerj_common::resource::threads_setting(None, auto), auto);
+        assert!((1..=4).contains(&auto));
+    }
+
+    /// The page floor fires for the page a client asks for most: `_source`
+    /// projected to a plain field on a cold segment, the hits of each segment
+    /// entering the page with their rows read after the loop. Fails with the
+    /// floor taken from a set-aside list that stays empty during the walk,
+    /// which is how this path once ran (0 floors); here `all_hits` carries
+    /// the deferred hits, so the floor fires and the page does not change.
+    #[tokio::test]
+    async fn projected_match_walk_takes_the_merged_page_floor_and_keeps_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        TEST_INDEX_HYDRATION_BUDGET
+            .with(|slot| *slot.borrow_mut() = Some(SegmentHydrationBudget::new(0)));
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("id", FieldType::Keyword))
+            .unwrap();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        engine.create_index("floor2", schema).unwrap();
+        TEST_INDEX_HYDRATION_BUDGET.with(|slot| slot.borrow_mut().take());
+        let idx = engine.get_index("floor2").unwrap();
+        for seg in 0..3u32 {
+            for i in 0..600u32 {
+                let g = seg * 600 + i;
+                let mut body = match seg {
+                    0 => String::from("alpha beta filler"),
+                    1 if i % 50 == 7 => String::from("alpha alpha alpha beta beta"),
+                    2 if i % 10 == 3 => String::from("alpha beta filler"),
+                    _ => String::from("filler"),
+                };
+                for _ in 0..(g % 9) {
+                    body.push_str(" pad");
+                }
+                let id = format!("d{g}");
+                idx.index_document(Some(id.clone()), json!({ "id": id, "body": body }))
+                    .await
+                    .unwrap();
+            }
+            idx.flush().await.unwrap();
+        }
+        let req = xerj_query::parse_request(&json!({
+            "size": 200,
+            "_source": ["id"],
+            "query": {"match": {"body": "alpha beta filler"}}
+        }))
+        .unwrap();
+        let page = |r: &SearchResult| -> Vec<(String, u32, Value)> {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), h.score.to_bits(), h.source.clone()))
+                .collect()
+        };
+        FTS_FLOOR_DISABLED.with(|c| c.set(true));
+        idx.query_cache.clear();
+        let reference = idx.search(&req).await.unwrap();
+        FTS_FLOOR_DISABLED.with(|c| c.set(false));
+        SEG_FTS_FLOORS.with(|c| c.set(0));
+        SEG_FTS_HITS_BELOW_PAGE.with(|c| c.set(0));
+        idx.query_cache.clear();
+        let floored = idx.search(&req).await.unwrap();
+        assert!(
+            SEG_FTS_FLOORS.with(|c| c.get()) >= 2,
+            "the segments after the first page's worth must receive the floor"
+        );
+        assert_eq!(SEG_FTS_HITS_BELOW_PAGE.with(|c| c.get()), 0);
+        assert_eq!(page(&floored), page(&reference), "the page must not change");
+        assert_eq!(floored.total.value, reference.total.value);
+        for hit in &floored.hits {
+            assert_eq!(hit.source, json!({ "id": hit.id }));
+        }
     }
 }
 

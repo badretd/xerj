@@ -88,4 +88,5 @@ pub use postings::{
 pub use search::{
     phrase_positions_match, search_segments, tree_walk_enabled, BoolQuery, FtsSearcher,
     PhraseQuery, PrefixQuery, Query, ScoredHit, SharedFloor, TermQuery, WalkStats,
+    TREE_WALK_THREAD_OVERRIDE,
 };

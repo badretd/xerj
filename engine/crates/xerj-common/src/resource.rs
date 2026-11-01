@@ -97,6 +97,38 @@ pub fn cores() -> usize {
     })
 }
 
+/// A parallel read's thread count on a machine of `cores` cores: half of them,
+/// four at most, at least one. Concurrent searches each take this many, so it
+/// leaves room for them, for ingest and for the merge pool.
+pub fn read_threads_for(cores: usize) -> usize {
+    (cores / 2).clamp(1, 4)
+}
+
+/// [`read_threads_for`] of this machine's [`cores`]: the default of the
+/// parallel search and open paths.
+pub fn read_threads() -> usize {
+    read_threads_for(cores())
+}
+
+/// A thread-count setting's value: its number clamped to 1..=64 (`0` and `1`
+/// run sequentially), and `default` when it is unset or not a number.
+pub fn threads_setting(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(1, 64)
+}
+
+/// An on-by-default switch's value: off for `0` / `false` / `off` / `no`, on
+/// for anything else, unset included.
+pub fn switch_setting(raw: Option<&str>) -> bool {
+    !raw.is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
 /// Report a policy problem on both channels.
 ///
 /// The server installs a `tracing` subscriber; `xerj autoindex` does not, so a
@@ -879,6 +911,43 @@ mod tests {
         // SAFETY: `sysconf` reads a system constant.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         Some(pages.saturating_mul(if page > 0 { page as u64 } else { 4096 }))
+    }
+
+    #[test]
+    fn read_threads_are_half_the_cores_up_to_four() {
+        for (cores, threads) in [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (7, 3),
+            (8, 4),
+            (20, 4),
+            (64, 4),
+        ] {
+            assert_eq!(read_threads_for(cores), threads, "{cores} cores");
+        }
+    }
+
+    #[test]
+    fn a_thread_setting_is_its_number_and_otherwise_the_default() {
+        assert_eq!(threads_setting(None, 4), 4);
+        assert_eq!(threads_setting(Some(" 8 "), 4), 8);
+        assert_eq!(threads_setting(Some("1"), 4), 1);
+        assert_eq!(threads_setting(Some("0"), 4), 1, "0 opts out, as 1 does");
+        assert_eq!(threads_setting(Some("many"), 4), 4);
+        assert_eq!(threads_setting(Some("1000"), 4), 64);
+    }
+
+    #[test]
+    fn a_switch_is_on_unless_set_off() {
+        assert!(switch_setting(None));
+        for raw in ["1", "true", "ON", "yes", "", "anything"] {
+            assert!(switch_setting(Some(raw)), "{raw:?}");
+        }
+        for raw in ["0", "false", " OFF ", "No"] {
+            assert!(!switch_setting(Some(raw)), "{raw:?}");
+        }
     }
 
     #[test]
