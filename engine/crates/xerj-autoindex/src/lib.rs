@@ -3233,6 +3233,153 @@ fn send_credit(size: u64, sent: u64, staged: u64, percent: u64) -> u64 {
     base + ((span * u128::from(sent.min(staged))) / u128::from(staged)) as u64
 }
 
+/// A file — or a `--no-graph` snapshot — at least this large is announced
+/// before it is staged under the state directory.
+///
+/// Phase B writes ALL of a file's records to a compressed staging file there
+/// before it sends any of them: the #1911 second content check and the
+/// delete-before-replace of a changed file both need the whole file extracted
+/// first. A `--no-graph` seal copies every new source file into the snapshot
+/// and writes its prepared records next to it. For a large input that is
+/// minutes of local writes before the node sees one document. The compressed
+/// size depends on the data and is unknown until the stage is finished, so
+/// the input's own size stands in as the room to plan for. Below this size
+/// staging takes seconds and a note would be noise.
+const STAGING_NOTE_MIN_BYTES: u64 = 256 << 20;
+
+/// [`STAGING_NOTE_MIN_BYTES`], or a test's own value for this state directory.
+pub(crate) fn staging_note_min_bytes(state_dir: &Path) -> u64 {
+    #[cfg(test)]
+    if let Some(value) = staging_test_value(state_dir, "note-min-bytes") {
+        return value;
+    }
+    #[cfg(not(test))]
+    let _ = state_dir;
+    STAGING_NOTE_MIN_BYTES
+}
+
+/// Free bytes on the filesystem that holds `state_dir`; `None` when it cannot
+/// be measured.
+pub(crate) fn staging_free_bytes(state_dir: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(value) = staging_test_value(state_dir, "available-bytes") {
+        return Some(value);
+    }
+    fs2::available_space(state_dir).ok()
+}
+
+/// Test injection keyed on the run's own state directory — the shape of the
+/// PDF spool's probes — so a test running in parallel is never affected.
+#[cfg(test)]
+fn staging_test_value(state_dir: &Path, name: &str) -> Option<u64> {
+    std::fs::read_to_string(state_dir.join(format!(".autoindex-test-staging-{name}")))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn free_space_clause(free: Option<u64>) -> String {
+    match free {
+        Some(free) => format!("{} free there", estimate::human_bytes(free)),
+        None => "free space there could not be measured".to_string(),
+    }
+}
+
+/// Phase B, before a large file is staged: what will be written, where, and
+/// how much room there is — and a warning when the file alone does not fit.
+fn note_phase_b_staging(pr: &Progress, state_dir: &Path, rel: &str, size: u64) {
+    let free = staging_free_bytes(state_dir);
+    let size_text = estimate::human_bytes(size);
+    pr.note(&format!(
+        "phase B: staging {rel} ({size_text}) in {} before sending it — all of a file's records \
+         are written to a compressed staging file there and sent only after the whole file has \
+         been extracted and checked again, so plan for up to about {size_text} on that \
+         filesystem before the first of them reaches the node ({})",
+        state_dir.display(),
+        free_space_clause(free)
+    ));
+    if let Some(free) = free.filter(|free| *free < size) {
+        pr.warn(&format!(
+            "warning: {rel} stages up to about {size_text} in {}, and only {} is free there: \
+             staging can fail with 'No space left on device' if that filesystem fills. Free \
+             space there before this file is staged, or start the run again with --state-dir on \
+             a filesystem with more room",
+            state_dir.display(),
+            estimate::human_bytes(free)
+        ));
+    }
+}
+
+/// What a `--no-graph` seal writes before the first document is sent,
+/// counted before it starts (`sync_executor::create_snapshot_inner`).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SnapshotStaging {
+    /// Bytes copied from the source tree into the snapshot.
+    pub(crate) copy_bytes: u64,
+    /// Of those, the copies that stay: files with nothing to prepare
+    /// (junk/skipped, or every file of a plan-less snapshot).
+    pub(crate) kept_bytes: u64,
+    /// The largest copy that is released once its prepared records are on
+    /// disk (#2421): the most copy bytes held at once.
+    pub(crate) largest_released: u64,
+    /// Bytes the prior generation lends instead (a hardlinked copy, or
+    /// prepared records reused by identity).
+    pub(crate) reused_bytes: u64,
+}
+
+/// `--no-graph`, before a seal that copies a lot: the same note for the
+/// snapshot, whose copy size is known exactly before it starts.
+///
+/// Since #2421 a copy is released once its file's prepared records are on
+/// disk, so the seal does not hold a second copy of the corpus: at its peak
+/// it holds the prepared records (about the size of the files they come
+/// from), the copies that stay, and the one copy being prepared.
+pub(crate) fn note_snapshot_staging(
+    pr: &Progress,
+    state_dir: &Path,
+    snapshots: &Path,
+    staged: &SnapshotStaging,
+) {
+    let free = staging_free_bytes(state_dir);
+    let copy_text = estimate::human_bytes(staged.copy_bytes);
+    let kept = if staged.kept_bytes > 0 {
+        format!(
+            "; {} of files with nothing to prepare stay as copies",
+            estimate::human_bytes(staged.kept_bytes)
+        )
+    } else {
+        String::new()
+    };
+    let reused = if staged.reused_bytes > 0 {
+        format!(
+            "; {} unchanged since the last generation is reused, not copied",
+            estimate::human_bytes(staged.reused_bytes)
+        )
+    } else {
+        String::new()
+    };
+    pr.note(&format!(
+        "snapshot: sealing {copy_text} of source files in {}: each file is copied, its prepared \
+         records are written, and the copy is released once they are on disk{kept}{reused} ({})",
+        snapshots.display(),
+        free_space_clause(free)
+    ));
+    let need = staged.copy_bytes.saturating_add(staged.largest_released);
+    if let Some(free) = free.filter(|free| *free < need) {
+        pr.warn(&format!(
+            "warning: sealing this snapshot needs about {} in {} (the prepared records, about the \
+             size of the files they come from, plus the copy being prepared), and only {} is free \
+             there: sealing will fail with 'No space left on device' once that filesystem is \
+             full. Free space there before the run seals, or start it again with --state-dir on \
+             a filesystem with more room",
+            estimate::human_bytes(need),
+            snapshots.display(),
+            estimate::human_bytes(free)
+        ));
+    }
+}
+
 fn sample_limit_bytes(family: Family, path: &Path) -> Option<u64> {
     // Only the test override reads the path; the shipped caps are per-family.
     #[cfg(not(test))]
@@ -11425,6 +11572,13 @@ fn run_index_report_inner(
             // only source that can name a PDF page boundary's
             // predecessor (p2-s0 follows the LAST section of page 1).
             let mut prev_section: Option<(String, String)> = None;
+            // A large file is staged in full before any of it is sent: say
+            // what that costs, and where, before it starts.
+            let staging_started = Instant::now();
+            let announce_staging = f.size >= staging_note_min_bytes(&state_dir);
+            if announce_staging {
+                note_phase_b_staging(&pr, &state_dir, &f.rel, f.size);
+            }
             let mut staged = match stage::Stage::create_in(&state_dir) {
                 Ok(file) => file,
                 Err(error) => {
@@ -11843,10 +11997,14 @@ fn run_index_report_inner(
             // The stage is consumed here whether or not the send runs: an
             // early error drops it, and the unnamed file goes with it.
             let staged_len = staged.raw_bytes();
+            let mut staged_disk = 0u64;
             let mut reader = None;
             if send_err.is_none() {
                 match staged.into_reader() {
-                    Ok((r, _disk)) => reader = Some(r),
+                    Ok((r, disk)) => {
+                        reader = Some(r);
+                        staged_disk = disk;
+                    }
                     Err(error) => {
                         send_err = Some(format!("finish staged records for {}: {error}", f.rel));
                     }
@@ -11899,6 +12057,16 @@ fn run_index_report_inner(
                 // submission: the shared buffer (#1147) may hold these
                 // bytes for a moment before a flush carries them, and
                 // the bar measures reading work, not wire time.
+                if announce_staging {
+                    pr.note(&format!(
+                        "phase B: {} staged as {} of records ({} compressed) in {:.1}s; sending \
+                         them to the node now",
+                        f.rel,
+                        estimate::human_bytes(staged_len),
+                        estimate::human_bytes(staged_disk),
+                        staging_started.elapsed().as_secs_f64()
+                    ));
+                }
                 let mut staged_sent = 0u64;
                 // A LOCAL chunk, not the bulk: chunks join whatever
                 // the other workers are staging in the shared buffer,

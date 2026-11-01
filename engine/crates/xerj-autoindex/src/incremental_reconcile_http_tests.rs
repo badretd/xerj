@@ -6667,6 +6667,101 @@ fn no_graph_index_bar_moves_inside_one_large_file() {
     );
 }
 
+/// A `--no-graph` seal copies every new source file into the snapshot,
+/// writes its prepared records, and (since #2421) releases the copy once
+/// those records are on disk, all before the first document is sent. The
+/// copy is known exactly before it starts, so a large one is announced with
+/// its size and location, says that the copies are released, and is warned
+/// about when the state directory's filesystem cannot hold what the seal
+/// needs at its peak: the prepared records plus the copy being prepared.
+#[test]
+fn the_snapshot_says_what_it_copies_and_where_before_sealing() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    // This test's own threshold (1 KiB, not 256 MiB) and free-space reading.
+    fs::write(
+        state_dir
+            .path()
+            .join(".autoindex-test-staging-note-min-bytes"),
+        "1024",
+    )
+    .unwrap();
+    fs::write(
+        state_dir
+            .path()
+            .join(".autoindex-test-staging-available-bytes"),
+        "1000",
+    )
+    .unwrap();
+    let jsonl: String = (0..200)
+        .map(|i| format!("{{\"id\":{i},\"text\":\"record number {i} of the fixture\"}}\n"))
+        .collect();
+    fs::write(corpus.path().join("passages.jsonl"), &jsonl).unwrap();
+    let size = jsonl.len() as u64;
+    let endpoint = HttpEndpoint::start();
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, _) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    assert_eq!(code, 0, "a note or a warning never changes the outcome");
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let copied = crate::estimate::human_bytes(size);
+    let snapshots = state_dir.path().join("sync-snapshots");
+    let note = stream
+        .lines()
+        .find(|line| line.starts_with("snapshot: sealing "))
+        .unwrap_or_else(|| panic!("no snapshot note: {stream}"));
+    assert!(
+        note.starts_with(&format!(
+            "snapshot: sealing {copied} of source files in {}: each file is copied, its \
+             prepared records are written, and the copy is released once they are on disk",
+            snapshots.display()
+        )),
+        "{note}"
+    );
+    assert!(
+        !note.contains("stay as copies"),
+        "the one file has records to prepare, so no copy stays: {note}"
+    );
+    assert!(note.ends_with("(1000 B free there)"), "{note}");
+    // At its peak the seal holds the prepared records (about the file's size)
+    // and the copy being prepared: twice the one file here.
+    let need = crate::estimate::human_bytes(2 * size);
+    let warning = stream
+        .lines()
+        .find(|line| line.starts_with("warning: sealing this snapshot needs about "))
+        .unwrap_or_else(|| panic!("no warning: {stream}"));
+    assert!(
+        warning.starts_with(&format!(
+            "warning: sealing this snapshot needs about {need} in {}",
+            snapshots.display()
+        )),
+        "{warning}"
+    );
+    assert!(warning.contains("only 1000 B is free there"), "{warning}");
+    // And it did release the copy: the committed snapshot holds no blob for a
+    // file whose records were prepared.
+    let blobs: Vec<_> = fs::read_dir(&snapshots)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().join("blobs").is_dir())
+        .flat_map(|entry| fs::read_dir(entry.path().join("blobs")).unwrap())
+        .collect();
+    assert!(blobs.is_empty(), "copies left in the snapshot: {blobs:?}");
+}
+
 /// #933: a bulk failing while other operations are in flight — the state the
 /// serial loop never had to think about. The run stops, everything already
 /// dispatched is drained and journaled, and the same command resumes to an

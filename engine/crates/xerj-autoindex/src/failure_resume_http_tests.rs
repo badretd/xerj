@@ -1242,6 +1242,111 @@ fn a_single_large_jsonl_moves_the_index_bar_before_it_finishes() {
     );
 }
 
+/// One JSONL corpus run on the legacy path with this test's own staging
+/// threshold and free-space reading injected into its state directory.
+/// Returns the progress stream and the state directory's name.
+fn run_staging_fixture(available_bytes: u64) -> (String, String) {
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    // 1 KiB instead of 256 MiB, and a free-space reading this test chooses.
+    fs::write(
+        state_dir
+            .path()
+            .join(".autoindex-test-staging-note-min-bytes"),
+        "1024",
+    )
+    .unwrap();
+    fs::write(
+        state_dir
+            .path()
+            .join(".autoindex-test-staging-available-bytes"),
+        available_bytes.to_string(),
+    )
+    .unwrap();
+    let jsonl: String = (0..200)
+        .map(|i| format!("{{\"id\":{i},\"text\":\"record number {i} of the fixture\"}}\n"))
+        .collect();
+    fs::write(corpus.path().join("passages.jsonl"), &jsonl).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, _) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    assert_eq!(code, 0, "a note or a warning never changes the outcome");
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let name = state_dir
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    (stream, name)
+}
+
+/// Phase B writes all of a file's records to a staging file in the state
+/// directory before it sends any of them. On the 10 GB single-JSONL report
+/// that was ~2.5 minutes and a 13.8 GB file under `~/.xerj/autoindex/…`
+/// before the first document, with nothing on the stream to say so. A large
+/// file now says what it stages, where, and how much room is there — before
+/// staging starts — and how much it staged once it is done.
+#[test]
+fn a_large_file_says_what_phase_b_stages_and_where_before_sending_it() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (stream, state_name) = run_staging_fixture(64 << 30);
+    let lines: Vec<&str> = stream.lines().collect();
+    let staging = lines
+        .iter()
+        .position(|line| line.starts_with("phase B: staging passages.jsonl ("))
+        .unwrap_or_else(|| panic!("no staging note: {stream}"));
+    assert!(lines[staging].contains(&state_name), "{}", lines[staging]);
+    assert!(
+        lines[staging].contains("(64.0 GB free there)"),
+        "{}",
+        lines[staging]
+    );
+    let staged = lines
+        .iter()
+        .position(|line| line.starts_with("phase B: passages.jsonl staged as "))
+        .unwrap_or_else(|| panic!("no staged note: {stream}"));
+    assert!(staging < staged, "{stream}");
+    assert!(!stream.contains("warning:"), "{stream}");
+}
+
+/// The same note, when the state directory's filesystem cannot even hold the
+/// file itself: a warning that survives `--quiet`, naming both numbers.
+#[test]
+fn phase_b_warns_when_the_state_dir_cannot_hold_a_large_file() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (stream, state_name) = run_staging_fixture(1000);
+    let warning = stream
+        .lines()
+        .find(|line| line.starts_with("warning: passages.jsonl stages up to about "))
+        .unwrap_or_else(|| panic!("no warning: {stream}"));
+    assert!(warning.contains(&state_name), "{warning}");
+    assert!(warning.contains("only 1000 B is free there"), "{warning}");
+    assert!(warning.contains("No space left on device"), "{warning}");
+}
+
 /// #955 on the legacy (graph) path, where the defect was SILENT. The catalog
 /// went out as one `_bulk` whatever `--bulk-mb` said; past the engine's
 /// `max_actions_per_bulk` the answer is one item of status 413, which is

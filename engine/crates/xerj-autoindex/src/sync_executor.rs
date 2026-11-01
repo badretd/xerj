@@ -3369,6 +3369,63 @@ fn create_snapshot_inner(
         })
         .unwrap_or_default();
     let mut files = Vec::with_capacity(inventory.files.len());
+    // Each file's preparation identity, computed once: the staging count below
+    // and the reuse test in the seal loop both need it. `None` = nothing to
+    // prepare (no plan, or a junk/skipped file).
+    let identities: Vec<Option<String>> = inventory
+        .keys
+        .iter()
+        .map(|content_id| {
+            let assignment = plan.and_then(|plan| plan.files.get(content_id.as_str()));
+            match (lookup.as_ref(), assignment) {
+                (Some(lookup), Some(assignment)) => prepared_artifact_identity(
+                    chunker_identity,
+                    lookup,
+                    content_id.as_str(),
+                    assignment,
+                )
+                .map(Some),
+                _ => Ok(None),
+            }
+        })
+        .collect::<Result<_>>()?;
+    // What this seal writes before the first document is sent, known exactly
+    // here, so said before it starts. Every file the prior generation cannot
+    // lend is copied. Since #2421 a copy whose file has prepared records is
+    // released once those records are on disk; only a file with nothing to
+    // prepare keeps its copy.
+    let mut staged = crate::SnapshotStaging::default();
+    for (((source, content_id), content_digest), identity) in inventory
+        .files
+        .iter()
+        .zip(&inventory.keys)
+        .zip(&inventory.digests)
+        .zip(&identities)
+    {
+        // The seal loop's reuse test (`reusable` below), on the same inputs.
+        let lent = reuse_by_content
+            .get(content_id.as_str())
+            .is_some_and(|prior| {
+                prior.content_digest == *content_digest
+                    && prior.content_size == source.size
+                    && (!prior.blob_released
+                        || (prior.prepared.is_some()
+                            && prior.prepared_identity.is_some()
+                            && prior.prepared_identity == *identity))
+            });
+        if lent {
+            staged.reused_bytes += source.size;
+        } else if identity.is_some() {
+            staged.copy_bytes += source.size;
+            staged.largest_released = staged.largest_released.max(source.size);
+        } else {
+            staged.copy_bytes += source.size;
+            staged.kept_bytes += source.size;
+        }
+    }
+    if staged.copy_bytes >= crate::staging_note_min_bytes(state_dir) {
+        crate::note_snapshot_staging(pr, state_dir, &root, &staged);
+    }
     // Entered only when there is work to report: a retry that reuses a verified
     // final snapshot returned above and never claims a phase it did not run.
     pr.phase("snapshot", inventory.files.len() as u64, source_bytes);
@@ -3396,15 +3453,7 @@ fn create_snapshot_inner(
         // mutable tree, and the inventory it is verified against lists the
         // file), but there is nothing to prepare for it: `prepared: None`.
         let assignment = plan.and_then(|plan| plan.files.get(content_id.as_str()));
-        let prepared_identity = match (lookup.as_ref(), assignment) {
-            (Some(lookup), Some(assignment)) => Some(prepared_artifact_identity(
-                chunker_identity,
-                lookup,
-                content_id.as_str(),
-                assignment,
-            )?),
-            _ => None,
-        };
+        let prepared_identity = identities[ordinal].clone();
         let reusable = reuse_by_content
             .get(content_id.as_str())
             .copied()
