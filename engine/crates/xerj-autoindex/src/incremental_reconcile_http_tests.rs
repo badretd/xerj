@@ -6606,6 +6606,67 @@ fn no_graph_replay_applies_files_in_parallel_and_converges() {
     started_precedes_committed(state_dir.path());
 }
 
+/// The `--no-graph` twin of the legacy path's single-large-file test (and the
+/// route `--approve fast` takes): the replay streams one file's sealed NDJSON
+/// in several bulks, and the index bar must move with each accepted bulk
+/// instead of printing `pct=0.0 items=0/1` until the file's last bulk returns.
+#[test]
+fn no_graph_index_bar_moves_inside_one_large_file() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let text = "lorem ipsum dolor sit amet consectetur ".repeat(12);
+    let jsonl: String = (0..6_000)
+        .map(|i| format!("{{\"id\":\"p{i}\",\"title\":\"passage {i}\",\"text\":\"{text}\"}}\n"))
+        .collect();
+    fs::write(corpus.path().join("passages.jsonl"), &jsonl).unwrap();
+    let endpoint = HttpEndpoint::start();
+    endpoint.state.lock().unwrap().data_bulk_delay_ms = 250;
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+    config.progress_interval = Some(std::time::Duration::from_millis(50));
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, _) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    assert_eq!(code, 0);
+    assert!(
+        endpoint.data_bulk_requests() >= 3,
+        "the fixture must replay the file in several bulks: {}",
+        endpoint.data_bulk_requests()
+    );
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    let in_flight: Vec<f64> = stream
+        .lines()
+        .filter(|line| {
+            line.starts_with("xerj-progress phase=index ") && line.contains(" items=0/1 ")
+        })
+        .filter_map(crate::progress::record_pct)
+        .collect();
+    assert!(
+        in_flight.len() >= 5,
+        "the ticker must have sampled the file in flight: {stream}"
+    );
+    assert!(
+        in_flight.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the bar never moves backwards: {in_flight:?}"
+    );
+    assert!(
+        in_flight.iter().any(|pct| *pct > 0.0 && *pct < 100.0),
+        "the bar must move while the only file is still being replayed, not sit at 0.0 \
+         until its last bulk returns: {in_flight:?}"
+    );
+}
+
 /// #933: a bulk failing while other operations are in flight — the state the
 /// serial loop never had to think about. The run stops, everything already
 /// dispatched is drained and journaled, and the same command resumes to an

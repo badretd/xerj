@@ -3187,19 +3187,45 @@ const UNITY_SAMPLE_LIMIT: u64 = 512 << 20;
 /// (all text, or all attachments) sees a bar that is uneven, never wrong.
 const CONTAINER_EXTRACT_PERCENT: u64 = 45;
 
-/// Progress position for "the splitter has reached `offset`" in a file of
-/// `size` bytes. `offset` is clamped to `size`: in a gzipped mailbox it counts
-/// DECOMPRESSED bytes and runs past the size on disk, and extraction must not
-/// spend the share that belongs to sending.
-fn container_extract_credit(size: u64, offset: u64) -> u64 {
-    // u128: a u64 byte position times 45 can overflow a u64.
-    ((u128::from(offset.min(size)) * u128::from(CONTAINER_EXTRACT_PERCENT)) / 100) as u64
+/// The same split for every other file: JSONL, CSV/TSV, logs, line text and
+/// any family whose reader reports how far into the file it has got
+/// (`extract::extract_tracked`).
+///
+/// Small, unlike [`CONTAINER_EXTRACT_PERCENT`], because staging these files is
+/// one parse-and-write pass while sending them is paced by the node. One
+/// 629,146,621-byte JSONL (475,479 records) against a local node finished
+/// staging under 20 s into a 2,638 s phase B; the single 10 GB JSONL this was
+/// reported on staged in about 2.5 minutes and then sent for hours. A share
+/// near that ratio keeps the two halves moving the bar at a similar speed, so
+/// the ETA — extrapolated from that speed — is not a minutes-long promise made
+/// while staging and broken by the send. At or under the progress module's 2%
+/// ETA floor, a lone file shows no ETA until its sending has been measured.
+/// Both ends stay exact whatever this is.
+const STREAM_EXTRACT_PERCENT: u64 = 1;
+
+/// Share of a file's progress that belongs to extracting and staging it.
+fn extract_percent(family: Family) -> u64 {
+    if family == Family::Mbox {
+        CONTAINER_EXTRACT_PERCENT
+    } else {
+        STREAM_EXTRACT_PERCENT
+    }
+}
+
+/// Progress position for "extraction has reached `offset`" in a file of
+/// `size` bytes whose first `percent` belongs to extraction. `offset` is
+/// clamped to `size`: in a gzipped mailbox it counts DECOMPRESSED bytes and
+/// runs past the size on disk, and extraction must not spend the share that
+/// belongs to sending.
+fn extract_credit(size: u64, offset: u64, percent: u64) -> u64 {
+    // u128: a u64 byte position times the percent can overflow a u64.
+    ((u128::from(offset.min(size)) * u128::from(percent)) / 100) as u64
 }
 
 /// Progress position for "`sent` of `staged` bytes have reached the engine",
-/// for a file of `size` bytes.
-fn container_send_credit(size: u64, sent: u64, staged: u64) -> u64 {
-    let base = container_extract_credit(size, size);
+/// for a file of `size` bytes whose first `percent` belongs to extraction.
+fn send_credit(size: u64, sent: u64, staged: u64, percent: u64) -> u64 {
+    let base = extract_credit(size, size, percent);
     if staged == 0 {
         return base;
     }
@@ -11472,6 +11498,11 @@ fn run_index_report_inner(
                     }
                 }
             }
+            // How far the extractor has read into this file on disk, and how
+            // much of the file's bar that reading may move (the rest moves as
+            // the staged records are sent, below).
+            let read_position = extract::ReadPosition::new();
+            let split = extract_percent(sn.family);
             {
                 let mut sink = |rec: extract::RawRecord| -> bool {
                     let Some(slug) = asg.get(&rec.group).or_else(|| asg.get(&None)) else {
@@ -11485,16 +11516,20 @@ fn run_index_report_inner(
                         file_junk += 1;
                         return true;
                     };
-                    // Progress INSIDE a mailbox. One Takeout mbox is
-                    // the whole corpus, so crediting its bytes only
-                    // when the file finishes left the bar at 0.0% and
-                    // `since_progress_s` climbing for the entire run.
-                    // Every mbox record says how far into the file its
-                    // message began; that is the position.
-                    if sn.family == Family::Mbox {
-                        if let Some(offset) = extract::mbox::locator_offset(&rec.locator) {
-                            in_flight.advance_to(container_extract_credit(f.size, offset));
-                        }
+                    // Progress INSIDE one file. One Takeout mbox, or one
+                    // multi-GB JSONL, is the whole corpus, so crediting its
+                    // bytes only when the file finishes left the bar at
+                    // 0.0% and `since_progress_s` climbing for the entire
+                    // run. Every mbox record says how far into the file
+                    // its message began; every other family's reader says
+                    // how far into the file it has read.
+                    let position = if sn.family == Family::Mbox {
+                        extract::mbox::locator_offset(&rec.locator)
+                    } else {
+                        Some(read_position.bytes())
+                    };
+                    if let Some(position) = position {
+                        in_flight.advance_to(extract_credit(f.size, position, split));
                     }
                     let mut fields = rec.fields;
                     // BEFORE coercion, not after: these are ordinary
@@ -11669,7 +11704,7 @@ fn run_index_report_inner(
                         }
                     }
                 } else {
-                    extract::extract(&f.path, &sn, None, &mut sink)
+                    extract::extract_tracked(&f.path, &sn, &read_position, &mut sink)
                 };
                 match res {
                     Ok(stats) => {
@@ -11856,13 +11891,14 @@ fn run_index_report_inner(
                 }
             }
             if let Some(mut reader) = reader.filter(|_| send_err.is_none()) {
-                // The second half of a mailbox's bar: staged bytes
+                // The second half of the file's bar: staged bytes
                 // handed to the engine, out of staged bytes in total.
-                // Credit is taken at submission: the shared buffer
-                // (#1147) may hold these bytes for a moment before a
-                // flush carries them, and the bar measures reading
-                // work, not wire time.
-                let credit_send = sn.family == Family::Mbox;
+                // Every family, not only mailboxes: a single large
+                // JSONL spends nearly all of its time here, behind
+                // the node's ingest rate. Credit is taken at
+                // submission: the shared buffer (#1147) may hold these
+                // bytes for a moment before a flush carries them, and
+                // the bar measures reading work, not wire time.
                 let mut staged_sent = 0u64;
                 // A LOCAL chunk, not the bulk: chunks join whatever
                 // the other workers are staging in the shared buffer,
@@ -11909,13 +11945,7 @@ fn run_index_report_inner(
                         pipe.submit(file_token, std::mem::take(&mut chunk), docs);
                         docs = 0;
                         chunk.reserve(bulk_cut);
-                        if credit_send {
-                            in_flight.advance_to(container_send_credit(
-                                f.size,
-                                staged_sent,
-                                staged_len,
-                            ));
-                        }
+                        in_flight.advance_to(send_credit(f.size, staged_sent, staged_len, split));
                     }
                 }
                 if !chunk.is_empty() && !pipe.failed(file_token) {
@@ -16797,23 +16827,29 @@ mod unity_pipeline_tests {
 
 #[cfg(test)]
 mod container_progress_tests {
-    use super::{container_extract_credit, container_send_credit, CONTAINER_EXTRACT_PERCENT};
+    use super::{
+        extract_credit, extract_percent, send_credit, CONTAINER_EXTRACT_PERCENT,
+        STREAM_EXTRACT_PERCENT,
+    };
+    use crate::sniff::Family;
 
     /// Whatever the split, the two stages together cover the file EXACTLY:
     /// extraction ends where sending starts, sending ends on the file's size.
     #[test]
     fn the_two_stages_meet_and_end_on_the_file_size() {
-        for size in [0u64, 1, 99, 100, 1_073_777_879, u64::MAX] {
-            let seam = container_extract_credit(size, size);
-            assert_eq!(container_send_credit(size, 0, 1000), seam, "size={size}");
-            assert_eq!(container_send_credit(size, 1000, 1000), size, "size={size}");
-            assert!(seam <= size);
-            // Nothing staged (every entry was junk): stay at the seam; the
-            // guard's drop credits the rest.
-            assert_eq!(container_send_credit(size, 0, 0), seam);
+        for percent in [CONTAINER_EXTRACT_PERCENT, STREAM_EXTRACT_PERCENT] {
+            for size in [0u64, 1, 99, 100, 1_073_777_879, u64::MAX] {
+                let seam = extract_credit(size, size, percent);
+                assert_eq!(send_credit(size, 0, 1000, percent), seam, "size={size}");
+                assert_eq!(send_credit(size, 1000, 1000, percent), size, "size={size}");
+                assert!(seam <= size);
+                // Nothing staged (every entry was junk): stay at the seam; the
+                // guard's drop credits the rest.
+                assert_eq!(send_credit(size, 0, 0, percent), seam);
+            }
         }
         assert_eq!(
-            container_extract_credit(1000, 1000),
+            extract_credit(1000, 1000, CONTAINER_EXTRACT_PERCENT),
             10 * CONTAINER_EXTRACT_PERCENT
         );
     }
@@ -16821,17 +16857,19 @@ mod container_progress_tests {
     #[test]
     fn credit_is_monotonic_and_never_overflows() {
         let size = u64::MAX;
-        let mut last = 0;
-        for offset in [0, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
-            let c = container_extract_credit(size, offset);
-            assert!(c >= last && c <= size);
-            last = c;
-        }
-        let mut last = container_extract_credit(size, size);
-        for sent in [0u64, 1, 500, 999, 1000, 5000] {
-            let c = container_send_credit(size, sent, 1000);
-            assert!(c >= last && c <= size, "sent={sent}");
-            last = c;
+        for percent in [CONTAINER_EXTRACT_PERCENT, STREAM_EXTRACT_PERCENT] {
+            let mut last = 0;
+            for offset in [0, 1, u64::MAX / 3, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+                let c = extract_credit(size, offset, percent);
+                assert!(c >= last && c <= size);
+                last = c;
+            }
+            let mut last = extract_credit(size, size, percent);
+            for sent in [0u64, 1, 500, 999, 1000, 5000] {
+                let c = send_credit(size, sent, 1000, percent);
+                assert!(c >= last && c <= size, "sent={sent}");
+                last = c;
+            }
         }
     }
 
@@ -16841,8 +16879,27 @@ mod container_progress_tests {
     fn a_decompressed_offset_past_the_file_size_is_clamped() {
         let size = 1000;
         assert_eq!(
-            container_extract_credit(size, 50_000),
-            container_extract_credit(size, size)
+            extract_credit(size, 50_000, CONTAINER_EXTRACT_PERCENT),
+            extract_credit(size, size, CONTAINER_EXTRACT_PERCENT)
+        );
+    }
+
+    /// A mailbox keeps its measured split; every other family stages with the
+    /// small streaming share, so a lone large JSONL moves its bar mostly while
+    /// it is being SENT, which is where its time goes.
+    #[test]
+    fn mailboxes_keep_their_split_and_every_other_family_streams() {
+        assert_eq!(extract_percent(Family::Mbox), CONTAINER_EXTRACT_PERCENT);
+        for family in [Family::Jsonl, Family::Csv, Family::Logs, Family::TxtLines] {
+            assert_eq!(
+                extract_percent(family),
+                STREAM_EXTRACT_PERCENT,
+                "{family:?}"
+            );
+        }
+        assert_eq!(
+            extract_credit(629_146_621, 629_146_621, STREAM_EXTRACT_PERCENT),
+            6_291_466
         );
     }
 }

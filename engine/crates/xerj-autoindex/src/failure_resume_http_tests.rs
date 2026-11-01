@@ -190,6 +190,11 @@ struct MockState {
     /// persist nothing. Status 400 is not a `server_error`, so it used to be
     /// a warning on an exit-0 run.
     reject_catalog_items: bool,
+    /// Opt-in: hold every DATA bulk this long before answering it — the
+    /// shape of a node that ingests slower than autoindex extracts, which is
+    /// where a single large file spends almost all of its time. Catalog,
+    /// graph and every other request answer at once.
+    data_bulk_delay_ms: u64,
 }
 
 struct MockEndpoint {
@@ -780,6 +785,14 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
     if is_graph {
         return json!({"errors": false, "items": []});
     }
+    if is_data {
+        // Read under the lock, slept without it: the state is shared with the
+        // test thread, which must stay free to inspect it meanwhile.
+        let delay_ms = state.lock().unwrap().data_bulk_delay_ms;
+        if delay_ms > 0 {
+            thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+    }
     {
         // Checked before anything is applied and by LINES, as
         // `xerj-engine/src/bulk.rs` does.
@@ -1157,6 +1170,75 @@ fn the_legacy_terminal_line_and_run_document_report_code_coverage() {
             .as_str()
             .is_some_and(|defs| defs.contains("struct AlphaConfig")),
         "{ast}"
+    );
+}
+
+/// A corpus that is ONE large streaming file must move the index bar while
+/// that file is still in flight. Bytes used to be credited only when a file
+/// finished — mailboxes excepted — so a run over a single 10 GB JSONL printed
+/// `pct=0.0 items=0/1 … eta_s=unknown` on every tick for hours while the node
+/// ingested ~1,100 docs/s: the signature of a hang, to a person and to an
+/// agent reading stderr. The endpoint holds every data bulk for a moment, so
+/// the file spends most of its time being sent, exactly as on a real node.
+#[test]
+fn a_single_large_jsonl_moves_the_index_bar_before_it_finishes() {
+    let _guard = FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _io_guard = state::FILE_DONE_IO_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let _sink_guard = crate::progress::SINK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let text = "lorem ipsum dolor sit amet consectetur ".repeat(12);
+    let jsonl: String = (0..6_000)
+        .map(|i| format!("{{\"id\":\"p{i}\",\"title\":\"passage {i}\",\"text\":\"{text}\"}}\n"))
+        .collect();
+    fs::write(corpus.path().join("passages.jsonl"), &jsonl).unwrap();
+    let endpoint = MockEndpoint::start(usize::MAX);
+    endpoint.state.lock().unwrap().data_bulk_delay_ms = 250;
+    let mut config = cfg(corpus.path(), state_dir.path(), &endpoint.url);
+    // ~3.2 MB of source stages to several 1 MiB bulks, each held 250 ms.
+    config.bulk_mb = 1;
+    config.quiet = false;
+    config.progress = crate::progress::ProgressMode::Plain;
+    config.progress_interval = Some(std::time::Duration::from_millis(50));
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let (code, _) = {
+        let _sink = crate::progress::install_test_sink(&buffer);
+        run_index_report(config).unwrap()
+    };
+    assert_eq!(code, 0);
+    let data_bulks = endpoint.state.lock().unwrap().data_bulk_number;
+    assert!(
+        data_bulks >= 3,
+        "the fixture must send the file in several bulks: {data_bulks}"
+    );
+    let stream = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    // Every index-phase tick taken while the one file was still in flight.
+    let in_flight: Vec<f64> = stream
+        .lines()
+        .filter(|line| {
+            line.starts_with("xerj-progress phase=index ") && line.contains(" items=0/1 ")
+        })
+        .filter_map(crate::progress::record_pct)
+        .collect();
+    assert!(
+        in_flight.len() >= 5,
+        "the ticker must have sampled the file in flight: {stream}"
+    );
+    assert!(
+        in_flight.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the bar never moves backwards: {in_flight:?}"
+    );
+    assert!(
+        in_flight.iter().any(|pct| *pct > 0.0 && *pct < 100.0),
+        "the bar must move while the only file is still being indexed, not sit at 0.0 \
+         until it finishes: {in_flight:?}"
     );
 }
 

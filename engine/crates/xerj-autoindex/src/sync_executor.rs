@@ -973,12 +973,17 @@ impl<'a> EsSyncBackend<'a> {
     /// over operations whose groups — and therefore whose documents, selected
     /// by `ax_file` content id — are disjoint. The body is the serial loop's
     /// `apply`, unchanged; only the receiver changed.
+    ///
+    /// `in_flight` is the operation's own progress entry. Its byte weight is
+    /// the sealed NDJSON the operation replays, so an upsert credits it bulk
+    /// by bulk as the node accepts them, instead of all at once at the end.
     fn apply_shared(
         &self,
         operation: &SyncOperation,
         base: &CommittedManifest,
         desired: &GenerationManifest,
         snapshot: &SourceSnapshot,
+        in_flight: Option<&crate::progress::FileGuard<'_>>,
     ) -> Result<()> {
         anyhow::ensure!(
             desired
@@ -1001,7 +1006,7 @@ impl<'a> EsSyncBackend<'a> {
                 let new = new.context("upsert operation has no desired group")?;
                 // Remove a partial prior retry of the desired identity too.
                 self.delete_group(new, &desired.plan)?;
-                self.replay_prepared(snapshot, &new.content_id)?;
+                self.replay_prepared(snapshot, &new.content_id, in_flight)?;
             }
             crate::sync::SyncOperationKind::Metadata => {
                 self.replay_metadata(
@@ -1013,7 +1018,12 @@ impl<'a> EsSyncBackend<'a> {
         Ok(())
     }
 
-    fn replay_prepared(&self, snapshot: &SourceSnapshot, content_id: &str) -> Result<()> {
+    fn replay_prepared(
+        &self,
+        snapshot: &SourceSnapshot,
+        content_id: &str,
+        in_flight: Option<&crate::progress::FileGuard<'_>>,
+    ) -> Result<()> {
         // Cache-first resolution of the sealed artifact (#1224): a linear
         // scan of the snapshot's files per upsert is quadratic over a corpus
         // run. Falls back to `prepared_for`'s scan when no replay cache
@@ -1025,8 +1035,17 @@ impl<'a> EsSyncBackend<'a> {
             .with_context(|| format!("content {content_id} has no sealed prepared artifact"))?;
         let snapshot_dir = self.state_dir.join("sync-snapshots").join(&snapshot.tx_id);
         let file = File::open(snapshot_dir.join(&prepared.relative_ndjson))?;
+        // Bodies are consecutive slices of the artifact, so their running
+        // length is the position in the bytes this operation is weighted by.
+        let mut accepted = 0u64;
         stream_ndjson_pairs(BufReader::new(file), self.bulk_bytes, |body| {
-            checked_bulk(self.es, body)
+            let length = body.len() as u64;
+            checked_bulk(self.es, body)?;
+            accepted += length;
+            if let Some(in_flight) = in_flight {
+                in_flight.advance_to(accepted);
+            }
+            Ok(())
         })
     }
 
@@ -1881,7 +1900,7 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         desired: &GenerationManifest,
         snapshot: &SourceSnapshot,
     ) -> Result<()> {
-        self.apply_shared(operation, base, desired, snapshot)
+        self.apply_shared(operation, base, desired, snapshot, self.in_flight.as_ref())
     }
 
     fn replay_operations(
@@ -1918,8 +1937,8 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
             // The in-flight entry IS this worker's file: the guard counts the
             // item done on every exit path, exactly as the serial loop's
             // `operation_begins`/`operation_applied` pair does (#931).
-            let _guard = pr.file(&item.rel, item.bytes);
-            this.apply_shared(item.operation, base, desired, snapshot)
+            let guard = pr.file(&item.rel, item.bytes);
+            this.apply_shared(item.operation, base, desired, snapshot, Some(&guard))
         };
         /// The serial loop's two journal writes, verbatim: Started before
         /// dispatch, Committed after the apply returned — the durable order

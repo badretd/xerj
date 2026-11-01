@@ -35,9 +35,11 @@ use crate::sniff::{Family, Sniffed};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Where a record's FIELD NAMES came from — the input to dataset clustering.
@@ -141,14 +143,88 @@ pub const SECTION_OVERLAP: usize = 200;
 /// next word instead, or keeps the char boundary when there is none.
 const WORD_SNAP_BYTES: usize = 64;
 
+/// How far one extraction has read into its file on disk — see
+/// [`extract_tracked`].
+///
+/// For a gzip file this counts COMPRESSED bytes, the unit the file's size on
+/// disk is measured in, so the position cannot run past that size the way a
+/// decompressed offset does.
+#[derive(Debug, Clone, Default)]
+pub struct ReadPosition(Arc<AtomicU64>);
+
+impl ReadPosition {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bytes of the file read so far.
+    pub fn bytes(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+thread_local! {
+    /// The position [`open_reader`] publishes into while [`extract_tracked`]
+    /// runs on this thread. `None` everywhere else, so sampling, sniffing and
+    /// every other caller of `open_reader` are untouched.
+    static READ_POSITION: RefCell<Option<ReadPosition>> = const { RefCell::new(None) };
+}
+
+/// Installs a [`ReadPosition`] for the current thread and restores whatever
+/// was there before on drop — on an early return and on an unwind alike — so
+/// a position can never leak into the next file this worker reads.
+struct ReadPositionScope(Option<ReadPosition>);
+
+impl ReadPositionScope {
+    fn enter(position: &ReadPosition) -> Self {
+        Self(READ_POSITION.with(|slot| slot.replace(Some(position.clone()))))
+    }
+}
+
+impl Drop for ReadPositionScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        READ_POSITION.with(|slot| *slot.borrow_mut() = previous);
+    }
+}
+
+/// Counts the bytes read from the underlying file and publishes the furthest
+/// point reached. `fetch_max`, never a plain store: a family that opens its
+/// file twice — a short prefix probe, then the full stream — must not move the
+/// published position backwards.
+struct PositionReader<R> {
+    inner: R,
+    read: u64,
+    position: ReadPosition,
+}
+
+impl<R: Read> Read for PositionReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read = self.read.saturating_add(n as u64);
+        self.position.0.fetch_max(self.read, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
 /// Open a (possibly gzipped) file as a buffered reader of DECODED-transparent
 /// bytes, optionally capped at `limit` decoded bytes (sampling).
 pub fn open_reader(path: &Path, gzip: bool, limit: Option<u64>) -> Result<Box<dyn BufRead + Send>> {
     let f = std::fs::File::open(path)?;
+    // Counted BELOW the decoder: a gzip file reports how much of the file on
+    // disk has been consumed, not how much text came out of it.
+    let raw: Box<dyn Read + Send> = match READ_POSITION.with(|slot| slot.borrow().clone()) {
+        Some(position) => Box::new(PositionReader {
+            inner: f,
+            read: 0,
+            position,
+        }),
+        None => Box::new(f),
+    };
     let inner: Box<dyn Read + Send> = if gzip {
-        Box::new(flate2::read::MultiGzDecoder::new(f))
+        Box::new(flate2::read::MultiGzDecoder::new(raw))
     } else {
-        Box::new(f)
+        raw
     };
     // `Send` so a container extractor (mbox) can move the reader to its
     // splitter thread; every concrete reader here is.
@@ -446,6 +522,28 @@ pub fn extract(
         }
         Family::Binary => Ok(ExtractStats::default()),
     }
+}
+
+/// [`extract`] over the whole file, publishing into `position` how far into
+/// `path` the extractor has read so far.
+///
+/// Phase B turns that position into progress INSIDE one file
+/// (`FileGuard::advance_to`). Without it a corpus that is a single large
+/// JSONL, CSV, log or text file credits nothing until the file is done, and
+/// the bar sits at 0.0% for the whole run. The position comes from the reader,
+/// not from record locators, so it holds for every family that streams through
+/// [`open_reader`] — a CSV's `r{row}` locators carry no byte offset at all, and
+/// a gzip file's offsets are decompressed ones. A family that reads through its
+/// own parser (PDF, Office containers, SQLite) publishes nothing here and is
+/// credited when the file finishes, as before.
+pub fn extract_tracked(
+    path: &Path,
+    sn: &Sniffed,
+    position: &ReadPosition,
+    sink: Sink,
+) -> Result<ExtractStats> {
+    let _scope = ReadPositionScope::enter(position);
+    extract(path, sn, None, sink)
 }
 
 // ─── shared helpers ──────────────────────────────────────────────────────
@@ -2237,5 +2335,158 @@ mod phrase_skip_tests {
             text.contains("wait_for_register"),
             "a stub must stay indexed for xerj def: {text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_position_tests {
+    use super::*;
+    use crate::sniff::CsvDialect;
+    use std::io::Write;
+
+    fn sniffed(family: Family, gzip: bool) -> Sniffed {
+        Sniffed {
+            family,
+            gzip,
+            binary_kind: None,
+            csv: (family == Family::Csv).then_some(CsvDialect {
+                delim: b',',
+                has_header: true,
+                decimal_comma: false,
+            }),
+            encoding: "utf-8",
+            logical_name: None,
+        }
+    }
+
+    /// The position the sink saw at each record, and where it ended.
+    fn positions_seen(path: &Path, sn: &Sniffed) -> (Vec<u64>, u64) {
+        let position = ReadPosition::new();
+        let mut seen = Vec::new();
+        let stats = extract_tracked(path, sn, &position, &mut |_| {
+            seen.push(position.bytes());
+            true
+        })
+        .unwrap();
+        assert_eq!(stats.records, seen.len() as u64);
+        (seen, position.bytes())
+    }
+
+    /// Several reader buffers' worth of lines whose digits do not repeat, so
+    /// a gzip of them is still several decoder reads long.
+    fn varied_lines(count: u64, render: impl Fn(u64, u64) -> String) -> String {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        (0..count)
+            .map(|i| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                render(i, state)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_jsonl_publishes_how_far_it_has_read_while_records_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.jsonl");
+        let body = varied_lines(4_000, |i, n| {
+            format!(
+                "{{\"id\":{i},\"text\":\"{n:020} {}\"}}\n",
+                "word ".repeat(100)
+            )
+        });
+        std::fs::write(&path, &body).unwrap();
+        let size = body.len() as u64;
+        let (seen, end) = positions_seen(&path, &sniffed(Family::Jsonl, false));
+        assert_eq!(seen.len(), 4_000);
+        assert!(
+            seen.windows(2).all(|pair| pair[0] <= pair[1]),
+            "positions only move forward"
+        );
+        assert!(
+            seen[0] > 0 && seen[0] < size / 2,
+            "the first record is seen long before the end: {} of {size}",
+            seen[0]
+        );
+        // Never behind the bytes the extractor has already consumed: record
+        // `k` cannot be emitted before the reader got past its own line.
+        let mut line_end = 0u64;
+        for (k, line) in body.split_inclusive('\n').enumerate() {
+            line_end += line.len() as u64;
+            assert!(seen[k] >= line_end, "record {k} seen at {}", seen[k]);
+        }
+        assert_eq!(end, size, "the stream ends exactly on the size on disk");
+    }
+
+    /// A CSV's `r{row}` locators carry no byte offset; the reader position is
+    /// the only in-file signal it has.
+    #[test]
+    fn a_csv_publishes_a_position_although_its_locators_carry_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.csv");
+        let rows = varied_lines(20_000, |i, n| format!("{i},{n},{}\n", "cell ".repeat(20)));
+        let body = format!("id,value,text\n{rows}");
+        std::fs::write(&path, &body).unwrap();
+        let size = body.len() as u64;
+        let (seen, end) = positions_seen(&path, &sniffed(Family::Csv, false));
+        assert_eq!(seen.len(), 20_000);
+        assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(seen[0] > 0 && seen[0] < size / 2, "{} of {size}", seen[0]);
+        assert_eq!(end, size);
+    }
+
+    /// Gzip offsets are decompressed ones and run past the size on disk. The
+    /// published position counts what was read from the file itself.
+    #[test]
+    fn a_gzip_file_publishes_compressed_bytes_never_past_its_size_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.jsonl.gz");
+        let body = varied_lines(30_000, |i, n| {
+            format!(
+                "{{\"id\":{i},\"n\":\"{n:020}\",\"text\":\"{}\"}}\n",
+                "abc ".repeat(40)
+            )
+        });
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(body.as_bytes()).unwrap();
+        let compressed = gz.finish().unwrap();
+        std::fs::write(&path, &compressed).unwrap();
+        let size = compressed.len() as u64;
+        assert!(size * 3 < body.len() as u64, "the fixture must compress");
+        let (seen, end) = positions_seen(&path, &sniffed(Family::Jsonl, true));
+        assert_eq!(seen.len(), 30_000);
+        assert!(seen.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(
+            seen.iter().all(|at| *at <= size),
+            "never past the size on disk"
+        );
+        assert!(seen[0] < size, "{} of {size}", seen[0]);
+        assert_eq!(end, size);
+    }
+
+    /// Only `extract_tracked` publishes. Once it returns, the thread's next
+    /// read — any other file, sampling, sniffing — moves nothing.
+    #[test]
+    fn nothing_is_published_outside_extract_tracked() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a.jsonl");
+        let second = dir.path().join("b.jsonl");
+        std::fs::write(&first, "{\"id\":1}\n{\"id\":2}\n").unwrap();
+        std::fs::write(&second, "{\"id\":3}\n".repeat(1_000)).unwrap();
+        let position = ReadPosition::new();
+        let sn = sniffed(Family::Jsonl, false);
+        extract_tracked(&first, &sn, &position, &mut |_| true).unwrap();
+        let after = position.bytes();
+        assert_eq!(after, 18);
+        extract(&second, &sn, None, &mut |_| true).unwrap();
+        let mut reader = open_reader(&second, false, None).unwrap();
+        std::io::copy(&mut reader, &mut std::io::sink()).unwrap();
+        assert_eq!(
+            position.bytes(),
+            after,
+            "a later read moved a finished position"
+        );
+        READ_POSITION.with(|slot| assert!(slot.borrow().is_none(), "scope not restored"));
     }
 }
