@@ -17676,7 +17676,7 @@ impl Index {
         let pinned: Option<String> = self.hnsw_field.read().unwrap().clone();
         if let Some(field) = pinned {
             // Enforced path: only the pinned field ever enters the graph.
-            return extract_numeric_vector(source, &field);
+            return self.graph_vector_of_field(doc_id, source, &field).await;
         }
 
         // No pinned field yet. Cheap sync pre-screen: bail before any async
@@ -17713,7 +17713,55 @@ impl Index {
                 }
             }
         };
-        extract_numeric_vector(source, &field)
+        self.graph_vector_of_field(doc_id, source, &field).await
+    }
+
+    /// The vector `doc_id` contributes to the graph of the pinned `field`, or
+    /// `None` when the field is passage-scored and the graph is not kept.
+    async fn graph_vector_of_field(
+        &self,
+        doc_id: &str,
+        source: &Value,
+        field: &str,
+    ) -> Option<Vec<f32>> {
+        if self.passage_chunks_require_exact(field) {
+            self.hnsw_skip_passage_scored(doc_id, source, field).await;
+            return None;
+        }
+        extract_numeric_vector(source, field)
+    }
+
+    /// The graph is not maintained for a passage-scored field: once any
+    /// document of `field` carries passage vectors (`<field>_chunks`), the ANN
+    /// path never serves it (`run_knn_hnsw` returns to the exact passage
+    /// scorer on `passage_chunks_require_exact`, and that set is monotonic and
+    /// persisted), so an HNSW insert for it is CPU nobody can read back. On a
+    /// `semantic_text` autoindex corpus of Wikipedia passages (most longer
+    /// than the 512-character semantic chunk) these inserts were 23.3 % of all
+    /// server CPU and ran one at a time under the graph's write lock.
+    ///
+    /// The document still counts toward `vector_doc_count` (an attempt, as in
+    /// `hnsw_insert_vector`), so the coverage gate reads "incomplete" — the
+    /// exact path — even before the passage guard is consulted. A node this
+    /// document got before the field became passage-scored now holds a stale
+    /// vector: it is tombstoned like an update would.
+    async fn hnsw_skip_passage_scored(&self, doc_id: &str, source: &Value, field: &str) {
+        if !carries_numeric_vector(source, field) {
+            return;
+        }
+        let old_node: Option<u64> = self.hnsw_id_map.read().await.get(doc_id).copied();
+        match old_node {
+            Some(node) => {
+                if let Some(graph) = self.hnsw.read().await.as_ref() {
+                    graph.mark_deleted(node);
+                }
+                self.hnsw_id_map.write().await.remove(doc_id);
+                self.hnsw_id_rev.write().await.remove(&node);
+            }
+            None => {
+                self.vector_doc_count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Pick the field the HNSW graph will index, given the first
@@ -18348,6 +18396,13 @@ impl Index {
             Some(f) => f,
             None => return Ok(false),
         };
+        // A passage-scored field is never served by ANN, and ingest no longer
+        // maintains its graph (`hnsw_skip_passage_scored`): re-deriving it
+        // would re-insert every vector for nothing. The graph stays stale,
+        // which keeps the ANN path closed a second way.
+        if self.passage_chunks_require_exact(&field) {
+            return Ok(false);
+        }
         if self.hnsw.read().await.is_none() {
             return Ok(false);
         }
@@ -47097,6 +47152,22 @@ fn push_field_root_keys(field: &str, out: &mut Vec<String>) -> bool {
 /// Extract `field` from `source` as an all-numbers f32 vector.
 /// Returns `None` when the field is absent, not an array, empty, or holds
 /// any non-number element.
+/// Whether `source` carries a vector for `field` in a shape
+/// [`extract_numeric_vector`] reads, without decoding it: the common
+/// top-level companion (`<field>_vector`) is checked in place, anything
+/// nested falls back to the decoding path.
+fn carries_numeric_vector(source: &Value, field: &str) -> bool {
+    if let Some(value) = source.as_object().and_then(|object| object.get(field)) {
+        return value
+            .as_str()
+            .is_some_and(xerj_common::packed_f32::is_packed_f32)
+            || value
+                .as_array()
+                .is_some_and(|arr| !arr.is_empty() && arr.iter().all(Value::is_number));
+    }
+    extract_numeric_vector(source, field).is_some()
+}
+
 fn extract_numeric_vector(source: &Value, field: &str) -> Option<Vec<f32>> {
     let value = get_field_value(source, field)?;
     // Packed strings are the retained form (#1940). Number arrays remain
