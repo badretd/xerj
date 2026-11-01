@@ -3,7 +3,7 @@
 # Builds the release server from the committed heads of dev/e2e1 (git archive, so nothing uncommitted counts), copies it to the run host,
 # runs tests 1 to 7 there detached, pulls the results and scores test 6 here, where the labels are. Safe to rerun: finished steps are
 # skipped, a run that died resumes. To repeat a test, use a new TAG, or delete its .ok marker on the run host.
-# env: RUN_HOST BUILD_HOST (both required) CPUS (12-19) CONC (8) BIN (a built server here: skips the build) MVP (research tree) MODEL (export on the run host) T5_MIN (10) FUNC_ONLY (1,2,3,4,5)
+# env: RUN_HOST BUILD_HOST (both required) CPUS (12-19) CONC (8) BIN (a built server here: skips the build) MVP (research tree) MODEL (export on the run host) COUNTING_WORLDS (a dev worlds file here: runs test 8) T5_MIN (10) FUNC_ONLY (1,2,3,4,5)
 set -u
 TAG=${1:-main}
 HERE=$(cd "$(dirname "$0")" && pwd); PROD=$(cd "$HERE/../.." && pwd); MEM=$(cd "$PROD/../xerj_mem" && pwd)
@@ -39,9 +39,10 @@ fi
 ssh "$RUN_HOST" "mkdir -p $RD/bin $RD/tests; ln -sfn \$HOME/$MODEL $RD/model; ln -sfn \$HOME/$WORLDS $RD/worlds"
 if [ -n "${BIN:-}" ]; then ssh "$RUN_HOST" "test -f $RD/bin/xerj" || scp -q "$BIN" "$RUN_HOST:$RD/bin/xerj"
 else ssh "$RUN_HOST" "test -f $RD/bin/xerj" || scp -q -3 "$BUILD_HOST:$BASE/target_e2e/release/xerj" "$RUN_HOST:$RD/bin/xerj"; fi
-scp -q "$HERE"/e2e_lib.py "$HERE"/e2e_functional.py "$HERE"/e2e_bench.py "$HERE"/node.sh "$RUN_HOST:$RD/tests/"
+scp -q "$HERE"/e2e_lib.py "$HERE"/e2e_functional.py "$HERE"/e2e_bench.py "$HERE"/e2e_counting.py "$HERE"/node.sh "$RUN_HOST:$RD/tests/"
 scp -q "$MVP/runs/e2e1/s5/sample.json" "$RUN_HOST:$RD/sample.json"
 scp -q "$OUT/select_ids.txt" "$RUN_HOST:$RD/select_ids.txt"
+[ -n "${COUNTING_WORLDS:-}" ] && scp -q "$COUNTING_WORLDS" "$RUN_HOST:$RD/counting.jsonl"
 ssh "$RUN_HOST" "test -f $RD/DONE || { cd $RD; CPUS=$CPUS CONC=${CONC:-8} T5_MIN=${T5_MIN:-10} FUNC_ONLY=${FUNC_ONLY:-1,2,3,4,5} nohup setsid bash tests/node.sh \$PWD > driver.out 2>&1 < /dev/null & }"
 log "running on $RUN_HOST:$RD (progress.log there)"
 until ssh "$RUN_HOST" "test -f $RD/DONE"; do sleep 60; done
