@@ -3769,11 +3769,11 @@ where
 ///
 /// The pipe lock is NOT held across the wire: a flush detaches the buffer as
 /// a job, drops the lock, sends, and resolves tokens on return, so up to
-/// [`MAX_IN_FLIGHT`] bulks are on the wire at once. Per-file order still
-/// holds — a file's cut chunks are sent synchronously by its own worker
-/// inside `submit`, so any later job carrying its tail ships after those
-/// completed; files interleave arbitrarily, exactly as the 32 parallel
-/// per-file buffers always did.
+/// [`MAX_IN_FLIGHT`] bulks are on the wire at once. With more than one worker
+/// a run uses sender threads ([`Self::use_senders`]), so bulks of one file can
+/// land out of order; records carry deterministic ids, so they converge.
+/// Inline mode (`--workers 1`, or no sender could start) sends a file's chunks
+/// on its own worker, in order.
 ///
 /// Durability semantics are the per-file code's, unchanged: a token settles
 /// `Ok` only after EVERY bulk carrying its records was accepted (server_errors
