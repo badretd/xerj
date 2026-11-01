@@ -1,0 +1,134 @@
+# A `semantic_text` field's vectors follow its text through every update path — regression lock.
+#
+# `_update` (a partial document or a script) and `_update_by_query` read the document back with its stored vectors
+# and re-index it. Those vectors used to count as caller-supplied, so the write kept the OLD text's pooled and chunk
+# vectors for the NEW text and a `semantic` query scored the document like the text it no longer had. `ref` is a
+# fresh index of the text the updates write; after an update `upd` holds the same text and must score the same.
+# The texts are ~790 characters, two passages each, so the chunk vectors are covered too.
+
+setup:
+  - do:
+      indices.create:
+        index: sem_update
+        body:
+          mappings:
+            properties:
+              sem: { type: semantic_text }
+              tag: { type: keyword }
+
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - index: { _index: sem_update, _id: upd }
+          - sem: "Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike. Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike. Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike. Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike. Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike. Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike. Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike. Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike. Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike. Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike."
+            tag: x
+          - index: { _index: sem_update, _id: ref }
+          - sem: "Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly."
+            tag: x
+          - index: { _index: sem_update, _id: other }
+          - sem: "Mountain rivers carve granite canyons beneath silent glaciers every spring season. Mountain rivers carve granite canyons beneath silent glaciers every spring season. Mountain rivers carve granite canyons beneath silent glaciers every spring season. Mountain rivers carve granite canyons beneath silent glaciers every spring season. Mountain rivers carve granite canyons beneath silent glaciers every spring season. Mountain rivers carve granite canyons beneath silent glaciers every spring season. Mountain rivers carve granite canyons beneath silent glaciers every spring season. Mountain rivers carve granite canyons beneath silent glaciers every spring season. Mountain rivers carve granite canyons beneath silent glaciers every spring season. Mountain rivers carve granite canyons beneath silent glaciers every spring season."
+            tag: x
+
+---
+"partial _update re-embeds the changed text":
+  - do:
+      update:
+        index: sem_update
+        id: upd
+        body:
+          doc: { sem: "Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly." }
+  - do:
+      indices.refresh: { index: sem_update }
+
+  - do:
+      search:
+        index: sem_update
+        body:
+          size: 3
+          query: { semantic: { field: sem, query: "zebras graze near quantum laboratories while violins tune", k: 10 } }
+  - length: { hits.hits: 3 }
+  # upd and ref hold the same text: same score, both above the unrelated document.
+  - set: { hits.hits.0._score: top }
+  - match: { hits.hits.1._score: $top }
+  - match: { hits.hits.2._id: other }
+
+---
+"scripted _update re-embeds the changed text":
+  - do:
+      update:
+        index: sem_update
+        id: upd
+        body:
+          script:
+            source: "ctx._source.sem = params.t"
+            params:
+              t: "Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly."
+  - do:
+      indices.refresh: { index: sem_update }
+
+  - do:
+      search:
+        index: sem_update
+        body:
+          size: 3
+          query: { semantic: { field: sem, query: "zebras graze near quantum laboratories while violins tune", k: 10 } }
+  - length: { hits.hits: 3 }
+  - set: { hits.hits.0._score: top }
+  - match: { hits.hits.1._score: $top }
+  - match: { hits.hits.2._id: other }
+
+---
+"_update_by_query re-embeds the changed text":
+  - do:
+      update_by_query:
+        index: sem_update
+        body:
+          query: { ids: { values: [upd] } }
+          script:
+            source: "ctx._source.sem = params.t"
+            params:
+              t: "Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly. Zebras graze near quantum laboratories while violins tune their strings slowly."
+  - match: { updated: 1 }
+  - do:
+      indices.refresh: { index: sem_update }
+
+  - do:
+      search:
+        index: sem_update
+        body:
+          size: 3
+          query: { semantic: { field: sem, query: "zebras graze near quantum laboratories while violins tune", k: 10 } }
+  - length: { hits.hits: 3 }
+  - set: { hits.hits.0._score: top }
+  - match: { hits.hits.1._score: $top }
+  - match: { hits.hits.2._id: other }
+
+---
+"an update that does not touch the text keeps its score":
+  - do:
+      search:
+        index: sem_update
+        body:
+          size: 1
+          query: { semantic: { field: sem, query: "alpha bravo charlie delta echo foxtrot", k: 10 } }
+  - match: { hits.hits.0._id: upd }
+  - set: { hits.hits.0._score: before }
+
+  - do:
+      update:
+        index: sem_update
+        id: upd
+        body:
+          doc: { tag: y }
+  - do:
+      indices.refresh: { index: sem_update }
+
+  - do:
+      search:
+        index: sem_update
+        body:
+          size: 1
+          query: { semantic: { field: sem, query: "alpha bravo charlie delta echo foxtrot", k: 10 } }
+  - match: { hits.hits.0._id: upd }
+  - match: { hits.hits.0._score: $before }
