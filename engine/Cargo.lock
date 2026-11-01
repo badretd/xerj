@@ -7883,6 +7883,7 @@ dependencies = [
  "lz4_flex",
  "memchr",
  "memmap2",
+ "rand 0.8.7",
  "rayon",
  "roaring",
  "rustc-hash",
