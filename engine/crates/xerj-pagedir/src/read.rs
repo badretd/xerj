@@ -1,7 +1,8 @@
 //! Read side: locate, read, check.
 use crate::bits::{Bits, SAMPLE};
 use crate::format::{
-    mtime_ns, read_full_at, source_identity, Header, F_ARTICLES, F_MTIME, KEY_MAX, MAGIC, SECTION,
+    mtime_ns, read_full_at, source_identity, Header, F_ARTICLES, F_ENDS_NL, F_MTIME, KEY_MAX, MAGIC,
+    SECTION,
     TAIL,
 };
 use crate::{Error, Result};
@@ -430,7 +431,10 @@ impl PageDir {
             let mut more = vec![0u8; pg];
             let got = read_full_at(f, &mut more, off)?;
             if got == 0 {
-                if cur < data.len() {
+                // A line may end without a newline only where the indexed file did. Anywhere else
+                // the file was cut, and this is a piece of a line.
+                let last_line = self.header.flags & F_ENDS_NL == 0 && off == self.header.file_size;
+                if cur < data.len() && last_line {
                     recs.push(data[cur..].to_vec());
                 }
                 break;

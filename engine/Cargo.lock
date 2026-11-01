@@ -7768,6 +7768,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xerj-pagedir"
+version = "1.0.0-rc.100"
+dependencies = [
+ "memchr",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "xerj-query"
 version = "1.0.0-rc.100"
 dependencies = [
@@ -7895,6 +7908,7 @@ dependencies = [
  "uuid",
  "xerj-ai",
  "xerj-common",
+ "xerj-pagedir",
  "xxhash-rust",
  "zstd",
 ]

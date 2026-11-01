@@ -90,6 +90,7 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 
 pub mod derived_vectors;
+pub mod source_ref;
 mod row_hydration;
 pub use row_hydration::{
     decode_stored_v2_ids, decode_stored_v2_row_for_get, decode_stored_v2_rows,
@@ -374,6 +375,10 @@ fn encode_stored_v2_at_level_inner(
             if let (Some(stripped), Some(obj)) = (stripped, doc.as_object_mut()) {
                 obj.insert("_source".into(), stripped);
             }
+            let stripped = doc.get("_source").and_then(source_ref::strip_source);
+            if let (Some(stripped), Some(obj)) = (stripped, doc.as_object_mut()) {
+                obj.insert("_source".into(), stripped);
+            }
         });
     }
 
@@ -518,7 +523,11 @@ fn encode_stored_v2_from_values_inner(
     let stripped: Vec<Option<serde_json::Value>> = {
         use rayon::prelude::*;
         docs.par_iter()
-            .map(|(_, _, src)| derived_vectors::strip_source(src))
+            .map(|(_, _, src)| {
+                let stripped = derived_vectors::strip_source(src);
+                let current = stripped.as_ref().unwrap_or(src);
+                source_ref::strip_source(current).or(stripped)
+            })
             .collect()
     };
     let stripped_docs: Vec<(&str, u64, &serde_json::Value)> = docs
@@ -2377,10 +2386,18 @@ fn decode_stored_v2_filtered(
         && entries
             .iter()
             .any(|(name, _, _)| derived_vectors::metadata_target(name).is_some());
-    let wants_derived = has_metadata
-        && keep.is_none_or(|keep| {
-            derived_vectors::keep_wants_derived(entries.iter().map(|(n, _, _)| n.as_str()), keep)
-        });
+    let has_source_ref = rehydrate
+        && entries
+            .iter()
+            .any(|(name, _, _)| name == source_ref::REF_FIELD);
+    let wants_derived = has_source_ref
+        || has_metadata
+            && keep.is_none_or(|keep| {
+                derived_vectors::keep_wants_derived(
+                    entries.iter().map(|(n, _, _)| n.as_str()),
+                    keep,
+                )
+            });
     let allowed: Option<std::collections::HashSet<String>> = match keep {
         Some(keep) if wants_derived => {
             let mut names: std::collections::HashSet<String> = entries
@@ -2668,6 +2685,7 @@ fn decode_stored_v2_filtered(
                             }
                         }
                         if wants_derived {
+                            source_ref::rehydrate_source_map(&mut source_map);
                             derived_vectors::rehydrate_source_map(&mut source_map);
                         }
                         if let Some(allowed) = allowed.as_ref() {

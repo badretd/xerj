@@ -2,7 +2,6 @@
 //! read, on files built to hit the edges of the format.
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::fs::{self, File};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use xerj_pagedir::{build, open, ArticleKey, BuildOptions, Error, Expect, ReadOptions};
 
@@ -242,14 +241,24 @@ fn a_damaged_directory_is_refused() {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Check {
+    None,
+    Id,
+    Hash,
+}
+
 /// Reads every passage of an edited file. Returns (correct, stale errors, wrong lines returned).
-fn sweep(d: &xerj_pagedir::PageDir, f: &File, lines: &[Vec<u8>], with_check: bool) -> (u32, u32, u32) {
+fn sweep(d: &xerj_pagedir::PageDir, f: &File, lines: &[Vec<u8>], check: Check) -> (u32, u32, u32) {
     let (mut ok, mut stale, mut wrong) = (0, 0, 0);
     for (i, line) in lines.iter().enumerate() {
-        let r = if with_check {
-            d.read(f, i as u64, Expect::Id(&id_of(line)), OPT)
-        } else {
-            d.read_unchecked(f, i as u64, OPT)
+        let r = match check {
+            Check::None => d.read_unchecked(f, i as u64, OPT),
+            Check::Id => d.read(f, i as u64, Expect::Id(&id_of(line)), OPT),
+            Check::Hash => {
+                let h = xerj_pagedir::line_hash(line);
+                d.read(f, i as u64, Expect::LineHash(h), OPT)
+            }
         };
         match r {
             Ok(got) if got == *line => ok += 1,
@@ -285,8 +294,12 @@ fn an_edited_file_gives_errors_never_wrong_text() {
         let f = File::open(&p).unwrap();
         assert!(matches!(d.check_source(&f), Err(Error::SourceMismatch(_))));
         assert_eq!(d.check_stat(&f).unwrap(), Some(false));
-        wrong_without_check += sweep(&d, &f, &lines, false).2;
-        let (_, stale, wrong) = sweep(&d, &f, &lines, true);
+        wrong_without_check += sweep(&d, &f, &lines, Check::None).2;
+        // The id check cannot see the one line the bytes landed inside: its id is still right.
+        let (_, stale, wrong) = sweep(&d, &f, &lines, Check::Id);
+        assert!(wrong <= 1, "insert {ins} at {frac}: {wrong}");
+        assert!(stale > 0);
+        let (_, stale, wrong) = sweep(&d, &f, &lines, Check::Hash);
         assert_eq!(wrong, 0, "insert {ins} at {frac}");
         assert!(stale > 0);
     }
@@ -316,8 +329,11 @@ fn an_edited_file_gives_errors_never_wrong_text() {
     fs::write(&p, &e).unwrap();
     let f = File::open(&p).unwrap();
     d.check_source(&f).expect("this edit passes the identity check");
-    assert!(sweep(&d, &f, &big, false).2 > 0, "unchecked reads go wrong");
-    let (_, stale, wrong) = sweep(&d, &f, &big, true);
+    assert!(sweep(&d, &f, &big, Check::None).2 > 0, "unchecked reads go wrong");
+    let (_, stale, wrong) = sweep(&d, &f, &big, Check::Id);
+    assert!(wrong <= 2, "{wrong}");
+    assert!(stale > 0);
+    let (_, stale, wrong) = sweep(&d, &f, &big, Check::Hash);
     assert_eq!(wrong, 0);
     assert!(stale > 0);
 }
@@ -354,10 +370,9 @@ fn a_truncated_file_gives_an_error() {
     let f = fs::OpenOptions::new().write(true).open(&p).unwrap();
     f.set_len(data.len() as u64 / 2).unwrap();
     let f = File::open(&p).unwrap();
-    let (_, stale, wrong) = sweep(&d, &f, &lines, true);
-    assert_eq!(wrong, 0);
+    let (_, stale, wrong) = sweep(&d, &f, &lines, Check::Id);
+    assert_eq!(wrong, 0, "a cut line must not pass as a whole one");
     assert!(stale > 0);
-    let _ = f.read_at(&mut [0u8; 1], 0);
 }
 
 #[test]
